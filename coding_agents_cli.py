@@ -15,6 +15,9 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TIMEOUT_SECONDS = 1200  # 20 minutes
+DEFAULT_HEARTBEAT_INTERVAL = 15.0  # seconds
+
 
 # =============================================================================
 # Unified Interface
@@ -111,7 +114,8 @@ def run_with_config(
     prompt: str,
     config: AgentConfig,
     *,
-    heartbeat_interval: float | None = None,
+    heartbeat_interval: float | None = DEFAULT_HEARTBEAT_INTERVAL,
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> AgentResult:
     """Run a coding agent using an AgentConfig.
 
@@ -123,6 +127,8 @@ def run_with_config(
         config: Agent configuration.
         heartbeat_interval: If set, log a heartbeat message every N seconds
             while the agent is running. Useful for long-running jobs.
+        timeout: Maximum time in seconds to wait for the agent to complete.
+            Defaults to 1200 (20 minutes). Set to None for no timeout.
 
     Returns:
         AgentResult with output, returncode, stderr, and agent type.
@@ -130,6 +136,7 @@ def run_with_config(
     Raises:
         FileNotFoundError: If agent binary is not found.
         ValueError: If unknown agent type.
+        TimeoutError: If the agent exceeds the timeout.
     """
     agent = config.agent
     effective_model = config.model
@@ -159,18 +166,21 @@ def run_with_config(
                 working_dir=config.codex_working_dir,
                 add_dirs=config.codex_add_dirs,
                 output_schema=config.codex_output_schema,
+                timeout=timeout,
             )
         elif agent == AgentType.CLAUDE:
             result = _run_claude_internal(
                 prompt,
                 model=effective_model,
                 auto_approve=config.auto_approve,
+                timeout=timeout,
             )
         elif agent == AgentType.GEMINI:
             result = _run_gemini_internal(
                 prompt,
                 model=effective_model,
                 auto_approve=config.auto_approve,
+                timeout=timeout,
             )
         else:
             raise ValueError(f"Unknown agent type: {agent}")
@@ -192,10 +202,11 @@ def run_with_config_or_raise(
     prompt: str,
     config: AgentConfig,
     *,
-    heartbeat_interval: float | None = None,
+    heartbeat_interval: float | None = DEFAULT_HEARTBEAT_INTERVAL,
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
     """Run a coding agent using AgentConfig, raising on failure."""
-    result = run_with_config(prompt, config, heartbeat_interval=heartbeat_interval)
+    result = run_with_config(prompt, config, heartbeat_interval=heartbeat_interval, timeout=timeout)
     if result.returncode != 0:
         error_msg = result.stderr.strip() or result.output.strip()
         raise RuntimeError(f"{result.agent.value} exec failed: {error_msg}")
@@ -206,14 +217,15 @@ def run_with_config_and_fallback(
     prompt: str | Sequence[str],
     configs: Sequence[AgentConfig] | None = None,
     *,
-    heartbeat_interval: float | None = None,
+    heartbeat_interval: float | None = DEFAULT_HEARTBEAT_INTERVAL,
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> AgentResult:
     """Try each AgentConfig in order, returning the first successful result.
 
     An agent is considered to have failed if it returns a non-zero exit code or
-    raises an exception (e.g. binary not found). The next config in the list is
-    then attempted. If every agent fails, a RuntimeError is raised summarising
-    all errors.
+    raises an exception (e.g. binary not found, timeout). The next config in
+    the list is then attempted. If every agent fails, a RuntimeError is raised
+    summarising all errors.
 
     Args:
         prompt: The prompt(s) to send to the agents. If a single string, all
@@ -223,6 +235,8 @@ def run_with_config_and_fallback(
             ``DEFAULT_AGENT_FALLBACK_ORDER`` (Gemini → Codex → Claude).
         heartbeat_interval: If set, log a heartbeat message every N seconds
             while each agent is running.
+        timeout: Maximum time in seconds to wait for each agent to complete.
+            Defaults to 1200 (20 minutes). Set to None for no timeout.
 
     Returns:
         The first successful AgentResult.
@@ -251,7 +265,7 @@ def run_with_config_and_fallback(
     for config, agent_prompt in zip(configs, prompts):
         try:
             result = run_with_config(
-                agent_prompt, config, heartbeat_interval=heartbeat_interval
+                agent_prompt, config, heartbeat_interval=heartbeat_interval, timeout=timeout
             )
             if result.returncode == 0:
                 return result
@@ -287,7 +301,8 @@ def run_agent(
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
     codex_output_schema: dict | None = None,
-    heartbeat_interval: float | None = None,
+    heartbeat_interval: float | None = DEFAULT_HEARTBEAT_INTERVAL,
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> AgentResult:
     """Run a coding agent CLI with unified interface.
 
@@ -306,6 +321,7 @@ def run_agent(
         codex_add_dirs: Additional directories to add (Codex only).
         codex_output_schema: JSON schema for structured output (Codex only).
         heartbeat_interval: If set, log a heartbeat message every N seconds.
+        timeout: Maximum time in seconds to wait. Defaults to 1200 (20 minutes).
 
     Returns:
         AgentResult with output, returncode, stderr, and agent type.
@@ -313,6 +329,7 @@ def run_agent(
     Raises:
         FileNotFoundError: If agent binary is not found.
         ValueError: If unknown agent type.
+        TimeoutError: If the agent exceeds the timeout.
     """
     return run_with_config(
         prompt,
@@ -326,6 +343,7 @@ def run_agent(
             codex_output_schema=codex_output_schema,
         ),
         heartbeat_interval=heartbeat_interval,
+        timeout=timeout,
     )
 
 
@@ -339,7 +357,8 @@ def run_agent_or_raise(
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
     codex_output_schema: dict | None = None,
-    heartbeat_interval: float | None = None,
+    heartbeat_interval: float | None = DEFAULT_HEARTBEAT_INTERVAL,
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
     """Run a coding agent CLI and return output, raising on failure.
 
@@ -352,6 +371,7 @@ def run_agent_or_raise(
         FileNotFoundError: If agent binary is not found.
         ValueError: If unknown agent type.
         RuntimeError: If agent returns non-zero exit code.
+        TimeoutError: If the agent exceeds the timeout.
     """
     return run_with_config_or_raise(
         prompt,
@@ -365,6 +385,7 @@ def run_agent_or_raise(
             codex_output_schema=codex_output_schema,
         ),
         heartbeat_interval=heartbeat_interval,
+        timeout=timeout,
     )
 
 
@@ -430,6 +451,7 @@ def _run_codex_internal(
     working_dir: Path | None,
     add_dirs: list[Path] | None,
     output_schema: dict | None,
+    timeout: float | None,
 ) -> _RunResult:
     """Internal Codex runner."""
     binaries = find_codex_binaries()
@@ -478,13 +500,17 @@ def _run_codex_internal(
         command.append("-")
 
         logger.debug("Running codex command with stdin: %s", " ".join(command[:5]) + " ...")
-        completed = subprocess.run(
-            command,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError(f"Codex timed out after {timeout} seconds") from e
 
         if output_path and output_path.exists():
             output = output_path.read_text(encoding="utf-8")
@@ -545,6 +571,7 @@ def _run_claude_internal(
     *,
     model: str,
     auto_approve: bool,
+    timeout: float | None,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -560,13 +587,17 @@ def _run_claude_internal(
         command.extend(["--permission-mode", "bypassPermissions"])
 
     logger.debug("Running claude command: %s", " ".join(command))
-    completed = subprocess.run(
-        command,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError(f"Claude timed out after {timeout} seconds") from e
 
     return _RunResult(
         output=completed.stdout,
@@ -613,6 +644,7 @@ def _run_gemini_internal(
     *,
     model: str,
     auto_approve: bool = False,
+    timeout: float | None = None,
 ) -> _RunResult:
     """Internal Gemini runner."""
     gemini_bin = find_gemini_bin()
@@ -630,13 +662,17 @@ def _run_gemini_internal(
         command.extend(["--approval-mode", "yolo"])
 
     logger.debug("Running gemini command with stdin: %s", " ".join(command))
-    completed = subprocess.run(
-        command,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError(f"Gemini timed out after {timeout} seconds") from e
 
     return _RunResult(
         output=completed.stdout,
