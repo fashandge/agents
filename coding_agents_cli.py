@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import logging
+import os
 import subprocess
 import tempfile
 import threading
@@ -529,6 +531,54 @@ def _run_codex_internal(
             output_path.unlink(missing_ok=True)
 
 
+# =============================================================================
+# Environment Helpers
+# =============================================================================
+
+
+def _find_node_bin_dir() -> str | None:
+    """Find the directory containing the node binary."""
+    # Priority 1: Check standard paths
+    for base in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
+        if (base / "node").exists():
+            return str(base)
+
+    # Priority 2: Check NVM
+    nvm_dir = Path.home() / ".nvm/versions/node"
+    if nvm_dir.exists():
+        for version_dir in sorted(nvm_dir.iterdir(), reverse=True):
+            if not version_dir.is_dir():
+                continue
+            bin_dir = version_dir / "bin"
+            if (bin_dir / "node").exists():
+                return str(bin_dir)
+
+    return None
+
+
+def _build_agent_env() -> dict[str, str]:
+    """Build environment dict with PATH including node and USER set."""
+    env = os.environ.copy()
+
+    # Ensure USER is set (required for Claude auth)
+    if "USER" not in env:
+        try:
+            env["USER"] = getpass.getuser()
+        except Exception:
+            pass
+
+    # Ensure HOME is set
+    if "HOME" not in env:
+        env["HOME"] = str(Path.home())
+
+    # Ensure node is in PATH (required for gemini's #!/usr/bin/env node shebang)
+    node_bin_dir = _find_node_bin_dir()
+    if node_bin_dir:
+        current_path = env.get("PATH", "")
+        if node_bin_dir not in current_path:
+            env["PATH"] = f"{node_bin_dir}:{current_path}" if current_path else node_bin_dir
+
+    return env
 
 
 # =============================================================================
@@ -587,6 +637,7 @@ def _run_claude_internal(
         command.extend(["--permission-mode", "bypassPermissions"])
 
     logger.debug("Running claude command: %s", " ".join(command))
+    env = _build_agent_env()
     try:
         completed = subprocess.run(
             command,
@@ -595,6 +646,7 @@ def _run_claude_internal(
             text=True,
             check=False,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(f"Claude timed out after {timeout} seconds") from e
@@ -662,6 +714,7 @@ def _run_gemini_internal(
         command.extend(["--approval-mode", "yolo"])
 
     logger.debug("Running gemini command with stdin: %s", " ".join(command))
+    env = _build_agent_env()
     try:
         completed = subprocess.run(
             command,
@@ -670,6 +723,7 @@ def _run_gemini_internal(
             text=True,
             check=False,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(f"Gemini timed out after {timeout} seconds") from e
