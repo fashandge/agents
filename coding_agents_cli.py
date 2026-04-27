@@ -63,7 +63,7 @@ class AgentConfig:
         codex_output_schema: JSON schema for structured output.
         codex_skip_git_check: Skip git repository validation.
     """
-    agent: AgentType | Literal["codex", "claude", "gemini"] = AgentType.CODEX
+    agent: AgentType | Literal["codex", "claude", "gemini"] = AgentType.CLAUDE
     model: str | None = None
     auto_approve: bool = True
 
@@ -536,28 +536,12 @@ def _run_codex_internal(
 # =============================================================================
 
 
-def _find_node_bin_dir() -> str | None:
-    """Find the directory containing the node binary."""
-    # Priority 1: Check standard paths
-    for base in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
-        if (base / "node").exists():
-            return str(base)
-
-    # Priority 2: Check NVM
-    nvm_dir = Path.home() / ".nvm/versions/node"
-    if nvm_dir.exists():
-        for version_dir in sorted(nvm_dir.iterdir(), reverse=True):
-            if not version_dir.is_dir():
-                continue
-            bin_dir = version_dir / "bin"
-            if (bin_dir / "node").exists():
-                return str(bin_dir)
-
-    return None
-
-
 def _build_agent_env() -> dict[str, str]:
-    """Build environment dict with PATH including node and USER set."""
+    """Build environment dict by sourcing ~/.zshenv for PATH and other vars.
+
+    Falls back to manual setup if zshenv doesn't exist or fails.
+    Always ensures USER and HOME are set (required for Claude auth).
+    """
     env = os.environ.copy()
 
     # Ensure USER is set (required for Claude auth)
@@ -571,12 +555,24 @@ def _build_agent_env() -> dict[str, str]:
     if "HOME" not in env:
         env["HOME"] = str(Path.home())
 
-    # Ensure node is in PATH (required for gemini's #!/usr/bin/env node shebang)
-    node_bin_dir = _find_node_bin_dir()
-    if node_bin_dir:
-        current_path = env.get("PATH", "")
-        if node_bin_dir not in current_path:
-            env["PATH"] = f"{node_bin_dir}:{current_path}" if current_path else node_bin_dir
+    # Source ~/.zshenv to get PATH and other env vars
+    zshenv = Path.home() / ".zshenv"
+    if zshenv.exists():
+        try:
+            result = subprocess.run(
+                ["/bin/zsh", "-c", f"source {zshenv} && env"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env={"HOME": env["HOME"], "USER": env.get("USER", "")},
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if "=" in line:
+                        key, _, value = line.partition("=")
+                        env[key] = value
+        except Exception:
+            pass
 
     return env
 
