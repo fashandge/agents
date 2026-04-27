@@ -537,9 +537,13 @@ def _run_codex_internal(
 
 
 def _build_agent_env() -> dict[str, str]:
-    """Build environment dict by sourcing ~/.zshenv for PATH and other vars.
+    """Build environment dict by sourcing ~/.zshenv and ~/.config/secrets.env.
 
-    Falls back to manual setup if zshenv doesn't exist or fails.
+    Sources:
+    - ~/.zshenv: PATH and other non-sensitive env vars
+    - ~/.config/secrets.env: API keys (should be chmod 600)
+
+    Falls back gracefully if files don't exist or fail to source.
     Always ensures USER and HOME are set (required for Claude auth).
     """
     env = os.environ.copy()
@@ -555,12 +559,15 @@ def _build_agent_env() -> dict[str, str]:
     if "HOME" not in env:
         env["HOME"] = str(Path.home())
 
-    # Source ~/.zshenv to get PATH and other env vars
-    zshenv = Path.home() / ".zshenv"
-    if zshenv.exists():
+    # Source ~/.zshenv and ~/.config/secrets.env
+    home = Path(env["HOME"])
+    env_files = [home / ".zshenv", home / ".config/secrets.env"]
+    sources = [f"source {f}" for f in env_files if f.exists()]
+
+    if sources:
         try:
             result = subprocess.run(
-                ["/bin/zsh", "-c", f"source {zshenv} && env"],
+                ["/bin/zsh", "-c", " && ".join(sources) + " && env"],
                 capture_output=True,
                 text=True,
                 timeout=5,
