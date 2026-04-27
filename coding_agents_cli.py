@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import getpass
 import json
 import logging
 import os
@@ -14,6 +13,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Literal
+
+from agents import env
 
 logger = logging.getLogger(__name__)
 
@@ -532,59 +533,6 @@ def _run_codex_internal(
 
 
 # =============================================================================
-# Environment Helpers
-# =============================================================================
-
-
-def _build_agent_env() -> dict[str, str]:
-    """Build environment dict by sourcing ~/.zshenv and ~/.config/secrets.env.
-
-    Sources:
-    - ~/.zshenv: PATH and other non-sensitive env vars
-    - ~/.config/secrets.env: API keys (should be chmod 600)
-
-    Falls back gracefully if files don't exist or fail to source.
-    Always ensures USER and HOME are set (required for Claude auth).
-    """
-    env = os.environ.copy()
-
-    # Ensure USER is set (required for Claude auth)
-    if "USER" not in env:
-        try:
-            env["USER"] = getpass.getuser()
-        except Exception:
-            pass
-
-    # Ensure HOME is set
-    if "HOME" not in env:
-        env["HOME"] = str(Path.home())
-
-    # Source ~/.zshenv and ~/.config/secrets.env
-    home = Path(env["HOME"])
-    env_files = [home / ".zshenv", home / ".config/secrets.env"]
-    sources = [f"source {f}" for f in env_files if f.exists()]
-
-    if sources:
-        try:
-            result = subprocess.run(
-                ["/bin/zsh", "-c", " && ".join(sources) + " && env"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                env={"HOME": env["HOME"], "USER": env.get("USER", "")},
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if "=" in line:
-                        key, _, value = line.partition("=")
-                        env[key] = value
-        except Exception:
-            pass
-
-    return env
-
-
-# =============================================================================
 # Claude Code CLI
 # =============================================================================
 
@@ -640,7 +588,7 @@ def _run_claude_internal(
         command.extend(["--permission-mode", "bypassPermissions"])
 
     logger.debug("Running claude command: %s", " ".join(command))
-    env = _build_agent_env()
+    proc_env = env.build_env()
     try:
         completed = subprocess.run(
             command,
@@ -649,7 +597,7 @@ def _run_claude_internal(
             text=True,
             check=False,
             timeout=timeout,
-            env=env,
+            env=proc_env,
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(f"Claude timed out after {timeout} seconds") from e
@@ -717,7 +665,7 @@ def _run_gemini_internal(
         command.extend(["--approval-mode", "yolo"])
 
     logger.debug("Running gemini command with stdin: %s", " ".join(command))
-    env = _build_agent_env()
+    proc_env = env.build_env()
     try:
         completed = subprocess.run(
             command,
@@ -726,7 +674,7 @@ def _run_gemini_internal(
             text=True,
             check=False,
             timeout=timeout,
-            env=env,
+            env=proc_env,
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(f"Gemini timed out after {timeout} seconds") from e
