@@ -38,7 +38,7 @@ class AgentType(str, Enum):
 DEFAULT_MODELS: dict[AgentType, str] = {
     AgentType.CODEX: "gpt-5.4-mini",
     AgentType.CLAUDE: "sonnet",
-    AgentType.GEMINI: "gemini-3-flash-preview",
+    AgentType.GEMINI: "gemini-3.5-flash",
 }
 
 
@@ -614,12 +614,16 @@ def _run_claude_internal(
 
 
 def find_gemini_bin() -> str:
-    """Find the Gemini CLI binary."""
-    # Priority 1: Check standard paths
-    for base in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
-        gemini_path = base / "gemini"
-        if gemini_path.exists():
-            return str(gemini_path)
+    """Find the agy CLI binary (named gemini for compatibility)."""
+    # Priority 1: Check standard paths and user local bin
+    for base in [
+        Path.home() / ".local/bin",
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+    ]:
+        agy_path = base / "agy"
+        if agy_path.exists():
+            return str(agy_path)
 
     # Priority 2: Check NVM
     nvm_dir = Path.home() / ".nvm/versions/node"
@@ -627,19 +631,19 @@ def find_gemini_bin() -> str:
         for version_dir in sorted(nvm_dir.iterdir(), reverse=True):
             if not version_dir.is_dir():
                 continue
-            gemini_path = version_dir / "bin/gemini"
-            if gemini_path.exists():
-                return str(gemini_path)
+            agy_path = version_dir / "bin/agy"
+            if agy_path.exists():
+                return str(agy_path)
 
     # Priority 3: Fallback to which
     try:
-        path = subprocess.run(["which", "gemini"], capture_output=True, text=True).stdout.strip()
+        path = subprocess.run(["which", "agy"], capture_output=True, text=True).stdout.strip()
         if path:
             return path
     except Exception:
         pass
 
-    raise FileNotFoundError("gemini not found in standard paths, NVM, or PATH")
+    raise FileNotFoundError("agy not found in standard paths, NVM, or PATH")
 
 
 def _run_gemini_internal(
@@ -649,26 +653,22 @@ def _run_gemini_internal(
     auto_approve: bool = False,
     timeout: float | None = None,
 ) -> _RunResult:
-    """Internal Gemini runner."""
-    gemini_bin = find_gemini_bin()
+    """Internal Gemini runner (using agy CLI under the hood)."""
+    agy_bin = find_gemini_bin()
 
-    # Pass an empty string to -p so it enters headless mode and reads from stdin
-    command = [
-        gemini_bin,
-        "-p",
-        "",
-        "-m",
-        model,
-    ]
-
+    command = f'"{agy_bin}"'
     if auto_approve:
-        command.extend(["--approval-mode", "yolo"])
+        command += " --dangerously-skip-permissions"
+    command += ' --print "$(cat)"'
 
-    logger.debug("Running gemini command with stdin: %s", " ".join(command))
+    logger.debug("Running agy command: %s", command)
     proc_env = env.build_env()
+    proc_env["ANTIGRAVITY_MODEL"] = model
+
     try:
         completed = subprocess.run(
             command,
+            shell=True,
             input=prompt,
             capture_output=True,
             text=True,
