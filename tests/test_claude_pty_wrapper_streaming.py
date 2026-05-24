@@ -130,7 +130,7 @@ def test_build_command_uses_wrapper_not_claude_print(monkeypatch):
     assert "bypassPermissions" in command
     assert "--cwd" in command
     assert "/tmp/project" in command
-    assert command[-2:] == ["--", "hello"]
+    assert "hello" not in command
     assert command[:2] != ["/opt/homebrew/bin/claude", "-p"]
 
 
@@ -153,9 +153,12 @@ def test_build_command_omits_permission_mode_when_not_auto_approve(monkeypatch):
 
 
 class _FakePopen:
+    instances = []
+
     def __init__(self, command, **kwargs):
         self.command = command
         self.kwargs = kwargs
+        self.stdin = _FakeStdin()
         self.stdout = io.StringIO(
             _line(
                 {
@@ -177,6 +180,7 @@ class _FakePopen:
         self.returncode = 0
         self.terminated = False
         self.killed = False
+        self.__class__.instances.append(self)
 
     def poll(self):
         return self.returncode
@@ -193,7 +197,23 @@ class _FakePopen:
         self.returncode = -9
 
 
+class _FakeStdin:
+    def __init__(self):
+        self.value = ""
+        self.closed = False
+
+    def write(self, value):
+        self.value += value
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 def test_stream_claude_pty_with_mocked_popen(monkeypatch):
+    _FakePopen.instances.clear()
     monkeypatch.setattr(
         streaming.coding_agents_cli,
         "find_claude_pty_wrapper_bin",
@@ -219,6 +239,10 @@ def test_stream_claude_pty_with_mocked_popen(monkeypatch):
     assert [event.kind for event in events] == ["status", "log", "log", "done"]
     assert events[1].payload == {"stream": "claude", "text": "hello"}
     assert events[2].payload == {"stream": "stderr", "text": "diagnostic\n"}
+    assert _FakePopen.instances[0].kwargs["stdin"] == streaming.subprocess.PIPE
+    assert _FakePopen.instances[0].stdin.value == "hello"
+    assert _FakePopen.instances[0].stdin.closed
+    assert _FakePopen.instances[0].command[-1] != "hello"
     result = events[-1].payload["result"]
     assert isinstance(result, streaming.ClaudePtyStreamResult)
     assert result.output == "hello"

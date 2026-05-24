@@ -108,11 +108,11 @@ class AgentResult:
 
 
 # Default fallback order used by run_with_config_and_fallback when no configs
-# are explicitly provided: Gemini first, then Codex, then Claude.
+# are explicitly provided: Codex first, then Claude, then Gemini.
 DEFAULT_AGENT_FALLBACK_ORDER: tuple[AgentConfig, ...] = (
-    AgentConfig(agent=AgentType.GEMINI),
     AgentConfig(agent=AgentType.CODEX),
     AgentConfig(agent=AgentType.CLAUDE),
+    AgentConfig(agent=AgentType.GEMINI),
 )
 
 
@@ -245,7 +245,7 @@ def run_with_config_and_fallback(
             agents receive the same prompt. If a sequence of strings, each
             agent receives the corresponding prompt (must match len(configs)).
         configs: Ordered sequence of AgentConfigs to try. Defaults to
-            ``DEFAULT_AGENT_FALLBACK_ORDER`` (Gemini → Codex → Claude).
+            ``DEFAULT_AGENT_FALLBACK_ORDER`` (Codex → Claude → Gemini).
         heartbeat_interval: If set, log a heartbeat message every N seconds
             while each agent is running.
         timeout: Maximum time in seconds to wait for each agent to complete.
@@ -464,6 +464,47 @@ class _RunResult:
     stderr: str
 
 
+def build_codex_command(
+    config: AgentConfig,
+    *,
+    output_schema_path: Path | None = None,
+    output_path: Path | None = None,
+) -> list[str]:
+    """Build a Codex CLI command from an AgentConfig."""
+    binaries = find_codex_binaries()
+    command = [
+        binaries.node,
+        binaries.codex,
+        "exec",
+        "--model",
+        str(config.model),
+        "-c",
+        f'model_reasoning_effort="{config.codex_reasoning_effort}"',
+    ]
+
+    if config.auto_approve:
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+
+    if config.codex_skip_git_check:
+        command.append("--skip-git-repo-check")
+
+    if config.codex_working_dir:
+        command.extend(["--cd", str(config.codex_working_dir)])
+
+    if config.codex_add_dirs:
+        for add_dir in config.codex_add_dirs:
+            command.extend(["--add-dir", str(add_dir)])
+
+    if output_schema_path is not None:
+        command.extend(["--output-schema", str(output_schema_path)])
+
+    if output_path is not None:
+        command.extend(["--output-last-message", str(output_path)])
+
+    command.append("-")
+    return command
+
+
 def _run_codex_internal(
     prompt: str,
     *,
@@ -477,31 +518,6 @@ def _run_codex_internal(
     timeout: float | None,
 ) -> _RunResult:
     """Internal Codex runner."""
-    binaries = find_codex_binaries()
-
-    command = [
-        binaries.node,
-        binaries.codex,
-        "exec",
-        "--model",
-        model,
-        "-c",
-        f'model_reasoning_effort="{reasoning_effort}"',
-    ]
-
-    if auto_approve:
-        command.append("--dangerously-bypass-approvals-and-sandbox")
-
-    if skip_git_check:
-        command.append("--skip-git-repo-check")
-
-    if working_dir:
-        command.extend(["--cd", str(working_dir)])
-
-    if add_dirs:
-        for add_dir in add_dirs:
-            command.extend(["--add-dir", str(add_dir)])
-
     schema_path: Path | None = None
     output_path: Path | None = None
 
@@ -518,9 +534,21 @@ def _run_codex_internal(
                 "w", suffix=".json", delete=False, encoding="utf-8"
             ) as output_file:
                 output_path = Path(output_file.name)
-            command.extend(["--output-last-message", str(output_path)])
 
-        command.append("-")
+        command = build_codex_command(
+            AgentConfig(
+                agent=AgentType.CODEX,
+                model=model,
+                auto_approve=auto_approve,
+                codex_reasoning_effort=reasoning_effort,
+                codex_working_dir=working_dir,
+                codex_add_dirs=add_dirs,
+                codex_output_schema=output_schema,
+                codex_skip_git_check=skip_git_check,
+            ),
+            output_schema_path=schema_path,
+            output_path=output_path,
+        )
 
         logger.debug("Running codex command with stdin: %s", " ".join(command[:5]) + " ...")
         try:
@@ -717,6 +745,35 @@ def find_gemini_bin() -> str:
     raise FileNotFoundError("agy not found in standard paths, NVM, or PATH")
 
 
+def build_gemini_env(model: str) -> dict[str, str]:
+    """Build the env dict used to invoke agy with the configured model."""
+    proc_env = env.build_env()
+    proc_env["ANTIGRAVITY_MODEL"] = model
+    return proc_env
+
+
+def build_gemini_argv_command(
+    prompt: str,
+    *,
+    auto_approve: bool,
+) -> list[str]:
+    """Build an agy command that passes the prompt as an argv value."""
+    command = [find_gemini_bin()]
+    if auto_approve:
+        command.append("--dangerously-skip-permissions")
+    command.extend(["--print", prompt])
+    return command
+
+
+def build_gemini_stdin_shell_command(*, auto_approve: bool) -> str:
+    """Build an agy shell command that reads the prompt from stdin."""
+    command = f'"{find_gemini_bin()}"'
+    if auto_approve:
+        command += " --dangerously-skip-permissions"
+    command += ' --print "$(cat)"'
+    return command
+
+
 def _run_gemini_internal(
     prompt: str,
     *,
@@ -725,16 +782,10 @@ def _run_gemini_internal(
     timeout: float | None = None,
 ) -> _RunResult:
     """Internal Gemini runner (using agy CLI under the hood)."""
-    agy_bin = find_gemini_bin()
-
-    command = f'"{agy_bin}"'
-    if auto_approve:
-        command += " --dangerously-skip-permissions"
-    command += ' --print "$(cat)"'
+    command = build_gemini_stdin_shell_command(auto_approve=auto_approve)
 
     logger.debug("Running agy command: %s", command)
-    proc_env = env.build_env()
-    proc_env["ANTIGRAVITY_MODEL"] = model
+    proc_env = build_gemini_env(model)
 
     try:
         completed = subprocess.run(

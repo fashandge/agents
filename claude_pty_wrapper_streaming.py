@@ -63,7 +63,11 @@ def build_claude_pty_wrapper_command(
     timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
     cwd: Path | str | None = None,
 ) -> list[str]:
-    """Build a claude-pty-wrapper command for stream-json output."""
+    """Build a claude-pty-wrapper command for stream-json output.
+
+    The prompt is accepted for API compatibility but is sent through stdin by
+    ``_stream_command`` so multiline and long prompts do not become argv.
+    """
     wrapper_bin = coding_agents_cli.find_claude_pty_wrapper_bin()
     claude_bin = coding_agents_cli.find_claude_bin()
     wrapper_timeout = timeout or DEFAULT_PTY_WRAPPER_NO_TIMEOUT_SECONDS
@@ -84,7 +88,6 @@ def build_claude_pty_wrapper_command(
         command.extend(["--cwd", str(cwd)])
     if auto_approve:
         command.extend(["--permission-mode", "bypassPermissions"])
-    command.extend(["--", prompt])
     return command
 
 
@@ -120,7 +123,7 @@ def stream_claude_pty(
         kind="status",
         payload={"message": "Starting Claude via claude-pty-wrapper."},
     )
-    yield from _stream_command(command, timeout=timeout, cwd=cwd)
+    yield from _stream_command(command, prompt=prompt, timeout=timeout, cwd=cwd)
 
 
 def run_claude_pty_streaming(
@@ -167,6 +170,7 @@ def run_claude_pty_streaming(
 def _stream_command(
     command: list[str],
     *,
+    prompt: str,
     timeout: float | None,
     cwd: Path | str | None,
 ) -> Iterator[ClaudePtyStreamEvent]:
@@ -181,7 +185,7 @@ def _stream_command(
     try:
         process = subprocess.Popen(
             command,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -191,6 +195,13 @@ def _stream_command(
         )
         output_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
         threads = []
+        if process.stdin is not None:
+            thread = threading.Thread(
+                target=_write_prompt_to_stdin,
+                args=(process.stdin, prompt),
+                daemon=True,
+            )
+            thread.start()
         for stream, stream_name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             if stream is None:
                 continue
@@ -295,6 +306,16 @@ def _enqueue_stream(
             output_queue.put((stream_name, line))
     finally:
         output_queue.put(None)
+
+
+def _write_prompt_to_stdin(stdin: TextIO, prompt: str) -> None:
+    try:
+        stdin.write(prompt)
+        stdin.flush()
+    except BrokenPipeError:
+        pass
+    finally:
+        stdin.close()
 
 
 def _format_stream_json_line(line: str) -> _FormattedStreamLine:
