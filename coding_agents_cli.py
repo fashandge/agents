@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 1200  # 20 minutes
 DEFAULT_HEARTBEAT_INTERVAL = 15.0  # seconds
+DEFAULT_PTY_WRAPPER_NO_TIMEOUT_SECONDS = 7 * 24 * 60 * 60  # 1 week
 
 
 # =============================================================================
@@ -56,6 +57,11 @@ class AgentConfig:
         model: Model name. Defaults to the agent-specific default.
         auto_approve: Auto-approve all actions for unattended runs.
 
+    Claude-specific options (prefixed with claude_):
+        claude_use_pty_wrapper: Use claude-pty-wrapper instead of ``claude -p``.
+            Defaults to True because the PTY wrapper can use the interactive
+            Claude Code session while still returning print-like output.
+
     Codex-specific options (prefixed with codex_):
         codex_reasoning_effort: Reasoning effort level (low, medium, high).
             Defaults to ``"high"`` for gpt-5.4-mini and ``"medium"`` for others.
@@ -67,6 +73,9 @@ class AgentConfig:
     agent: AgentType | Literal["codex", "claude", "gemini"] = AgentType.CLAUDE
     model: str | None = None
     auto_approve: bool = True
+
+    # Claude-specific
+    claude_use_pty_wrapper: bool = True
 
     # Codex-specific
     codex_reasoning_effort: str | None = None
@@ -176,6 +185,7 @@ def run_with_config(
                 prompt,
                 model=effective_model,
                 auto_approve=config.auto_approve,
+                use_pty_wrapper=config.claude_use_pty_wrapper,
                 timeout=timeout,
             )
         elif agent == AgentType.GEMINI:
@@ -300,6 +310,7 @@ def run_agent(
     *,
     model: str | None = None,
     auto_approve: bool = True,
+    claude_use_pty_wrapper: bool = True,
     codex_reasoning_effort: str | None = None,
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
@@ -317,6 +328,8 @@ def run_agent(
         agent: Which agent to use (codex, claude, gemini).
         model: Model name. Defaults to agent-specific default.
         auto_approve: Auto-approve all actions for unattended runs.
+        claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
+            of ``claude -p``. Defaults to True.
         codex_reasoning_effort: Reasoning effort (Codex only: low, medium, high).
             If None, defaults to ``"high"`` for gpt-5.4-mini and ``"medium"``
             for other models.
@@ -340,6 +353,7 @@ def run_agent(
             agent=agent,
             model=model,
             auto_approve=auto_approve,
+            claude_use_pty_wrapper=claude_use_pty_wrapper,
             codex_reasoning_effort=codex_reasoning_effort,
             codex_working_dir=codex_working_dir,
             codex_add_dirs=codex_add_dirs,
@@ -356,6 +370,7 @@ def run_agent_or_raise(
     *,
     model: str | None = None,
     auto_approve: bool = True,
+    claude_use_pty_wrapper: bool = True,
     codex_reasoning_effort: str | None = None,
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
@@ -366,6 +381,10 @@ def run_agent_or_raise(
     """Run a coding agent CLI and return output, raising on failure.
 
     Convenience wrapper around :func:`run_with_config_or_raise`.
+
+    Args:
+        claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
+            of ``claude -p``. Defaults to True.
 
     Returns:
         The output string from the agent.
@@ -382,6 +401,7 @@ def run_agent_or_raise(
             agent=agent,
             model=model,
             auto_approve=auto_approve,
+            claude_use_pty_wrapper=claude_use_pty_wrapper,
             codex_reasoning_effort=codex_reasoning_effort,
             codex_working_dir=codex_working_dir,
             codex_add_dirs=codex_add_dirs,
@@ -566,29 +586,80 @@ def find_claude_bin() -> str:
     raise FileNotFoundError("claude not found in standard paths, NVM, or PATH")
 
 
+def find_claude_pty_wrapper_bin() -> str:
+    """Find the claude-pty-wrapper CLI binary."""
+    # Priority 1: Check standard paths
+    for base in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
+        wrapper_path = base / "claude-pty-wrapper"
+        if wrapper_path.exists():
+            return str(wrapper_path)
+
+    # Priority 2: Check NVM
+    nvm_dir = Path.home() / ".nvm/versions/node"
+    if nvm_dir.exists():
+        for version_dir in sorted(nvm_dir.iterdir(), reverse=True):
+            if not version_dir.is_dir():
+                continue
+            wrapper_path = version_dir / "bin/claude-pty-wrapper"
+            if wrapper_path.exists():
+                return str(wrapper_path)
+
+    # Priority 3: Fallback to which
+    try:
+        path = subprocess.run(
+            ["which", "claude-pty-wrapper"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if path:
+            return path
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        "claude-pty-wrapper not found in standard paths, NVM, or PATH"
+    )
+
+
 
 def _run_claude_internal(
     prompt: str,
     *,
     model: str,
     auto_approve: bool,
+    use_pty_wrapper: bool,
     timeout: float | None,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
 
-    command = [
-        claude_bin,
-        "-p",
-        "--model",
-        model,
-    ]
+    if use_pty_wrapper:
+        command = [
+            find_claude_pty_wrapper_bin(),
+            "-p",
+            "--claude-bin",
+            claude_bin,
+            "--model",
+            model,
+        ]
+        wrapper_timeout = timeout or DEFAULT_PTY_WRAPPER_NO_TIMEOUT_SECONDS
+        command.extend(["--timeout", str(wrapper_timeout)])
+    else:
+        command = [
+            claude_bin,
+            "-p",
+            "--model",
+            model,
+        ]
 
     if auto_approve:
         command.extend(["--permission-mode", "bypassPermissions"])
 
     logger.debug("Running claude command: %s", " ".join(command))
     proc_env = env.build_env()
+    subprocess_timeout = timeout
+    if use_pty_wrapper and timeout is not None:
+        subprocess_timeout = timeout + 10
     try:
         completed = subprocess.run(
             command,
@@ -596,7 +667,7 @@ def _run_claude_internal(
             capture_output=True,
             text=True,
             check=False,
-            timeout=timeout,
+            timeout=subprocess_timeout,
             env=proc_env,
         )
     except subprocess.TimeoutExpired as e:
