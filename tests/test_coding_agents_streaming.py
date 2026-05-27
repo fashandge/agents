@@ -143,11 +143,11 @@ def test_build_gemini_command_and_env(monkeypatch):
     monkeypatch.setattr(streaming.coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
     config = _config("gemini", model="gemini-3.1-pro")
 
-    assert streaming.build_gemini_command("hello", config) == [
+    assert streaming.build_gemini_command(config) == [
         "/tmp/agy",
         "--dangerously-skip-permissions",
         "--print",
-        "hello",
+        "-",
     ]
     assert streaming.build_gemini_env(config) == {
         "PATH": "/usr/bin",
@@ -156,11 +156,11 @@ def test_build_gemini_command_and_env(monkeypatch):
 
 
 def test_stream_gemini_forwards_heartbeat_status(monkeypatch):
-    monkeypatch.setattr(streaming, "build_gemini_command", lambda prompt, config: ["agy", "--print", prompt])
+    monkeypatch.setattr(streaming, "build_gemini_command", lambda config: ["agy", "--print", "-"])
     monkeypatch.setattr(streaming, "build_gemini_env", lambda config: {"ANTIGRAVITY_MODEL": "gemini-3.1-pro"})
 
     def fake_pty(command, prompt, **kwargs):
-        assert kwargs["write_stdin"] is False
+        assert kwargs.get("write_stdin", True) is True
         assert kwargs["heartbeat_interval"] == streaming.DEFAULT_GEMINI_HEARTBEAT_INTERVAL_SECONDS
         assert kwargs["env"] == {"ANTIGRAVITY_MODEL": "gemini-3.1-pro"}
         yield streaming.AgentStreamEvent(

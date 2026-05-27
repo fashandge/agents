@@ -47,10 +47,9 @@ def build_codex_command(config: coding_agents_cli.AgentConfig) -> list[str]:
     return coding_agents_cli.build_codex_command(config)
 
 
-def build_gemini_command(prompt: str, config: coding_agents_cli.AgentConfig) -> list[str]:
-    """Build the agy (Gemini) command for streaming."""
-    return coding_agents_cli.build_gemini_argv_command(
-        prompt,
+def build_gemini_command(config: coding_agents_cli.AgentConfig) -> list[str]:
+    """Build the agy (Gemini) command for streaming (prompt via stdin)."""
+    return coding_agents_cli.build_gemini_command(
         auto_approve=config.auto_approve,
     )
 
@@ -266,7 +265,7 @@ def _stream_gemini(
     timeout: float | None,
 ) -> Iterator[AgentStreamEvent]:
     try:
-        command = build_gemini_command(prompt, config)
+        command = build_gemini_command(config)
     except Exception as exc:
         yield AgentStreamEvent(kind="error", payload={"message": f"gemini unavailable: {exc}"})
         return
@@ -281,7 +280,6 @@ def _stream_gemini(
             label="gemini",
             cwd=_string_path(config.codex_working_dir),
             env=build_gemini_env(config),
-            write_stdin=False,
             heartbeat_interval=DEFAULT_GEMINI_HEARTBEAT_INTERVAL_SECONDS,
             timeout=timeout,
         ):
@@ -304,7 +302,6 @@ def _stream_gemini(
             label="gemini",
             cwd=_string_path(config.codex_working_dir),
             env=build_gemini_env(config),
-            write_stdin=False,
             timeout=timeout,
         ):
             if event.kind == "log":

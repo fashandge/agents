@@ -752,25 +752,12 @@ def build_gemini_env(model: str) -> dict[str, str]:
     return proc_env
 
 
-def build_gemini_argv_command(
-    prompt: str,
-    *,
-    auto_approve: bool,
-) -> list[str]:
-    """Build an agy command that passes the prompt as an argv value."""
+def build_gemini_command(*, auto_approve: bool) -> list[str]:
+    """Build an agy command that reads the prompt from stdin via ``--print -``."""
     command = [find_gemini_bin()]
     if auto_approve:
         command.append("--dangerously-skip-permissions")
-    command.extend(["--print", prompt])
-    return command
-
-
-def build_gemini_stdin_shell_command(*, auto_approve: bool) -> str:
-    """Build an agy shell command that reads the prompt from stdin."""
-    command = f'"{find_gemini_bin()}"'
-    if auto_approve:
-        command += " --dangerously-skip-permissions"
-    command += ' --print "$(cat)"'
+    command.extend(["--print", "-"])
     return command
 
 
@@ -782,7 +769,7 @@ def _run_gemini_internal(
     timeout: float | None = None,
 ) -> _RunResult:
     """Internal Gemini runner (using agy CLI under the hood)."""
-    command = build_gemini_stdin_shell_command(auto_approve=auto_approve)
+    command = build_gemini_command(auto_approve=auto_approve)
 
     logger.debug("Running agy command: %s", command)
     proc_env = build_gemini_env(model)
@@ -790,7 +777,6 @@ def _run_gemini_internal(
     try:
         completed = subprocess.run(
             command,
-            shell=True,
             input=prompt,
             capture_output=True,
             text=True,
