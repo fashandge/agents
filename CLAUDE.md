@@ -16,6 +16,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, OpenClaw, H
 - Run tests: `/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python -m pytest tests/`
 - Run a single test: `... -m pytest tests/test_openrouter.py::test_openrouter_client_sends_chat_completion_request`
 - Source Codex bin/node discovery (finds newest NVM node with `codex` installed and exports `CODEX_BIN` / `CODEX_NODE_BIN`): `source scripts/codex-env.sh`
+- Run an agent from the shell: `python agents_cli.py [-a claude|codex|gemini] [-m MODEL] "prompt"` — prompt can also be piped via stdin or supplied as a heredoc. Use `--fallback claude,codex,gemini` to walk a fallback chain.
 
 ## Architecture
 
@@ -33,6 +34,8 @@ Three layers, all in the top-level `agents/` package:
 3. **Streaming variants** — same agent set, but yield `AgentStreamEvent`s as the process runs:
    - `coding_agents_streaming` is the top-level streaming dispatcher. It reuses `coding_agents_cli`'s command/env builders and Claude path is delegated to `claude_pty_wrapper_streaming`.
    - `claude_pty_wrapper_streaming` shells out to `claude-pty-wrapper -p --output-format stream-json` and converts the wrapper's JSONL into readable progress events plus a clean final assistant string. Do not switch this module to `claude -p` — the wrapper path is intentional.
+
+`agents_cli.py` is a thin argparse-based shell entry point on top of `coding_agents_cli`. It accepts the prompt as an argv arg or via stdin, builds a single `AgentConfig`, and delegates to `run_with_config` — or, when `--fallback` is given, builds one `AgentConfig` per agent in the list and calls `run_with_config_and_fallback`. Only the first config in the fallback list receives `--model`; the rest fall back to their per-agent defaults.
 
 `openrouter` is independent of the agent-CLI stack: `OpenRouterChatClient.complete(...)` posts to OpenRouter's chat completions endpoint, with a `RANDOM_FREE` model option that picks from `data/openrouter_free_models.txt` and retries across models on failure.
 
