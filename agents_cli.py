@@ -14,9 +14,9 @@ def main() -> None:
     )
     parser.add_argument(
         "prompt", nargs="?",
-        help="Prompt text. If omitted, reads from stdin. "
-             "For long or multiline prompts, pipe via stdin: "
-             "echo '...' | agents-cli, or use a heredoc: "
+        help="Prompt text (only recommended for short, single-line prompts). "
+             "For anything longer, prefer stdin to avoid shell quoting issues "
+             "and ARG_MAX limits: echo '...' | agents-cli, or use a heredoc: "
              "agents-cli <<'EOF'\\n...\\nEOF",
     )
     parser.add_argument(
