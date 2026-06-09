@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python
 """CLI wrapper for agents.coding_agents_cli."""
 
 import argparse
