@@ -22,6 +22,18 @@ DEFAULT_TIMEOUT_SECONDS = 1200  # 20 minutes
 DEFAULT_HEARTBEAT_INTERVAL = 15.0  # seconds
 DEFAULT_PTY_WRAPPER_NO_TIMEOUT_SECONDS = 7 * 24 * 60 * 60  # 1 week
 
+# Ordered directories to search for agent CLI binaries (node, claude, codex, agy,
+# claude-pty-wrapper). The Hermes agent ships its own bundled Node runtime under
+# ~/.hermes/node and shims node/npm/claude into ~/.local/bin, so those come first;
+# Homebrew / /usr/local are legacy fallbacks. Codex in particular only lives under
+# ~/.hermes/node/bin, so omitting it leaves codex undiscoverable.
+_AGENT_BIN_DIRS: tuple[Path, ...] = (
+    Path.home() / ".local/bin",
+    Path.home() / ".hermes/node/bin",
+    Path("/opt/homebrew/bin"),
+    Path("/usr/local/bin"),
+)
+
 
 # =============================================================================
 # Unified Interface
@@ -427,7 +439,7 @@ class CodexBinaries:
 def find_codex_binaries() -> CodexBinaries:
     """Find node and codex binaries for the Codex CLI."""
     # Priority 1: Check standard paths
-    for base in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
+    for base in _AGENT_BIN_DIRS:
         node_path = base / "node"
         codex_path = base / "codex"
         if node_path.exists() and codex_path.exists():
@@ -588,7 +600,7 @@ def _run_codex_internal(
 def find_claude_bin() -> str:
     """Find the Claude Code CLI binary."""
     # Priority 1: Check standard paths
-    for base in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
+    for base in _AGENT_BIN_DIRS:
         claude_path = base / "claude"
         if claude_path.exists():
             return str(claude_path)
@@ -617,7 +629,7 @@ def find_claude_bin() -> str:
 def find_claude_pty_wrapper_bin() -> str:
     """Find the claude-pty-wrapper CLI binary."""
     # Priority 1: Check standard paths
-    for base in [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]:
+    for base in _AGENT_BIN_DIRS:
         wrapper_path = base / "claude-pty-wrapper"
         if wrapper_path.exists():
             return str(wrapper_path)
@@ -715,11 +727,7 @@ def _run_claude_internal(
 def find_gemini_bin() -> str:
     """Find the agy CLI binary (named gemini for compatibility)."""
     # Priority 1: Check standard paths and user local bin
-    for base in [
-        Path.home() / ".local/bin",
-        Path("/opt/homebrew/bin"),
-        Path("/usr/local/bin"),
-    ]:
+    for base in _AGENT_BIN_DIRS:
         agy_path = base / "agy"
         if agy_path.exists():
             return str(agy_path)
