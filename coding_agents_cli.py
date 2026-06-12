@@ -436,34 +436,45 @@ class CodexBinaries:
     codex: str
 
 
-def find_codex_binaries() -> CodexBinaries:
-    """Find node and codex binaries for the Codex CLI."""
-    # Priority 1: Check standard paths
+def _find_binary(name: str) -> str | None:
+    """Locate a single CLI binary, preferring ~/.local/bin, then the other
+    standard agent dirs, then the newest NVM node version, then `which`."""
+    # Priority 1: Standard paths (~/.local/bin first).
     for base in _AGENT_BIN_DIRS:
-        node_path = base / "node"
-        codex_path = base / "codex"
-        if node_path.exists() and codex_path.exists():
-            return CodexBinaries(node=str(node_path), codex=str(codex_path))
+        candidate = base / name
+        if candidate.exists():
+            return str(candidate)
 
-    # Priority 2: Check NVM
+    # Priority 2: Newest NVM node version that has the binary.
     nvm_dir = Path.home() / ".nvm/versions/node"
     if nvm_dir.exists():
         for version_dir in sorted(nvm_dir.iterdir(), reverse=True):
-            if not version_dir.is_dir():
-                continue
-            node_path = version_dir / "bin/node"
-            codex_path = version_dir / "bin/codex"
-            if node_path.exists() and codex_path.exists():
-                return CodexBinaries(node=str(node_path), codex=str(codex_path))
+            candidate = version_dir / "bin" / name
+            if version_dir.is_dir() and candidate.exists():
+                return str(candidate)
 
-    # Priority 3: Fallback to system node and which codex
+    # Priority 3: Fallback to `which`.
     try:
-        node_path = subprocess.run(["which", "node"], capture_output=True, text=True).stdout.strip()
-        codex_path = subprocess.run(["which", "codex"], capture_output=True, text=True).stdout.strip()
-        if node_path and codex_path:
-            return CodexBinaries(node=node_path, codex=codex_path)
+        found = subprocess.run(["which", name], capture_output=True, text=True).stdout.strip()
+        if found:
+            return found
     except Exception:
         pass
+
+    return None
+
+
+def find_codex_binaries() -> CodexBinaries:
+    """Find node and codex binaries for the Codex CLI.
+
+    Each binary is resolved independently, preferring ~/.local/bin (where the
+    Hermes-bundled node/codex are shimmed) so codex is discovered there first
+    even if node resolves from a different directory.
+    """
+    codex_path = _find_binary("codex")
+    node_path = _find_binary("node")
+    if codex_path and node_path:
+        return CodexBinaries(node=node_path, codex=codex_path)
 
     raise FileNotFoundError("Could not find node and codex binaries in standard paths or NVM.")
 
