@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, OpenClaw, H
 
 ## Project
 
-`agents` is a small Python library of reusable utilities for driving AI coding-agent CLIs (Codex, Claude Code, Gemini/`agy`) and for calling OpenRouter chat completions. It is consumed by other local projects as a package — modules are imported as `from agents import <module>`.
+`agents` is a small Python library of reusable utilities for driving AI coding-agent CLIs (Codex, Claude Code, Gemini/`agy`) and for calling chat-completion APIs (OpenRouter and DeepSeek). It is consumed by other local projects as a package — modules are imported as `from agents import <module>`.
 
 ## Environment
 
@@ -38,6 +38,8 @@ Three layers, all in the top-level `agents/` package:
 `agents_cli.py` is a thin argparse-based shell entry point on top of `coding_agents_cli`. It accepts the prompt as an argv arg or via stdin, builds a single `AgentConfig`, and delegates to `run_with_config` — or, when `--fallback` is given, builds one `AgentConfig` per agent in the list and calls `run_with_config_and_fallback`. Only the first config in the fallback list receives `--model`; the rest fall back to their per-agent defaults.
 
 `openrouter` is independent of the agent-CLI stack: `OpenRouterChatClient.complete(...)` posts to OpenRouter's chat completions endpoint, with a `RANDOM_FREE` model option that picks from `data/openrouter_free_models.txt` and retries across models on failure.
+
+`deepseek` is a parallel, standalone client for DeepSeek's OpenAI-compatible chat completions endpoint: `DeepSeekChatClient.complete(...)` reads `DEEPSEEK_API_KEY`, defaults to model `deepseek-v4-flash`, and supports `max_tokens`, a `thinking` flag, and `reasoning_effort`. Known model ids live in `DeepSeekModel` (`deepseek-v4-pro`, `deepseek-v4-flash`, `deepseek-chat`, `deepseek-reasoner`). `thinking` defaults to `False`, which sends `{"thinking":{"type":"disabled"}}` to turn off the reasoning pass on hybrid V4 models (faster/cheaper); pass `thinking=True` to send `{"thinking":{"type":"enabled"}}`. When thinking is on, `reasoning_effort` sizes the reasoning depth — DeepSeek only honors `high` (default) and `max` (see `ReasoningEffort`; legacy `low`/`medium`/`xhigh` are server-mapped onto those), and it is ignored when thinking is off. Thinking mode also ignores `temperature` (no error, no effect). It shares no code with `openrouter` — both are deliberately small, self-contained, stdlib-only (`urllib`) clients.
 
 ## Conventions specific to this repo
 
