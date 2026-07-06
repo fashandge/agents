@@ -71,8 +71,19 @@ class AgentConfig:
 
     Claude-specific options (prefixed with claude_):
         claude_use_pty_wrapper: Use claude-pty-wrapper instead of ``claude -p``.
-            Defaults to True because the PTY wrapper can use the interactive
-            Claude Code session while still returning print-like output.
+            Defaults to False (``claude -p``). The PTY wrapper drives the
+            interactive Claude Code session, which starts plugin MCP servers
+            (Playwright / chrome-devtools via ``npm exec``) that don't shut down
+            on teardown and keep the wrapper's PTY slave open, so an
+            otherwise-finished headless run hangs until its hard timeout (and
+            leaks those servers). Direct ``claude -p`` exits cleanly, so it is the
+            default for unattended runs; set this True to opt into the
+            interactive-session wrapper.
+        claude_disable_mcp: Run Claude with no MCP servers (``--strict-mcp-config``
+            + empty ``--mcp-config``). Use for unattended/headless runs that need
+            no MCP tools: it avoids the teardown hang where orphaned stdio MCP
+            servers keep the PTY open so the wrapper never sees EOF, and it stops
+            those servers from leaking as background processes.
 
     Codex-specific options (prefixed with codex_):
         codex_reasoning_effort: Reasoning effort level (low, medium, high).
@@ -87,7 +98,8 @@ class AgentConfig:
     auto_approve: bool = True
 
     # Claude-specific
-    claude_use_pty_wrapper: bool = True
+    claude_use_pty_wrapper: bool = False
+    claude_disable_mcp: bool = False
 
     # Codex-specific
     codex_reasoning_effort: str | None = None
@@ -198,6 +210,7 @@ def run_with_config(
                 model=effective_model,
                 auto_approve=config.auto_approve,
                 use_pty_wrapper=config.claude_use_pty_wrapper,
+                disable_mcp=config.claude_disable_mcp,
                 timeout=timeout,
             )
         elif agent == AgentType.GEMINI:
@@ -322,7 +335,7 @@ def run_agent(
     *,
     model: str | None = None,
     auto_approve: bool = True,
-    claude_use_pty_wrapper: bool = True,
+    claude_use_pty_wrapper: bool = False,
     codex_reasoning_effort: str | None = None,
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
@@ -382,7 +395,7 @@ def run_agent_or_raise(
     *,
     model: str | None = None,
     auto_approve: bool = True,
-    claude_use_pty_wrapper: bool = True,
+    claude_use_pty_wrapper: bool = False,
     codex_reasoning_effort: str | None = None,
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
@@ -680,6 +693,7 @@ def _run_claude_internal(
     auto_approve: bool,
     use_pty_wrapper: bool,
     timeout: float | None,
+    disable_mcp: bool = False,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -705,6 +719,16 @@ def _run_claude_internal(
 
     if auto_approve:
         command.extend(["--permission-mode", "bypassPermissions"])
+
+    if disable_mcp:
+        # No MCP servers: --strict-mcp-config makes Claude ignore all ambient MCP
+        # config (including plugin-provided servers), and an empty --mcp-config
+        # leaves nothing enabled. Both the pty-wrapper and `claude -p` accept and
+        # forward these flags. This prevents the headless-teardown hang where
+        # orphaned npm-exec stdio MCP servers (Playwright / chrome-devtools) hold
+        # the wrapper's PTY slave open so its master read never sees EOF, and it
+        # stops those servers from leaking as long-lived background processes.
+        command.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
 
     logger.debug("Running claude command: %s", " ".join(command))
     proc_env = env.build_env()

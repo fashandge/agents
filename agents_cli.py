@@ -32,9 +32,20 @@ def main() -> None:
     )
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument(
-        "--no-pty-wrapper",
+        "--pty-wrapper",
         action="store_true",
-        help="Use claude -p instead of claude-pty-wrapper (claude only).",
+        help="Drive Claude through claude-pty-wrapper (interactive session) "
+             "instead of the default `claude -p`. Note: the wrapper starts plugin "
+             "MCP servers that can hang headless teardown; only use it when you "
+             "need interactive-session behavior.",
+    )
+    parser.add_argument(
+        "--no-mcp",
+        action="store_true",
+        help="Run Claude with no MCP servers (--strict-mcp-config + empty "
+             "--mcp-config). Use for unattended runs that need no MCP tools: "
+             "avoids the headless-teardown hang from orphaned stdio MCP servers "
+             "holding the PTY open, and stops them leaking as background procs.",
     )
     parser.add_argument(
         "--codex-reasoning",
@@ -69,7 +80,12 @@ def main() -> None:
             if a not in valid:
                 parser.error(f"Unknown agent in --fallback: {a!r} (valid: {', '.join(sorted(valid))})")
         configs = [
-            coding_agents_cli.AgentConfig(agent=a, model=args.model if a == agents[0] else None, auto_approve=auto_approve)
+            coding_agents_cli.AgentConfig(
+                agent=a,
+                model=args.model if a == agents[0] else None,
+                auto_approve=auto_approve,
+                claude_disable_mcp=args.no_mcp,
+            )
             for a in agents
         ]
         result = coding_agents_cli.run_with_config_and_fallback(prompt, configs, timeout=args.timeout)
@@ -78,7 +94,8 @@ def main() -> None:
             agent=args.agent,
             model=args.model,
             auto_approve=auto_approve,
-            claude_use_pty_wrapper=not args.no_pty_wrapper,
+            claude_use_pty_wrapper=args.pty_wrapper,
+            claude_disable_mcp=args.no_mcp,
             codex_reasoning_effort=args.codex_reasoning,
             codex_working_dir=args.codex_working_dir,
         )
