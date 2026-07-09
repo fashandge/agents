@@ -564,7 +564,6 @@ def _run_codex_internal(
             ) as schema_file:
                 json.dump(output_schema, schema_file)
                 schema_path = Path(schema_file.name)
-            command.extend(["--output-schema", str(schema_path)])
 
             with tempfile.NamedTemporaryFile(
                 "w", suffix=".json", delete=False, encoding="utf-8"
