@@ -156,11 +156,18 @@ def test_build_gemini_command_and_env(monkeypatch):
 
 
 def test_stream_gemini_forwards_heartbeat_status(monkeypatch):
-    monkeypatch.setattr(streaming, "build_gemini_command", lambda config: ["agy", "--print", "-"])
+    """Streaming Gemini uses temp file for prompt and write_stdin=False."""
+    monkeypatch.setattr(streaming.coding_agents_cli, "find_gemini_bin", lambda: "/tmp/agy")
+    monkeypatch.setattr(streaming.coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
     monkeypatch.setattr(streaming, "build_gemini_env", lambda config: {"ANTIGRAVITY_MODEL": "gemini-3.1-pro"})
 
+    captured = {}
+
     def fake_pty(command, prompt, **kwargs):
-        assert kwargs.get("write_stdin", True) is True
+        captured["command"] = command
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        assert kwargs.get("write_stdin", True) is False, "streaming gemini must not write stdin"
         assert kwargs["heartbeat_interval"] == streaming.DEFAULT_GEMINI_HEARTBEAT_INTERVAL_SECONDS
         assert kwargs["env"] == {"ANTIGRAVITY_MODEL": "gemini-3.1-pro"}
         yield streaming.AgentStreamEvent(
@@ -174,11 +181,27 @@ def test_stream_gemini_forwards_heartbeat_status(monkeypatch):
 
     monkeypatch.setattr(streaming, "_stream_subprocess_with_pty", fake_pty)
 
-    events = list(streaming.stream_with_config("hello", _config("gemini", model="gemini-3.1-pro")))
+    events = list(streaming.stream_with_config("hello", _config("gemini", model="gemini-3.1-pro", auto_approve=True)))
 
     assert [event.kind for event in events] == ["status", "status", "log", "done"]
     assert "gemini working" in str(events[1].payload["message"])
     assert events[-1].payload["result"].output == "gemini answer"
+    # Command is sh -c with temp file substitution
+    assert captured["command"][0] == "sh"
+    assert captured["command"][1] == "-c"
+    assert "--print" in captured["command"][2]
+    assert "$(cat" in captured["command"][2]
+    assert "--dangerously-skip-permissions" in captured["command"][2]
+    assert captured["prompt"] == ""
+
+    import os
+    # Temp file should be cleaned up
+    assert "$(cat" in captured["command"][2]
+    # Extract temp file path and verify it's gone
+    import re
+    m = re.search(r'cat (\S+)\)', captured["command"][2])
+    if m:
+        assert not os.path.exists(m.group(1)), "temp file was not cleaned up"
 
 
 def test_stream_with_config_and_fallback_clears_failed_output(monkeypatch):

@@ -7,7 +7,9 @@ import os
 import pty
 import queue
 import select
+import shlex
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -264,61 +266,86 @@ def _stream_gemini(
     *,
     timeout: float | None,
 ) -> Iterator[AgentStreamEvent]:
+    """Stream Gemini output. Uses a temp file for the prompt (agy 1.1.1+ no
+    longer reads stdin) and does not write to the subprocess stdin."""
     try:
-        command = build_gemini_command(config)
+        gemini_bin = coding_agents_cli.find_gemini_bin()
     except Exception as exc:
         yield AgentStreamEvent(kind="error", payload={"message": f"gemini unavailable: {exc}"})
         return
 
-    output_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-    try:
-        yield AgentStreamEvent(kind="status", payload={"message": "Streaming Gemini output via pty."})
-        for event in _stream_subprocess_with_pty(
-            command,
-            prompt,
-            label="gemini",
-            cwd=_string_path(config.codex_working_dir),
-            env=build_gemini_env(config),
-            heartbeat_interval=DEFAULT_GEMINI_HEARTBEAT_INTERVAL_SECONDS,
-            timeout=timeout,
-        ):
-            if event.kind == "log":
-                _append_stream_text(event, output_chunks, stderr_chunks)
-            if event.kind == "error":
-                yield event
-                return
-            yield event
-    except OSError:
-        output_chunks.clear()
-        stderr_chunks.clear()
-        yield AgentStreamEvent(
-            kind="status",
-            payload={"message": "PTY unavailable; streaming Gemini output via pipes."},
-        )
-        for event in _stream_subprocess_with_pipes(
-            command,
-            prompt,
-            label="gemini",
-            cwd=_string_path(config.codex_working_dir),
-            env=build_gemini_env(config),
-            timeout=timeout,
-        ):
-            if event.kind == "log":
-                _append_stream_text(event, output_chunks, stderr_chunks)
-            if event.kind == "error":
-                yield event
-                return
-            yield event
-    except Exception as exc:
-        yield AgentStreamEvent(kind="error", payload={"message": str(exc)})
-        return
+    # Write prompt to a temp file to avoid ARG_MAX limits and agy's lack of
+    # stdin support.
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as prompt_file:
+        prompt_file.write(prompt)
+        prompt_file_path = prompt_file.name
 
-    yield _done_event(
-        output="".join(output_chunks),
-        stderr="".join(stderr_chunks),
-        agent=config.agent,
-    )
+    try:
+        skip_perms = "--dangerously-skip-permissions " if config.auto_approve else ""
+        shell_cmd = (
+            f"{shlex.quote(gemini_bin)} "
+            f"{skip_perms}"
+            f'--print "$(cat {shlex.quote(prompt_file_path)})"'
+        )
+        command = ["sh", "-c", shell_cmd]
+        env = build_gemini_env(config)
+        cwd = _string_path(config.codex_working_dir)
+
+        output_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        try:
+            yield AgentStreamEvent(kind="status", payload={"message": "Streaming Gemini output via pty."})
+            for event in _stream_subprocess_with_pty(
+                command,
+                prompt="",  # not used; write_stdin=False
+                label="gemini",
+                cwd=cwd,
+                env=env,
+                write_stdin=False,
+                heartbeat_interval=DEFAULT_GEMINI_HEARTBEAT_INTERVAL_SECONDS,
+                timeout=timeout,
+            ):
+                if event.kind == "log":
+                    _append_stream_text(event, output_chunks, stderr_chunks)
+                if event.kind == "error":
+                    yield event
+                    return
+                yield event
+        except OSError:
+            output_chunks.clear()
+            stderr_chunks.clear()
+            yield AgentStreamEvent(
+                kind="status",
+                payload={"message": "PTY unavailable; streaming Gemini output via pipes."},
+            )
+            for event in _stream_subprocess_with_pipes(
+                command,
+                prompt="",
+                label="gemini",
+                cwd=cwd,
+                env=env,
+                write_stdin=False,
+                timeout=timeout,
+            ):
+                if event.kind == "log":
+                    _append_stream_text(event, output_chunks, stderr_chunks)
+                if event.kind == "error":
+                    yield event
+                    return
+                yield event
+        except Exception as exc:
+            yield AgentStreamEvent(kind="error", payload={"message": str(exc)})
+            return
+
+        yield _done_event(
+            output="".join(output_chunks),
+            stderr="".join(stderr_chunks),
+            agent=config.agent,
+        )
+    finally:
+        os.unlink(prompt_file_path)
 
 
 def _stream_subprocess_with_pty(
