@@ -819,13 +819,29 @@ def _run_gemini_internal(
     auto_approve: bool = False,
     timeout: float | None = None,
 ) -> _RunResult:
-    """Internal Gemini runner (using agy CLI under the hood)."""
-    command = build_gemini_command(auto_approve=auto_approve, prompt=prompt)
+    """Internal Gemini runner (using agy CLI under the hood).
 
-    logger.debug("Running agy command: %s", command)
-    proc_env = build_gemini_env(model)
+    The prompt is written to a temporary file and passed to agy via shell
+    command substitution to avoid ARG_MAX limits on very long prompts.
+    """
+    import shlex
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as prompt_file:
+        prompt_file.write(prompt)
+        prompt_file_path = prompt_file.name
 
     try:
+        gemini_bin = shlex.quote(find_gemini_bin())
+        skip_perms = "--dangerously-skip-permissions " if auto_approve else ""
+        cat_path = shlex.quote(prompt_file_path)
+        shell_cmd = f'{gemini_bin} {skip_perms}--print "$(cat {cat_path})"'
+        command = ["sh", "-c", shell_cmd]
+
+        logger.debug("Running agy command via temp file: %s", prompt_file_path)
+        proc_env = build_gemini_env(model)
+
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -836,6 +852,8 @@ def _run_gemini_internal(
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(f"Gemini timed out after {timeout} seconds") from e
+    finally:
+        os.unlink(prompt_file_path)
 
     return _RunResult(
         output=completed.stdout,

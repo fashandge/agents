@@ -24,7 +24,8 @@ def test_build_gemini_command_without_prompt_keeps_legacy_stdin_form(monkeypatch
     ]
 
 
-def test_run_gemini_internal_sends_prompt_as_arg_not_stdin(monkeypatch):
+def test_run_gemini_internal_uses_temp_file_for_prompt(monkeypatch, tmp_path):
+    """Prompt is written to a temp file and passed via shell substitution."""
     monkeypatch.setattr(coding_agents_cli, "find_gemini_bin", lambda: "/tmp/agy")
     monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
 
@@ -46,13 +47,70 @@ def test_run_gemini_internal_sends_prompt_as_arg_not_stdin(monkeypatch):
         "the prompt", model="gemini-3.5-flash", auto_approve=True
     )
 
-    # Prompt is the --print argument; nothing is piped via stdin.
-    assert captured["command"] == [
-        "/tmp/agy",
-        "--dangerously-skip-permissions",
-        "--print",
-        "the prompt",
-    ]
+    # Command runs via sh -c with shell substitution.
+    assert captured["command"][0] == "sh"
+    assert captured["command"][1] == "-c"
+    shell_cmd = captured["command"][2]
+    assert "--print" in shell_cmd
+    assert "$(cat" in shell_cmd
+    assert "--dangerously-skip-permissions" in shell_cmd
+    # Nothing piped via stdin.
     assert "input" not in captured["kwargs"]
     assert result.output == '{"routings": []}'
     assert result.returncode == 0
+
+
+def test_run_gemini_internal_cleans_up_temp_file(monkeypatch):
+    """Temp file is deleted after the run, even on success."""
+    monkeypatch.setattr(coding_agents_cli, "find_gemini_bin", lambda: "/tmp/agy")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+
+    created_paths = []
+
+    import agents.coding_agents_cli as mod
+    orig_named_temp = mod.tempfile.NamedTemporaryFile
+
+    def tracking_named_temp(*args, **kwargs):
+        f = orig_named_temp(*args, **kwargs)
+        created_paths.append(f.name)
+        return f
+
+    monkeypatch.setattr(mod.tempfile, "NamedTemporaryFile", tracking_named_temp)
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", lambda *a, **kw: _Completed())
+
+    coding_agents_cli._run_gemini_internal(
+        "prompt", model="gemini-3.5-flash", auto_approve=False
+    )
+
+    import os
+    for p in created_paths:
+        assert not os.path.exists(p), f"temp file {p} was not cleaned up"
+
+
+def test_run_gemini_internal_works_without_auto_approve(monkeypatch):
+    """Command without --dangerously-skip-permissions when auto_approve=False."""
+    monkeypatch.setattr(coding_agents_cli, "find_gemini_bin", lambda: "/tmp/agy")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", lambda cmd, **kw: (captured.__setitem__("command", cmd), captured.__setitem__("kwargs", kw), _Completed())[-1])
+
+    coding_agents_cli._run_gemini_internal(
+        "prompt", model="gemini-3.5-flash", auto_approve=False
+    )
+
+    shell_cmd = captured["command"][2]
+    assert "--dangerously-skip-permissions" not in shell_cmd
+    assert "--print" in shell_cmd
