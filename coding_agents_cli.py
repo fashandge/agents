@@ -794,12 +794,21 @@ def build_gemini_env(model: str) -> dict[str, str]:
     return proc_env
 
 
-def build_gemini_command(*, auto_approve: bool) -> list[str]:
-    """Build an agy command that reads the prompt from stdin via ``--print -``."""
+def build_gemini_command(*, auto_approve: bool, prompt: str | None = None) -> list[str]:
+    """Build an agy command that runs a single prompt non-interactively.
+
+    agy no longer reads the prompt from stdin: passing ``--print -`` makes it
+    treat ``-`` as the literal prompt and reply with a generic greeting. The
+    prompt must be passed as the ``--print`` argument instead. When ``prompt``
+    is None the legacy ``--print -`` form is emitted (streaming path, which
+    supplies the prompt separately via a pty)."""
     command = [find_gemini_bin()]
     if auto_approve:
         command.append("--dangerously-skip-permissions")
-    command.extend(["--print", "-"])
+    if prompt is None:
+        command.extend(["--print", "-"])
+    else:
+        command.extend(["--print", prompt])
     return command
 
 
@@ -811,7 +820,7 @@ def _run_gemini_internal(
     timeout: float | None = None,
 ) -> _RunResult:
     """Internal Gemini runner (using agy CLI under the hood)."""
-    command = build_gemini_command(auto_approve=auto_approve)
+    command = build_gemini_command(auto_approve=auto_approve, prompt=prompt)
 
     logger.debug("Running agy command: %s", command)
     proc_env = build_gemini_env(model)
@@ -819,7 +828,6 @@ def _run_gemini_internal(
     try:
         completed = subprocess.run(
             command,
-            input=prompt,
             capture_output=True,
             text=True,
             check=False,
