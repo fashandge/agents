@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import getpass
 import os
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 
 def build_env() -> dict[str, str]:
-    """Build environment dict by sourcing ~/.zshenv and ~/.config/secrets.env.
+    """Build environment dict from shell startup configuration and secrets.
 
     Sources:
-    - ~/.zshenv: PATH and other non-sensitive env vars
+    - macOS: ~/.zshenv (PATH and other non-sensitive env vars)
+    - Linux: ~/.bashrc (including ~/.bashrc.d fragments)
     - ~/.config/secrets.env: API keys (should be chmod 600)
 
     Falls back gracefully if files don't exist or fail to source.
@@ -38,19 +41,44 @@ def build_env() -> dict[str, str]:
     if "HOME" not in env:
         env["HOME"] = str(Path.home())
 
-    # Source ~/.zshenv and ~/.config/secrets.env
+    # macOS uses zsh; the OCI/Linux hosts use Bash. Source the same startup
+    # file that non-interactive schedulers otherwise miss, so agent subprocesses
+    # receive the PATH and conda setup available to an interactive shell.
     home = Path(env["HOME"])
-    env_files = [home / ".zshenv", home / ".config/secrets.env"]
-    sources = [f"source {f}" for f in env_files if f.exists()]
+    if sys.platform == "darwin":
+        shell = "/bin/zsh"
+        startup_file = home / ".zshenv"
+    else:
+        shell = "/bin/bash"
+        startup_file = home / ".bashrc"
+
+    sources: list[str] = []
+    if startup_file.exists():
+        sources.append(f"source {shlex.quote(str(startup_file))}")
+    secrets_file = home / ".config/secrets.env"
+    if secrets_file.exists():
+        # secrets.env commonly uses bare KEY=value assignments. Enable
+        # auto-export while sourcing so `env` (and thus the subprocess dict)
+        # receives them without requiring users to change their secrets file.
+        quoted_secrets = shlex.quote(str(secrets_file))
+        sources.append(f"set -a && source {quoted_secrets} && set +a")
 
     if sources:
         try:
             result = subprocess.run(
-                ["/bin/zsh", "-c", " && ".join(sources) + " && env"],
+                [shell, "-c", " && ".join(sources) + " && env"],
                 capture_output=True,
                 text=True,
                 timeout=5,
-                env={"HOME": env["HOME"], "USER": env.get("USER", "")},
+                # A scheduler can invoke Python with no PATH at all. The shell
+                # startup files need basic POSIX tools (dirname, grep, awk,
+                # etc.) before they can activate conda and construct the final
+                # application PATH.
+                env={
+                    "HOME": env["HOME"],
+                    "USER": env.get("USER", ""),
+                    "PATH": env.get("PATH", os.defpath),
+                },
             )
             if result.returncode == 0:
                 for line in result.stdout.splitlines():

@@ -24,6 +24,45 @@ def test_build_gemini_command_without_prompt_keeps_legacy_stdin_form(monkeypatch
     ]
 
 
+def test_run_codex_internal_uses_built_environment(monkeypatch):
+    expected_env = {"PATH": "/agent-bin", "AGENT_TOKEN": "present"}
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "find_codex_binaries",
+        lambda: coding_agents_cli.CodexBinaries(node="/agent-bin/node", codex="/agent-bin/codex"),
+    )
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: expected_env)
+
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+
+    result = coding_agents_cli._run_codex_internal(
+        "prompt",
+        model="gpt-5.4-mini",
+        reasoning_effort="high",
+        auto_approve=True,
+        skip_git_check=True,
+        working_dir=None,
+        add_dirs=None,
+        output_schema=None,
+        timeout=30,
+    )
+
+    assert captured["kwargs"]["env"] is expected_env
+    assert result.output == "ok"
+
+
 def test_run_gemini_internal_uses_temp_file_for_prompt(monkeypatch, tmp_path):
     """Prompt is written to a temp file and passed via shell substitution."""
     monkeypatch.setattr(coding_agents_cli, "find_gemini_bin", lambda: "/tmp/agy")

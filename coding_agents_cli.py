@@ -587,6 +587,7 @@ def _run_codex_internal(
 
         logger.debug("Running codex command with stdin: %s", " ".join(command[:5]) + " ...")
         try:
+            proc_env = env.build_env()
             completed = subprocess.run(
                 command,
                 input=prompt,
@@ -594,6 +595,7 @@ def _run_codex_internal(
                 text=True,
                 check=False,
                 timeout=timeout,
+                env=proc_env,
             )
         except subprocess.TimeoutExpired as e:
             raise TimeoutError(f"Codex timed out after {timeout} seconds") from e
