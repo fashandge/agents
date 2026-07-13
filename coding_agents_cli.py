@@ -84,10 +84,19 @@ class AgentConfig:
             no MCP tools: it avoids the teardown hang where orphaned stdio MCP
             servers keep the PTY open so the wrapper never sees EOF, and it stops
             those servers from leaking as background processes.
+        claude_effort: Reasoning effort forwarded via Claude's ``--effort``
+            flag (low, medium, high, xhigh, max). When None (default), no
+            ``--effort`` flag is emitted and any ambient ``CLAUDE_EFFORT``
+            environment variable is left in effect via the inherited
+            subprocess env. Setting it explicitly overrides the env var for
+            this run. Accepted by both the direct ``claude -p`` path and the
+            ``claude-pty-wrapper`` path (which forwards ``--effort``).
 
     Codex-specific options (prefixed with codex_):
-        codex_reasoning_effort: Reasoning effort level (low, medium, high).
-            Defaults to ``"high"`` for gpt-5.4-mini and ``"medium"`` for others.
+        codex_reasoning_effort: Reasoning effort level
+            (low, medium, high, xhigh, max). Defaults to ``"high"`` for
+            gpt-5.4-mini and ``"medium"`` for others. xhigh/max are honoured by
+            extended-reasoning models (e.g. gpt-5.x reasoning variants).
         codex_working_dir: Working directory for Codex.
         codex_add_dirs: Additional directories to add to context.
         codex_output_schema: JSON schema for structured output.
@@ -100,6 +109,10 @@ class AgentConfig:
     # Claude-specific
     claude_use_pty_wrapper: bool = False
     claude_disable_mcp: bool = False
+    # Reasoning effort for Claude ("low", "medium", "high", "xhigh", "max").
+    # When None, no --effort flag is passed; an ambient CLAUDE_EFFORT env var
+    # (if set) continues to take effect via the inherited subprocess env.
+    claude_effort: str | None = None
 
     # Codex-specific
     codex_reasoning_effort: str | None = None
@@ -211,6 +224,7 @@ def run_with_config(
                 auto_approve=config.auto_approve,
                 use_pty_wrapper=config.claude_use_pty_wrapper,
                 disable_mcp=config.claude_disable_mcp,
+                effort=config.claude_effort,
                 timeout=timeout,
             )
         elif agent == AgentType.GEMINI:
@@ -336,6 +350,7 @@ def run_agent(
     model: str | None = None,
     auto_approve: bool = True,
     claude_use_pty_wrapper: bool = False,
+    claude_effort: str | None = None,
     codex_reasoning_effort: str | None = None,
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
@@ -353,11 +368,16 @@ def run_agent(
         agent: Which agent to use (codex, claude, gemini).
         model: Model name. Defaults to agent-specific default.
         auto_approve: Auto-approve all actions for unattended runs.
-        claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
+claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
             of ``claude -p``. Defaults to True.
-        codex_reasoning_effort: Reasoning effort (Codex only: low, medium, high).
-            If None, defaults to ``"high"`` for gpt-5.4-mini and ``"medium"``
-            for other models.
+        claude_effort: Reasoning effort for Claude runs forwarded via Claude's
+            ``--effort`` flag (low, medium, high, xhigh, max). When None (the
+            default), no ``--effort`` flag is emitted and any ambient
+            ``CLAUDE_EFFORT`` environment variable stays in effect.
+        codex_reasoning_effort: Reasoning effort (Codex only: low, medium, high,
+            xhigh, max). If None, defaults to ``"high"`` for gpt-5.4-mini and
+            ``"medium"`` for other models. xhigh/max require a model that
+            honours extended reasoning.
         codex_working_dir: Working directory (Codex only).
         codex_add_dirs: Additional directories to add (Codex only).
         codex_output_schema: JSON schema for structured output (Codex only).
@@ -365,7 +385,7 @@ def run_agent(
         timeout: Maximum time in seconds to wait. Defaults to 1200 (20 minutes).
 
     Returns:
-        AgentResult with output, returncode, stderr, and agent type.
+        An AgentResult with output, returncode, stderr, and agent type.
 
     Raises:
         FileNotFoundError: If agent binary is not found.
@@ -379,6 +399,7 @@ def run_agent(
             model=model,
             auto_approve=auto_approve,
             claude_use_pty_wrapper=claude_use_pty_wrapper,
+            claude_effort=claude_effort,
             codex_reasoning_effort=codex_reasoning_effort,
             codex_working_dir=codex_working_dir,
             codex_add_dirs=codex_add_dirs,
@@ -396,6 +417,7 @@ def run_agent_or_raise(
     model: str | None = None,
     auto_approve: bool = True,
     claude_use_pty_wrapper: bool = False,
+    claude_effort: str | None = None,
     codex_reasoning_effort: str | None = None,
     codex_working_dir: Path | None = None,
     codex_add_dirs: list[Path] | None = None,
@@ -410,6 +432,7 @@ def run_agent_or_raise(
     Args:
         claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
             of ``claude -p``. Defaults to True.
+        claude_effort: Reasoning effort for Claude runs (see :func:`run_agent`).
 
     Returns:
         The output string from the agent.
@@ -427,6 +450,7 @@ def run_agent_or_raise(
             model=model,
             auto_approve=auto_approve,
             claude_use_pty_wrapper=claude_use_pty_wrapper,
+            claude_effort=claude_effort,
             codex_reasoning_effort=codex_reasoning_effort,
             codex_working_dir=codex_working_dir,
             codex_add_dirs=codex_add_dirs,
@@ -695,6 +719,7 @@ def _run_claude_internal(
     use_pty_wrapper: bool,
     timeout: float | None,
     disable_mcp: bool = False,
+    effort: str | None = None,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -717,6 +742,13 @@ def _run_claude_internal(
             "--model",
             model,
         ]
+
+    # Forward reasoning effort when requested. Both `claude -p` and
+    # claude-pty-wrapper accept --effort and forward it to Claude. When omitted,
+    # an ambient CLAUDE_EFFORT env var (if any) still applies via the inherited
+    # subprocess env, so we only inject the flag when explicitly set.
+    if effort is not None:
+        command.extend(["--effort", effort])
 
     if auto_approve:
         command.extend(["--permission-mode", "bypassPermissions"])

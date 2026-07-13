@@ -153,3 +153,97 @@ def test_run_gemini_internal_works_without_auto_approve(monkeypatch):
     shell_cmd = captured["command"][2]
     assert "--dangerously-skip-permissions" not in shell_cmd
     assert "--print" in shell_cmd
+
+
+def test_run_claude_internal_forwards_effort_flag(monkeypatch):
+    """When claude_effort is set, --effort <level> is appended to the command."""
+    monkeypatch.setattr(coding_agents_cli, "find_claude_bin", lambda: "/tmp/claude")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+
+    coding_agents_cli._run_claude_internal(
+        "prompt",
+        model="sonnet",
+        auto_approve=True,
+        use_pty_wrapper=False,
+        timeout=30,
+        effort="xhigh",
+    )
+    cmd = captured["command"]
+    assert "--effort" in cmd
+    assert cmd.index("--effort") < len(cmd) - 1 and cmd[cmd.index("--effort") + 1] == "xhigh"
+
+
+def test_run_claude_internal_omits_effort_flag_when_none(monkeypatch):
+    """When effort is None, no --effort flag is emitted (env var stays in effect)."""
+    monkeypatch.setattr(coding_agents_cli, "find_claude_bin", lambda: "/tmp/claude")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+
+    coding_agents_cli._run_claude_internal(
+        "prompt",
+        model="sonnet",
+        auto_approve=True,
+        use_pty_wrapper=False,
+        timeout=30,
+        effort=None,
+    )
+    assert "--effort" not in captured["command"]
+
+
+def test_run_claude_internal_forwards_effort_via_pty_wrapper(monkeypatch):
+    """--effort is also forwarded when driving Claude through claude-pty-wrapper."""
+    monkeypatch.setattr(coding_agents_cli, "find_claude_bin", lambda: "/tmp/claude")
+    monkeypatch.setattr(
+        coding_agents_cli, "find_claude_pty_wrapper_bin", lambda: "/tmp/claude-pty-wrapper"
+    )
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+
+    coding_agents_cli._run_claude_internal(
+        "prompt",
+        model="sonnet",
+        auto_approve=True,
+        use_pty_wrapper=True,
+        timeout=30,
+        effort="max",
+    )
+    cmd = captured["command"]
+    assert "--effort" in cmd
+    assert cmd[cmd.index("--effort") + 1] == "max"

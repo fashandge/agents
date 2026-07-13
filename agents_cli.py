@@ -48,9 +48,20 @@ def main() -> None:
              "holding the PTY open, and stops them leaking as background procs.",
     )
     parser.add_argument(
-        "--codex-reasoning",
-        choices=["low", "medium", "high"],
+        "--claude-effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
         default=None,
+        help="Claude reasoning effort (forwarded via --effort). When omitted, "
+             "no --effort flag is sent and the ambient CLAUDE_EFFORT env var "
+             "(if any) stays in effect. Applies to both `claude -p` and "
+             "claude-pty-wrapper runs. Ignored for non-Claude agents.",
+    )
+    parser.add_argument(
+        "--codex-reasoning",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="Codex reasoning effort. xhigh/max require a model that honors "
+             "extended reasoning (e.g. gpt-5.x reasoning models).",
     )
     parser.add_argument("--codex-working-dir", default=None)
     parser.add_argument(
@@ -85,6 +96,7 @@ def main() -> None:
                 model=args.model if a == agents[0] else None,
                 auto_approve=auto_approve,
                 claude_disable_mcp=args.no_mcp,
+                claude_effort=args.claude_effort,
             )
             for a in agents
         ]
@@ -96,6 +108,7 @@ def main() -> None:
             auto_approve=auto_approve,
             claude_use_pty_wrapper=args.pty_wrapper,
             claude_disable_mcp=args.no_mcp,
+            claude_effort=args.claude_effort,
             codex_reasoning_effort=args.codex_reasoning,
             codex_working_dir=args.codex_working_dir,
         )
