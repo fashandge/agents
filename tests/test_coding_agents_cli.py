@@ -1,4 +1,63 @@
+from pathlib import Path
+
+import pytest
+
 from agents import coding_agents_cli
+
+
+def test_agent_config_validates_claude_review_target():
+    with pytest.raises(ValueError, match="claude_review_target"):
+        coding_agents_cli.AgentConfig(
+            agent="claude",
+            claude_review_command="code-review",
+            claude_review_target="123",
+        )
+
+
+def test_build_codex_command_uses_native_custom_review(monkeypatch):
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "find_codex_binaries",
+        lambda: coding_agents_cli.CodexBinaries(
+            node="/tmp/node",
+            codex="/tmp/codex",
+        ),
+    )
+    config = coding_agents_cli.AgentConfig(
+        agent="codex",
+        model="gpt-review",
+        auto_approve=False,
+        codex_reasoning_effort="high",
+        codex_working_dir=Path("/tmp/repo"),
+        codex_skip_git_check=False,
+        codex_review=True,
+    )
+
+    assert coding_agents_cli.build_codex_command(config) == [
+        "/tmp/node",
+        "/tmp/codex",
+        "exec",
+        "--cd",
+        "/tmp/repo",
+        "review",
+        "--model",
+        "gpt-review",
+        "-c",
+        'model_reasoning_effort="high"',
+        "-",
+    ]
+
+
+def test_build_claude_prompt_uses_unnamespaced_native_commands():
+    assert coding_agents_cli.build_claude_prompt(
+        "review context",
+        review_command="code-review",
+    ) == "/code-review\n\nreview context"
+    assert coding_agents_cli.build_claude_prompt(
+        "review context",
+        review_command="review",
+        review_target="123",
+    ) == "/review 123\n\nreview context"
 
 
 def test_build_gemini_command_passes_prompt_as_print_arg(monkeypatch):
@@ -184,6 +243,37 @@ def test_run_claude_internal_forwards_effort_flag(monkeypatch):
     cmd = captured["command"]
     assert "--effort" in cmd
     assert cmd.index("--effort") < len(cmd) - 1 and cmd[cmd.index("--effort") + 1] == "xhigh"
+
+
+def test_run_claude_internal_invokes_native_code_review(monkeypatch):
+    monkeypatch.setattr(coding_agents_cli, "find_claude_bin", lambda: "/tmp/claude")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs["input"]
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+
+    coding_agents_cli._run_claude_internal(
+        "context packet",
+        model="sonnet",
+        auto_approve=True,
+        use_pty_wrapper=False,
+        timeout=30,
+        review_command="code-review",
+    )
+
+    assert captured["input"] == "/code-review\n\ncontext packet"
+    assert "/code-review:code-review" not in captured["input"]
 
 
 def test_run_claude_internal_omits_effort_flag_when_none(monkeypatch):

@@ -1,4 +1,14 @@
-"""Reusable CLI utilities for running AI agent tools like Codex, Claude Code, and Gemini."""
+"""Reusable CLI utilities for running AI agent tools like Codex, Claude Code, and Gemini.
+
+Environment note (cmux + Claude Code): when one of these agent runs is spawned as a
+background child of a Claude Code session hosted inside cmux, an agent-process
+reaper can SIGKILL the whole process group roughly 6 minutes after the hosting
+session goes idle (observed 2026-07-15: two ~7-minute codex runs killed at idle+6min
+while plain shells survived; a detached run of the same command completed). For runs
+expected to exceed ~6 minutes in that environment, use ``run_detached`` (CLI:
+``--detach OUTPUT_BASE``) so the agent runs in its own session, invisible to the
+reaper's process-tree walk. Short runs don't need it.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +18,7 @@ import os
 import subprocess
 import tempfile
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -91,6 +101,10 @@ class AgentConfig:
             subprocess env. Setting it explicitly overrides the env var for
             this run. Accepted by both the direct ``claude -p`` path and the
             ``claude-pty-wrapper`` path (which forwards ``--effort``).
+        claude_review_command: Invoke an unnamespaced native Claude Code review
+            command before the supplied prompt: ``code-review`` for the current
+            working diff or ``review`` for a GitHub pull request.
+        claude_review_target: Optional PR number or URL passed to ``/review``.
 
     Codex-specific options (prefixed with codex_):
         codex_reasoning_effort: Reasoning effort level
@@ -101,6 +115,8 @@ class AgentConfig:
         codex_add_dirs: Additional directories to add to context.
         codex_output_schema: JSON schema for structured output.
         codex_skip_git_check: Skip git repository validation.
+        codex_review: Invoke the native headless ``codex exec review`` workflow
+            with the supplied prompt as custom review instructions.
     """
     agent: AgentType | Literal["codex", "claude", "gemini"] = AgentType.CLAUDE
     model: str | None = None
@@ -113,6 +129,8 @@ class AgentConfig:
     # When None, no --effort flag is passed; an ambient CLAUDE_EFFORT env var
     # (if set) continues to take effect via the inherited subprocess env.
     claude_effort: str | None = None
+    claude_review_command: Literal["code-review", "review"] | None = None
+    claude_review_target: str | None = None
 
     # Codex-specific
     codex_reasoning_effort: str | None = None
@@ -120,6 +138,7 @@ class AgentConfig:
     codex_add_dirs: list[Path] | None = None
     codex_output_schema: dict | None = None
     codex_skip_git_check: bool = True
+    codex_review: bool = False
 
     def __post_init__(self) -> None:
         # Normalise agent string → AgentType
@@ -133,6 +152,13 @@ class AgentConfig:
             self.codex_reasoning_effort = (
                 "high" if self.model == "gpt-5.4-mini" else "medium"
             )
+        if self.claude_review_command not in {None, "code-review", "review"}:
+            raise ValueError(f"Unknown Claude review command: {self.claude_review_command}")
+        if self.claude_review_target is not None:
+            if self.claude_review_command != "review":
+                raise ValueError("claude_review_target requires claude_review_command='review'")
+            if not self.claude_review_target.strip() or "\n" in self.claude_review_target:
+                raise ValueError("claude_review_target must be a non-empty single line")
 
 
 @dataclass(frozen=True)
@@ -216,6 +242,7 @@ def run_with_config(
                 add_dirs=config.codex_add_dirs,
                 output_schema=config.codex_output_schema,
                 timeout=timeout,
+                review=config.codex_review,
             )
         elif agent == AgentType.CLAUDE:
             result = _run_claude_internal(
@@ -226,6 +253,8 @@ def run_with_config(
                 disable_mcp=config.claude_disable_mcp,
                 effort=config.claude_effort,
                 timeout=timeout,
+                review_command=config.claude_review_command,
+                review_target=config.claude_review_target,
             )
         elif agent == AgentType.GEMINI:
             result = _run_gemini_internal(
@@ -341,6 +370,96 @@ def run_with_config_and_fallback(
         "All agents failed:\n" + "\n".join(f"  - {e}" for e in errors)
     )
 
+
+def run_detached(
+    runner: Callable[[], AgentResult],
+    output_base: str | Path,
+) -> dict:
+    """Run an agent call as a fully detached daemon and return immediately.
+
+    Use this only when the run is expected to be LONG (more than ~6 minutes) and
+    the caller lives inside an environment whose idle reaper kills agent child
+    processes — see the module docstring. Short runs gain nothing from it and
+    lose the natural wait-for-exit-code contract.
+
+    The agent runs in its own session (double fork + ``os.setsid``), reparented
+    to launchd/init, so it survives the caller's exit and is invisible to
+    process-tree walks of the calling session. Results are file-based:
+
+    - ``<output_base>.out``      — the agent's final output (``AgentResult.output``)
+    - ``<output_base>.err``      — stderr/log stream while running (line-buffered)
+    - ``<output_base>.pid``      — pid of the detached process
+    - ``<output_base>.exitcode`` — written LAST; its existence means the run is done
+
+    Callers poll for ``.exitcode`` to detect completion.
+
+    Args:
+        runner: Zero-arg callable executing the agent call (e.g. a closure over
+            ``run_with_config(...)``). It runs inside the detached process; any
+            configured timeout still applies there. An exception in the runner
+            is written to ``.err`` and yields exit code 1.
+        output_base: Path prefix for the result files; parent dirs are created.
+
+    Returns:
+        Dict with ``pid`` and the four file paths, from the calling process.
+    """
+    base = Path(output_base)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    paths = {name: f"{base}.{name}" for name in ("out", "err", "pid", "exitcode")}
+
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid > 0:  # original process
+        os.close(write_fd)
+        with os.fdopen(read_fd) as fh:
+            daemon_pid = int(fh.read().strip() or "-1")
+        os.waitpid(pid, 0)  # reap the intermediate child
+        return {
+            "pid": daemon_pid,
+            "out": paths["out"],
+            "err": paths["err"],
+            "pid_file": paths["pid"],
+            "exitcode": paths["exitcode"],
+        }
+
+    # Intermediate child: new session, then exit so the grandchild is orphaned
+    # (reparented to launchd) and can never reacquire a controlling terminal.
+    os.close(read_fd)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+
+    # Grandchild (the detached daemon).
+    rc = 1
+    try:
+        with os.fdopen(write_fd, "w") as fh:
+            fh.write(str(os.getpid()))
+        Path(paths["pid"]).write_text(str(os.getpid()))
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        err_fd = os.open(paths["err"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.dup2(err_fd, 1)  # stray stdout prints belong in the log stream;
+        os.dup2(err_fd, 2)  # the real answer is written to .out explicitly.
+        # Rebind the Python-level streams too: a wrapper (pytest capture, an
+        # outer redirector) may have replaced sys.stdout/sys.stderr with objects
+        # that bypass fds 1/2 entirely.
+        import sys
+
+        sys.stdout = os.fdopen(1, "w", buffering=1)
+        sys.stderr = os.fdopen(2, "w", buffering=1)
+        try:
+            result = runner()
+            Path(paths["out"]).write_text(result.output)
+            rc = result.returncode
+        except BaseException:
+            import traceback
+
+            traceback.print_exc()
+    finally:
+        try:
+            Path(paths["exitcode"]).write_text(str(rc))
+        finally:
+            os._exit(rc if 0 <= rc < 256 else 1)
 
 
 def run_agent(
@@ -532,15 +651,27 @@ def build_codex_command(
 ) -> list[str]:
     """Build a Codex CLI command from an AgentConfig."""
     binaries = find_codex_binaries()
-    command = [
-        binaries.node,
-        binaries.codex,
-        "exec",
-        "--model",
-        str(config.model),
-        "-c",
-        f'model_reasoning_effort="{config.codex_reasoning_effort}"',
-    ]
+    native_review = config.codex_review
+    command = [binaries.node, binaries.codex, "exec"]
+
+    # `--cd` and `--add-dir` are `codex exec` options, so they must precede the
+    # `review` subcommand. Keep the legacy generic command ordering unchanged.
+    if native_review:
+        if config.codex_working_dir:
+            command.extend(["--cd", str(config.codex_working_dir)])
+        if config.codex_add_dirs:
+            for add_dir in config.codex_add_dirs:
+                command.extend(["--add-dir", str(add_dir)])
+        command.append("review")
+
+    command.extend(
+        [
+            "--model",
+            str(config.model),
+            "-c",
+            f'model_reasoning_effort="{config.codex_reasoning_effort}"',
+        ]
+    )
 
     if config.auto_approve:
         command.append("--dangerously-bypass-approvals-and-sandbox")
@@ -548,10 +679,10 @@ def build_codex_command(
     if config.codex_skip_git_check:
         command.append("--skip-git-repo-check")
 
-    if config.codex_working_dir:
+    if config.codex_working_dir and not native_review:
         command.extend(["--cd", str(config.codex_working_dir)])
 
-    if config.codex_add_dirs:
+    if config.codex_add_dirs and not native_review:
         for add_dir in config.codex_add_dirs:
             command.extend(["--add-dir", str(add_dir)])
 
@@ -576,6 +707,7 @@ def _run_codex_internal(
     add_dirs: list[Path] | None,
     output_schema: dict | None,
     timeout: float | None,
+    review: bool = False,
 ) -> _RunResult:
     """Internal Codex runner."""
     schema_path: Path | None = None
@@ -604,6 +736,7 @@ def _run_codex_internal(
                 codex_add_dirs=add_dirs,
                 codex_output_schema=output_schema,
                 codex_skip_git_check=skip_git_check,
+                codex_review=review,
             ),
             output_schema_path=schema_path,
             output_path=output_path,
@@ -644,6 +777,24 @@ def _run_codex_internal(
 # =============================================================================
 # Claude Code CLI
 # =============================================================================
+
+
+def build_claude_prompt(
+    prompt: str,
+    *,
+    review_command: Literal["code-review", "review"] | None = None,
+    review_target: str | None = None,
+) -> str:
+    """Prefix a prompt with an unnamespaced native Claude review command."""
+    if review_command is None:
+        return prompt
+
+    command = f"/{review_command}"
+    if review_target is not None:
+        command = f"{command} {review_target}"
+    if not prompt:
+        return command
+    return f"{command}\n\n{prompt}"
 
 
 def find_claude_bin() -> str:
@@ -720,6 +871,8 @@ def _run_claude_internal(
     timeout: float | None,
     disable_mcp: bool = False,
     effort: str | None = None,
+    review_command: Literal["code-review", "review"] | None = None,
+    review_target: str | None = None,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -769,9 +922,14 @@ def _run_claude_internal(
     if use_pty_wrapper and timeout is not None:
         subprocess_timeout = timeout + 10
     try:
+        effective_prompt = build_claude_prompt(
+            prompt,
+            review_command=review_command,
+            review_target=review_target,
+        )
         completed = subprocess.run(
             command,
-            input=prompt,
+            input=effective_prompt,
             capture_output=True,
             text=True,
             check=False,

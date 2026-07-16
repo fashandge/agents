@@ -138,6 +138,38 @@ def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch)
     assert events[-1].payload["result"].output == "claude answer"
 
 
+def test_stream_claude_prefixes_native_review_command(monkeypatch):
+    captured = {}
+
+    def fake_stream(prompt, *, model, auto_approve, timeout, cwd):
+        captured["prompt"] = prompt
+        yield claude_pty_wrapper_streaming.ClaudePtyStreamEvent(
+            kind="done",
+            payload={
+                "result": claude_pty_wrapper_streaming.ClaudePtyStreamResult(
+                    output="review",
+                    returncode=0,
+                    stderr="",
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        streaming.claude_pty_wrapper_streaming,
+        "stream_claude_pty",
+        fake_stream,
+    )
+    config = _config(
+        "claude",
+        claude_review_command="review",
+        claude_review_target="123",
+    )
+
+    list(streaming.stream_with_config("context", config))
+
+    assert captured["prompt"] == "/review 123\n\ncontext"
+
+
 def test_build_gemini_command_and_env(monkeypatch):
     monkeypatch.setattr(streaming.coding_agents_cli, "find_gemini_bin", lambda: "/tmp/agy")
     monkeypatch.setattr(streaming.coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})

@@ -12,11 +12,13 @@ This file provides guidance to AI coding agents (Claude Code, Codex, OpenClaw, H
 - Run a single test: `... -m pytest tests/test_openrouter.py::test_openrouter_client_sends_chat_completion_request`
 - Source Codex bin/node discovery (finds newest NVM node with `codex` installed and exports `CODEX_BIN` / `CODEX_NODE_BIN`): `source scripts/codex-env.sh`
 - Run an agent from the shell: `python agents_cli.py [-a claude|codex|gemini] [-m MODEL] "prompt"` — prompt can also be piped via stdin or supplied as a heredoc. Use `--fallback claude,codex,gemini` to walk a fallback chain.
+- Invoke native code review: add `--codex-review` to pass the prompt through headless `codex exec review`, or `--claude-review-command code-review|review` (and an optional PR `--claude-review-target` for review).
+- Long runs (> ~6 min) launched from a cmux-hosted Claude Code session: add `--detach OUTPUT_BASE` — runs in its own session (immune to the cmux idle reaper), answer in `OUTPUT_BASE.out`, `.exitcode` written last (poll for it). Short runs don't need it.
 
 ## Architecture (details: docs/architecture.md)
 
 - **`env.build_env()`** — sources `~/.zshenv` + `~/.config/secrets.env` into an env dict for `subprocess.run(env=...)`; the single entry point for PATH/API keys under launchd/cron.
-- **`coding_agents_cli`** — unified blocking interface for the three agent CLIs: `AgentConfig` dataclass (all options, agent-name-prefixed), `run_with_config()`, `run_with_config_and_fallback()` (Codex → Claude → Gemini).
+- **`coding_agents_cli`** — unified blocking interface for the three agent CLIs: `AgentConfig` dataclass (all options, including native-review routing, are agent-name-prefixed), `run_with_config()`, `run_with_config_and_fallback()` (Codex → Claude → Gemini).
 - **`coding_agents_streaming`** / **`claude_pty_wrapper_streaming`** — same agents, yielding `AgentStreamEvent`s as the process runs.
 - **`openrouter`** / **`deepseek`** — small, self-contained, stdlib-only chat-completion clients (deliberately share no code).
 - **`openclaw`** — messaging wrapper over the `openclaw` CLI (`send_message` / `send_discord`); no network call or token in this repo.

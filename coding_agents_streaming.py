@@ -229,8 +229,13 @@ def _stream_claude(
         payload={"message": "Streaming Claude output via claude-pty-wrapper."},
     )
     try:
-        for event in claude_pty_wrapper_streaming.stream_claude_pty(
+        effective_prompt = coding_agents_cli.build_claude_prompt(
             prompt,
+            review_command=config.claude_review_command,
+            review_target=config.claude_review_target,
+        )
+        for event in claude_pty_wrapper_streaming.stream_claude_pty(
+            effective_prompt,
             model=str(config.model),
             auto_approve=config.auto_approve,
             timeout=timeout,

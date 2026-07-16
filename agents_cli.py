@@ -2,6 +2,7 @@
 """CLI wrapper for agents.coding_agents_cli."""
 
 import argparse
+import json
 import sys
 
 from agents import coding_agents_cli
@@ -11,6 +12,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="agents-cli",
         description="Run a coding agent (claude, codex, gemini) with a prompt.",
+        epilog=(
+            "environment note:\n"
+            "  When agents-cli runs as a background child of a Claude Code session\n"
+            "  hosted inside cmux, an agent-process reaper can kill the run ~6 minutes\n"
+            "  after the session goes idle. ONLY when the run is expected to be long\n"
+            "  (more than ~6 minutes — e.g. high/xhigh reasoning over a large task),\n"
+            "  pass --detach OUTPUT_BASE in that environment; short runs don't need it."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "prompt", nargs="?",
@@ -57,6 +67,18 @@ def main() -> None:
              "claude-pty-wrapper runs. Ignored for non-Claude agents.",
     )
     parser.add_argument(
+        "--claude-review-command",
+        choices=["code-review", "review"],
+        default=None,
+        help="Invoke an unnamespaced native Claude review command: code-review "
+             "for the current working diff, or review for a GitHub pull request.",
+    )
+    parser.add_argument(
+        "--claude-review-target",
+        default=None,
+        help="Optional PR number or URL passed to --claude-review-command review.",
+    )
+    parser.add_argument(
         "--codex-reasoning",
         choices=["low", "medium", "high", "xhigh", "max"],
         default=None,
@@ -65,6 +87,12 @@ def main() -> None:
     )
     parser.add_argument("--codex-working-dir", default=None)
     parser.add_argument(
+        "--codex-review",
+        action="store_true",
+        help="Invoke native headless `codex exec review` with the prompt as "
+             "custom review instructions.",
+    )
+    parser.add_argument(
         "--fallback",
         type=str,
         default=None,
@@ -72,9 +100,23 @@ def main() -> None:
         help="Comma-separated fallback order, e.g. claude,codex,gemini. "
              "Tries each agent in order until one succeeds.",
     )
+    parser.add_argument(
+        "--detach",
+        metavar="OUTPUT_BASE",
+        default=None,
+        help="Run detached in its own session (double fork + setsid) and exit "
+             "immediately, printing one JSON line with the pid and result-file "
+             "paths. The final answer goes to OUTPUT_BASE.out, logs/stderr to "
+             ".err, and .exitcode is written last (poll for it to detect "
+             "completion). Use ONLY for runs expected to exceed ~6 minutes "
+             "inside a cmux-hosted Claude Code session (see environment note "
+             "below); short runs don't need it.",
+    )
 
     args = parser.parse_args()
 
+    if args.claude_review_target and args.claude_review_command != "review":
+        parser.error("--claude-review-target requires --claude-review-command review")
     if args.prompt:
         prompt = args.prompt
     elif not sys.stdin.isatty():
@@ -97,10 +139,15 @@ def main() -> None:
                 auto_approve=auto_approve,
                 claude_disable_mcp=args.no_mcp,
                 claude_effort=args.claude_effort,
+                claude_review_command=args.claude_review_command,
+                claude_review_target=args.claude_review_target,
+                codex_review=args.codex_review,
             )
             for a in agents
         ]
-        result = coding_agents_cli.run_with_config_and_fallback(prompt, configs, timeout=args.timeout)
+        runner = lambda: coding_agents_cli.run_with_config_and_fallback(
+            prompt, configs, timeout=args.timeout
+        )
     else:
         config = coding_agents_cli.AgentConfig(
             agent=args.agent,
@@ -109,11 +156,22 @@ def main() -> None:
             claude_use_pty_wrapper=args.pty_wrapper,
             claude_disable_mcp=args.no_mcp,
             claude_effort=args.claude_effort,
+            claude_review_command=args.claude_review_command,
+            claude_review_target=args.claude_review_target,
             codex_reasoning_effort=args.codex_reasoning,
             codex_working_dir=args.codex_working_dir,
+            codex_review=args.codex_review,
         )
-        result = coding_agents_cli.run_with_config(prompt, config, timeout=args.timeout)
+        runner = lambda: coding_agents_cli.run_with_config(
+            prompt, config, timeout=args.timeout
+        )
 
+    if args.detach:
+        info = coding_agents_cli.run_detached(runner, args.detach)
+        print(json.dumps(info))
+        sys.exit(0)
+
+    result = runner()
     sys.stdout.write(result.output)
     sys.exit(result.returncode)
 
