@@ -14,6 +14,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, OpenClaw, H
 - Run an agent from the shell: `python agents_cli.py [-a claude|codex|gemini] [-m MODEL] "prompt"` — prompt can also be piped via stdin or supplied as a heredoc. Use `--fallback claude,codex,gemini` to walk a fallback chain.
 - Invoke native code review: add `--codex-review` to pass the prompt through headless `codex exec review`, or `--claude-review-command code-review|review` (and an optional PR `--claude-review-target` for review).
 - Long runs (> ~6 min) launched from a cmux-hosted Claude Code session: add `--detach OUTPUT_BASE` — runs in its own session (immune to the cmux idle reaper), answer in `OUTPUT_BASE.out`, `.exitcode` written last (poll for it). Short runs don't need it.
+- Create/inspect a durable handoff run: `/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python -m agents.orchestration.handoffctl --help`; launch one through local cmux/tmux or remote SSH+tmux with `scripts/handoff_agent.sh --help`.
 
 ## Architecture (details: docs/architecture.md)
 
@@ -22,6 +23,8 @@ This file provides guidance to AI coding agents (Claude Code, Codex, OpenClaw, H
 - **`coding_agents_streaming`** / **`claude_pty_wrapper_streaming`** — same agents, yielding `AgentStreamEvent`s as the process runs.
 - **`openrouter`** / **`deepseek`** — small, self-contained, stdlib-only chat-completion clients (deliberately share no code).
 - **`openclaw`** — messaging wrapper over the `openclaw` CLI (`send_message` / `send_discord`); no network call or token in this repo.
+- **`orchestration.handoff` / `orchestration.handoffctl`** — standard-library local-v1 durable handoff protocol: locked JSONL journals, atomic state projections, scoped token/epoch ownership, explicit recovery, and review/integration state.
+- **`orchestration.handoff_launcher` / `scripts/handoff_agent.sh`** — safe local cmux/tmux and remote SSH+tmux launcher for Claude Code (`opus/high`), Codex (`gpt-5.6-terra/xhigh`), and Kimi Code (`kimi-code/k3`/`max`), with model/effort overrides; remote requests carry kickoff bytes as JSON over SSH stdin and keep the authoritative run on the worker host. Launch-only returns without a readiness wait and releases its lease, while managed monitoring is opt-in.
 - `agents_cli.py` — thin argparse shell entry point over `coding_agents_cli`.
 
 ## Rules that change what you do

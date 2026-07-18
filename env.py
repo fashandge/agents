@@ -66,9 +66,8 @@ def build_env() -> dict[str, str]:
     if sources:
         try:
             result = subprocess.run(
-                [shell, "-c", " && ".join(sources) + " && env"],
+                [shell, "-c", " && ".join(sources) + " && env -0"],
                 capture_output=True,
-                text=True,
                 timeout=5,
                 # A scheduler can invoke Python with no PATH at all. The shell
                 # startup files need basic POSIX tools (dirname, grep, awk,
@@ -81,11 +80,17 @@ def build_env() -> dict[str, str]:
                 },
             )
             if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if "=" in line:
-                        key, _, value = line.partition("=")
-                        env[key] = value
+                for record in result.stdout.split(b"\0"):
+                    key, separator, value = record.partition(b"=")
+                    if separator:
+                        decoded_key = key.decode("utf-8", errors="surrogateescape")
+                        # Bash serializes exported functions as multiline
+                        # BASH_FUNC_* values. They are unnecessary for agent
+                        # subprocesses and become an injection/noise surface
+                        # when forwarded through SSH, tmux, or /bin/sh.
+                        if not decoded_key.startswith("BASH_FUNC_"):
+                            env[decoded_key] = value.decode("utf-8", errors="surrogateescape")
         except Exception:
             pass
 
-    return env
+    return {key: value for key, value in env.items() if not key.startswith("BASH_FUNC_")}

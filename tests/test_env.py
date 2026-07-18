@@ -4,7 +4,11 @@ from agents import env
 def test_build_env_sources_linux_bashrc_and_exports_bare_secrets(monkeypatch, tmp_path):
     """Linux uses Bash startup and exports bare secrets.env assignments."""
     (tmp_path / ".bashrc").write_text(
-        'export PATH="/linux-agent-bin:$PATH"\nexport BASHRC_MARKER=loaded\n',
+        'export PATH="/linux-agent-bin:$PATH"\n'
+        'export BASHRC_MARKER=loaded\n'
+        "export MULTILINE_MARKER=$'line one\\nline two'\n"
+        "remote_helper() { :; }\n"
+        "export -f remote_helper\n",
         encoding="utf-8",
     )
     secrets_dir = tmp_path / ".config"
@@ -15,6 +19,7 @@ def test_build_env_sources_linux_bashrc_and_exports_bare_secrets(monkeypatch, tm
     )
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USER", "test-user")
+    monkeypatch.setenv("BASH_FUNC_parent%%", "() { :; }")
     monkeypatch.delenv("PATH", raising=False)
     monkeypatch.setattr(env.sys, "platform", "linux")
 
@@ -23,3 +28,5 @@ def test_build_env_sources_linux_bashrc_and_exports_bare_secrets(monkeypatch, tm
     assert built["BASHRC_MARKER"] == "loaded"
     assert "/linux-agent-bin" in built["PATH"]
     assert built["BARE_SECRET"] == "available"
+    assert built["MULTILINE_MARKER"] == "line one\nline two"
+    assert not any(key.startswith("BASH_FUNC_") for key in built)

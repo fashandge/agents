@@ -1,0 +1,804 @@
+"""Safe cmux/tmux launcher for local and SSH-hosted handoff workers.
+
+The terminal is sent one shell command containing only two shell-quoted paths:
+an immutable private wrapper and its private JSON configuration. User content is
+loaded by Python and passed directly to the agent as argv, never interpreted by a
+shell. Remote requests send kickoff bytes and launch options as JSON over SSH
+stdin; only a fixed, shell-quoted module command crosses the remote shell boundary.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+from agents import env
+from agents.orchestration import handoff
+
+
+CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+REMOTE_PYTHON_DEFAULT = "python3"
+KIMI_SUBMIT_SETTLE_SECONDS = 0.5
+REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
+AGENT_DEFAULTS = {
+    "claude": ("opus", "high"),
+    "codex": ("gpt-5.6-terra", "xhigh"),
+    "kimi": ("kimi-code/k3", "max"),
+}
+
+
+def _compact_terminal_text(value: str) -> str:
+    return "".join(value.split())
+
+
+def _kimi_instruction_count(screen: str, instruction: str) -> int:
+    welcome_position = screen.rfind("Welcome to Kimi Code!")
+    visible_agent_output = screen[welcome_position:] if welcome_position >= 0 else screen
+    return _compact_terminal_text(visible_agent_output).count(
+        _compact_terminal_text(instruction),
+    )
+
+
+def _kimi_input_ready(screen: str) -> bool:
+    return any(
+        re.match(r"^\s*(?:[│|]\s*)?>\s*(?:[│|])?\s*$", line)
+        for line in screen.splitlines()
+    )
+
+
+def _kimi_instruction_accepted(
+    screen: str,
+    instruction: str,
+    *,
+    previous_count: int,
+) -> bool:
+    return (
+        _kimi_instruction_count(screen, instruction) > previous_count
+        and _kimi_input_ready(screen)
+    )
+
+
+def _wrapper_source(python_executable: str | None = None) -> str:
+    executable = python_executable or sys.executable
+    if "\n" in executable or "\r" in executable:
+        raise AdapterError("Python executable path contains a newline")
+    return (
+        f"#!{executable}\n"
+        "from agents.orchestration import handoff_launcher\n"
+        "handoff_launcher.exec_from_config()\n"
+    )
+
+
+class AdapterError(handoff.HandoffError):
+    def __init__(self, message: str):
+        super().__init__(message, 6)
+
+
+def _process_env() -> dict[str, str]:
+    return env.build_env()
+
+
+def _run(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, env=_process_env(), timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AdapterError(f"session adapter failed: {exc}") from exc
+    if check and result.returncode != 0:
+        raise AdapterError(f"session adapter command failed ({result.returncode}): {' '.join(argv[:2])}: {result.stderr.strip()}")
+    return result
+
+
+def _remote_host(value: str) -> str:
+    if not REMOTE_HOST_RE.fullmatch(value):
+        raise handoff.HandoffError("remote host must be an SSH hostname, alias, or user@host without options", 2)
+    return value
+
+
+def _run_ssh(
+    host: str,
+    remote_argv: list[str],
+    *,
+    stdin: str,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    host = _remote_host(host)
+    command = shlex.join(remote_argv)
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            env=_process_env(),
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AdapterError(f"remote SSH launch failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise AdapterError(f"remote SSH launch failed ({result.returncode}): {detail}")
+    return result
+
+
+class TmuxAdapter:
+    def __init__(self, binary: str = "tmux"):
+        self.binary = binary
+
+    def launch(self, name: str, cwd: Path, terminal_command: str, workspace: str | None = None) -> str:
+        if _run([self.binary, "has-session", "-t", name], check=False).returncode == 0:
+            raise handoff.HandoffError(f"tmux session already exists: {name}", 4)
+        _run([self.binary, "new-session", "-d", "-s", name, "-c", str(cwd)])
+        self._type(name, terminal_command)
+        return name
+
+    def _type(self, handle: str, text: str) -> None:
+        _run([self.binary, "send-keys", "-t", handle, "-l", text])
+        _run([self.binary, "send-keys", "-t", handle, "Enter"])
+
+    def probe(self, handle: str, expected_agent: str) -> bool:
+        if _run([self.binary, "has-session", "-t", handle], check=False).returncode != 0:
+            return False
+        result = _run(
+            [self.binary, "list-panes", "-t", handle, "-F", "#{pane_dead}\t#{pane_pid}\t#{pane_current_command}"],
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) != 3 or fields[0] != "0":
+                continue
+            command = fields[2].lower()
+            if expected_agent in command:
+                return True
+            # Codex is commonly a Node entry point; confirm the pane leader's
+            # full argv rather than treating any live shell as worker liveness.
+            ps = _run(["ps", "-o", "command=", "-p", fields[1]], check=False)
+            if ps.returncode == 0 and expected_agent in ps.stdout.lower():
+                return True
+        return False
+
+    def capture(self, handle: str) -> str:
+        return _run([self.binary, "capture-pane", "-p", "-t", handle, "-S", "-2000"]).stdout
+
+    def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
+        self._type(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
+
+    def send_literal(self, handle: str, text: str) -> bool:
+        previous_count = _kimi_instruction_count(self.capture(handle), text)
+        _run([self.binary, "send-keys", "-t", handle, "-l", text])
+        # Kimi's interactive input widget does not reliably submit on tmux's
+        # synthetic Enter key (notably when extended-keys is disabled).  LF is
+        # the preferred terminal-level submit sequence.  Some Kimi versions
+        # instead leave LF in the input widget, so verify and fall back once to
+        # Enter.  Keep _type() on Enter for shell commands and doorbells.
+        _run([self.binary, "send-keys", "-t", handle, "C-j"])
+        time.sleep(KIMI_SUBMIT_SETTLE_SECONDS)
+        if _kimi_instruction_accepted(
+            self.capture(handle), text, previous_count=previous_count,
+        ):
+            return True
+        _run([self.binary, "send-keys", "-t", handle, "Enter"])
+        time.sleep(KIMI_SUBMIT_SETTLE_SECONDS)
+        return _kimi_instruction_accepted(
+            self.capture(handle), text, previous_count=previous_count,
+        )
+
+    def rescue_command(self, handle: str) -> str:
+        return f"tmux capture-pane -p -t {shlex.quote(handle)} -S -2000"
+
+
+class CmuxAdapter:
+    def __init__(self, binary: str = CMUX_DEFAULT):
+        self.binary = binary
+        self.workspace: str | None = None
+
+    def launch(self, name: str, cwd: Path, terminal_command: str, workspace: str | None = None) -> str:
+        if not workspace:
+            workspace = _run([self.binary, "current-workspace"]).stdout.strip()
+        if not workspace:
+            raise AdapterError("cmux did not report a current workspace")
+        self.workspace = workspace
+        result = _run([
+            self.binary, "--id-format", "both", "new-surface", "--type", "terminal",
+            "--workspace", workspace, "--focus", "false",
+        ])
+        match = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", result.stdout)
+        if not match:
+            raise AdapterError(f"could not parse cmux surface UUID: {result.stdout.strip()}")
+        handle = match.group(0).lower()
+        _run([self.binary, "rename-tab", "--workspace", workspace, "--surface", handle, name], check=False)
+        self._type(handle, terminal_command)
+        return handle
+
+    def _type(self, handle: str, text: str) -> None:
+        if not self.workspace:
+            raise AdapterError("cmux workspace was not resolved before sending input")
+        _run([self.binary, "send", "--workspace", self.workspace, "--surface", handle, text])
+        _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
+
+    def probe(self, handle: str, expected_agent: str) -> bool:
+        surfaces = _run(
+            [self.binary, "--id-format", "both", "list-pane-surfaces"],
+            check=False,
+        )
+        if surfaces.returncode != 0 or handle.lower() not in surfaces.stdout.lower():
+            return False
+        processes = _run([
+            self.binary, "--id-format", "both", "top", "--all", "--processes",
+            "--flat", "--format", "tsv",
+        ], check=False)
+        if processes.returncode != 0:
+            return False
+        # Require both the surface and expected agent in the process inventory;
+        # this avoids mistaking a live trust/TUI shell for the agent loop.
+        lowered = processes.stdout.lower()
+        return handle.lower() in lowered and expected_agent.lower() in lowered
+
+    def capture(self, handle: str) -> str:
+        if not self.workspace:
+            raise AdapterError("cmux workspace was not resolved before capturing output")
+        return _run([
+            self.binary, "read-screen", "--workspace", self.workspace,
+            "--surface", handle, "--scrollback",
+        ]).stdout
+
+    def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
+        self._type(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
+
+    def send_literal(self, handle: str, text: str) -> bool:
+        if not self.workspace:
+            raise AdapterError("cmux workspace was not resolved before sending input")
+        # The shell can echo an early, dropped bootstrap instruction into
+        # scrollback before Kimi's TUI is ready.  Only accept a newly visible
+        # occurrence so stale scrollback cannot produce a false success.
+        previous_count = _kimi_instruction_count(self.capture(handle), text)
+        _run([
+            self.binary, "send", "--workspace", self.workspace,
+            "--surface", handle, text,
+        ])
+        # Prefer Ctrl-J because some Kimi versions treat synthetic Enter as an
+        # input newline.  Kimi 0.27.0 can instead leave Ctrl-J unsubmitted, so
+        # inspect the input widget and fall back once to Enter.
+        _run([
+            self.binary, "send-key", "--workspace", self.workspace,
+            "--surface", handle, "ctrl+j",
+        ])
+        time.sleep(KIMI_SUBMIT_SETTLE_SECONDS)
+        if _kimi_instruction_accepted(
+            self.capture(handle), text, previous_count=previous_count,
+        ):
+            return True
+        _run([
+            self.binary, "send-key", "--workspace", self.workspace,
+            "--surface", handle, "enter",
+        ])
+        time.sleep(KIMI_SUBMIT_SETTLE_SECONDS)
+        return _kimi_instruction_accepted(
+            self.capture(handle), text, previous_count=previous_count,
+        )
+
+    def rescue_command(self, handle: str) -> str:
+        workspace = self.workspace
+        if not workspace:
+            return f"{shlex.quote(self.binary)} read-screen --surface {shlex.quote(handle)} --scrollback"
+        return (
+            f"{shlex.quote(self.binary)} read-screen --workspace {shlex.quote(workspace)} "
+            f"--surface {shlex.quote(handle)} --scrollback"
+        )
+
+
+def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str]:
+    agent = config["agent"]
+    executable = shutil.which(agent, path=process_env.get("PATH"))
+    if executable is None:
+        raise AdapterError(f"agent executable not found: {agent}")
+    if agent == "claude":
+        prompt = Path(config["kickoff"]).read_text(encoding="utf-8")
+        argv = [executable, "--model", config["model"]]
+        if config["effort"]:
+            argv.extend(["--effort", config["effort"]])
+        argv.extend(["--permission-mode", config["pmode"], prompt])
+        return argv
+    if agent == "codex":
+        prompt = Path(config["kickoff"]).read_text(encoding="utf-8")
+        argv = [executable, "-m", config["model"]]
+        if config["effort"]:
+            argv.extend(["-c", f"model_reasoning_effort={config['effort']}"])
+        if config["pmode"] == "bypassPermissions":
+            argv.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            argv.extend(["-a", "on-request"])
+        argv.append(prompt)
+        return argv
+    if agent == "kimi":
+        argv = [executable, "-m", config["model"]]
+        if config["pmode"] == "bypassPermissions":
+            argv.append("--yolo")
+        elif config["pmode"] == "auto":
+            argv.append("--auto")
+        return argv
+    raise handoff.HandoffError(f"unsupported agent: {agent}", 2)
+
+
+def exec_from_config(config_path: str | None = None) -> None:
+    """Replace the private wrapper process with the configured agent."""
+    if config_path is None:
+        if len(sys.argv) != 2:
+            raise SystemExit("usage: private-wrapper CONFIG")
+        config_path = sys.argv[1]
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    expected = {"agent", "model", "effort", "pmode", "cwd", "run_dir", "worker_token_file", "kickoff"}
+    if set(config) != expected:
+        raise SystemExit("invalid private launch config")
+    process_env = _process_env()
+    process_env["HANDOFF_RUN_DIR"] = config["run_dir"]
+    process_env["HANDOFF_WORKER_TOKEN_FILE"] = config["worker_token_file"]
+    if config["agent"] == "kimi" and config["effort"]:
+        process_env["KIMI_MODEL_THINKING_EFFORT"] = config["effort"]
+    os.chdir(config["cwd"])
+    argv = _agent_argv(config, process_env)
+    os.execvpe(argv[0], argv, process_env)
+
+
+def _private_launch_files(private_dir: Path, config: dict[str, Any]) -> tuple[Path, Path]:
+    wrapper = private_dir / "launch_worker.py"; config_path = private_dir / "launch.json"
+    handoff._write_new(wrapper, _wrapper_source().encode(), 0o700)  # noqa: SLF001
+    handoff._write_new(config_path, handoff._json_bytes(config), 0o600)  # noqa: SLF001
+    handoff._fsync_dir(private_dir)  # noqa: SLF001
+    return wrapper, config_path
+
+
+def wait_ready(adapter: Any, handle: str, expected_agent: str, run_dir: Path, *, timeout: float = 120.0, poll_interval: float = 0.25) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if adapter.probe(handle, expected_agent):
+            try:
+                if handoff.status(run_dir)["revision"] > 1:
+                    return True
+            except handoff.HandoffError:
+                pass
+        time.sleep(poll_interval)
+    return False
+
+
+def wait_process(adapter: Any, handle: str, expected_agent: str, *, timeout: float = 120.0, poll_interval: float = 0.25) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if adapter.probe(handle, expected_agent):
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+def wait_kimi_input_ready(
+    adapter: Any,
+    handle: str,
+    *,
+    timeout: float = 120.0,
+    poll_interval: float = 0.25,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _kimi_input_ready(adapter.capture(handle)):
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+def _kimi_kickoff_instruction(run_dir: Path) -> str:
+    kickoff_path = json.dumps(str(run_dir / "kickoff.md"), ensure_ascii=False)
+    return f"Read the handoff kickoff from {kickoff_path} and follow it completely."
+
+
+def bootstrap_kimi(
+    adapter: Any,
+    handle: str,
+    *,
+    run_dir: Path,
+    timeout: float = 120.0,
+) -> bool:
+    started_at = time.monotonic()
+    if not wait_process(adapter, handle, "kimi", timeout=timeout):
+        return False
+    # Process visibility precedes Kimi's interactive input loop.  Wait for the
+    # actual input widget: a fixed delay can still send into startup output,
+    # where the instruction is echoed into scrollback and then dropped.  Share
+    # one startup budget across both phases so either may consume the time it
+    # legitimately needs without doubling the caller's configured timeout.
+    remaining = max(0.0, timeout - (time.monotonic() - started_at))
+    input_ready = remaining > 0.0 and wait_kimi_input_ready(
+        adapter,
+        handle,
+        timeout=remaining,
+    )
+    if not input_ready:
+        return False
+    return adapter.send_literal(handle, _kimi_kickoff_instruction(run_dir))
+
+
+def _select_backend(backend: str | None, cmux_binary: str) -> str:
+    if backend is not None:
+        if backend not in {"cmux", "tmux"}:
+            raise handoff.HandoffError("backend must be cmux or tmux", 2)
+        return backend
+    cmux_ok = (
+        bool(os.environ.get("CMUX_WORKSPACE_ID"))
+        and Path(cmux_binary).is_file()
+        and _run([cmux_binary, "ping"], check=False).returncode == 0
+    )
+    if cmux_ok:
+        return "cmux"
+    if shutil.which("tmux", path=_process_env().get("PATH")):
+        return "tmux"
+    raise AdapterError("no backend: cmux socket is unavailable and tmux is not installed")
+
+
+def launch(
+    *, name: str, kickoff: Path, cwd: Path, agent: str = "claude", backend: str | None = None,
+    model: str | None = None, effort: str | None = None, pmode: str = "bypassPermissions",
+    workspace: str | None = None, inputs: list[str] | None = None,
+    state_root: Path | None = None, run_dir: Path | None = None,
+    readiness_timeout: float = 120.0, cmux_binary: str = CMUX_DEFAULT,
+    confirm_ready: bool = False, retain_coordinator: bool = False,
+    credential_dir: Path | None = None, recorded_transport: str | None = None,
+) -> dict[str, Any]:
+    cwd = Path(cwd).resolve(strict=True); kickoff = Path(kickoff).resolve(strict=True)
+    if agent not in AGENT_DEFAULTS:
+        raise handoff.HandoffError("agent must be claude, codex, or kimi", 2)
+    default_model, default_effort = AGENT_DEFAULTS[agent]
+    model = default_model if model is None else model
+    effort = default_effort if effort is None else effort
+    recorded_model = model or "configured-default"
+    backend = _select_backend(backend, cmux_binary)
+    protocol_transport = recorded_transport or backend
+
+    configured_private_dir = credential_dir or os.environ.get("HANDOFF_CREDENTIAL_DIR")
+    if configured_private_dir:
+        private_dir = Path(configured_private_dir).resolve(strict=False)
+        private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(private_dir, 0o700)
+    else:
+        credentials_root = Path.home() / ".local/state/agents/handoff/credentials"
+        credentials_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(credentials_root, 0o700)
+        private_dir = Path(tempfile.mkdtemp(prefix="handoff-launch-", dir=credentials_root))
+        os.chmod(private_dir, 0o700)
+    initialized = handoff.initialize(
+        workspace=cwd, kickoff=kickoff, harness=agent, model=recorded_model, effort=effort,
+        transport=protocol_transport, inputs=inputs or [], state_root=state_root, run_dir=run_dir,
+        recovery_token_file=private_dir / "recovery.token",
+        coordinator_token_file=private_dir / "coordinator.token",
+        worker_token_file=private_dir / "worker.token",
+    )
+    actual_run_dir = Path(initialized["run_dir"])
+    config = {
+        "agent": agent, "model": model, "effort": effort, "pmode": pmode,
+        "cwd": str(cwd), "run_dir": str(actual_run_dir),
+        "worker_token_file": str(private_dir / "worker.token"),
+        "kickoff": str(actual_run_dir / "kickoff.md"),
+    }
+    wrapper, config_path = _private_launch_files(private_dir, config)
+    terminal_command = f"exec {shlex.quote(str(wrapper))} {shlex.quote(str(config_path))}"
+    adapter: Any = CmuxAdapter(cmux_binary) if backend == "cmux" else TmuxAdapter()
+    handle = adapter.launch(name, cwd, terminal_command, workspace)
+    goal_file = Path(str(kickoff) + ".goal")
+    ready: bool | None = None
+    rescue: str | None = None
+    if agent == "kimi":
+        kickoff_sent = bootstrap_kimi(
+            adapter,
+            handle,
+            run_dir=actual_run_dir,
+            timeout=readiness_timeout,
+        )
+        if not kickoff_sent:
+            rescue = adapter.rescue_command(handle)
+        elif confirm_ready:
+            # Kimi process startup and semantic readiness have separate waits.
+            # Refresh ownership between them so a slow startup cannot make the
+            # eventual launch-only release fail on an expired lease.
+            handoff.control_renew(actual_run_dir, (private_dir / "coordinator.token").read_bytes())
+            ready = wait_ready(adapter, handle, agent, actual_run_dir, timeout=readiness_timeout)
+            if not ready:
+                rescue = adapter.rescue_command(handle)
+    elif goal_file.is_file():
+        ready = wait_ready(adapter, handle, agent, actual_run_dir, timeout=readiness_timeout)
+        if ready:
+            first_line = goal_file.read_text(encoding="utf-8").splitlines()[0]
+            adapter.send_literal(handle, first_line)
+        else:
+            rescue = adapter.rescue_command(handle)
+    elif confirm_ready:
+        ready = wait_ready(adapter, handle, agent, actual_run_dir, timeout=readiness_timeout)
+        if not ready:
+            rescue = adapter.rescue_command(handle)
+    coordinator_released = False
+    if not retain_coordinator:
+        coordinator_token = (private_dir / "coordinator.token").read_bytes()
+        handoff.control_release(actual_run_dir, coordinator_token)
+        coordinator_released = True
+    return {
+        "run_dir": str(actual_run_dir), "transport": protocol_transport,
+        "session_transport": backend, "handle": handle,
+        "agent": agent, "model": recorded_model, "effort": effort,
+        "worker_ready": ready,
+        "kickoff_sent": bool(agent != "kimi" or kickoff_sent),
+        "goal_sent": bool(agent != "kimi" and goal_file.is_file() and ready),
+        "coordinator_released": coordinator_released,
+        "rescue_command": rescue,
+    }
+
+
+REMOTE_REQUEST_FIELDS = {
+    "name", "kickoff_b64", "goal_b64", "cwd", "agent", "model", "effort",
+    "pmode", "inputs", "state_root", "run_dir", "readiness_timeout",
+    "confirm_ready", "retain_coordinator", "credential_dir",
+}
+
+
+def _remote_path(value: Any, field: str, *, required: bool = False) -> Path | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value:
+        raise handoff.HandoffError(f"remote {field} must be a non-empty absolute path", 2)
+    path = Path(value)
+    if not path.is_absolute():
+        raise handoff.HandoffError(f"remote {field} must be an absolute path", 2)
+    return path
+
+
+def _decode_remote_file(value: Any, field: str, *, required: bool = False) -> bytes | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise handoff.HandoffError(f"remote {field} must be base64 text", 2)
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise handoff.HandoffError(f"remote {field} is not valid base64", 2) from exc
+    if len(decoded) > handoff.MAX_KICKOFF:
+        raise handoff.HandoffError(f"remote {field} exceeds {handoff.MAX_KICKOFF} bytes", 2)
+    return decoded
+
+
+def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
+    """Validate a JSON-over-stdin request and launch it on this SSH host."""
+    if not isinstance(request, dict) or set(request) != REMOTE_REQUEST_FIELDS:
+        raise handoff.HandoffError("invalid remote launch request", 2)
+    if not isinstance(request["name"], str) or not request["name"]:
+        raise handoff.HandoffError("remote name must be a non-empty string", 2)
+    if request["agent"] not in AGENT_DEFAULTS:
+        raise handoff.HandoffError("remote agent must be claude, codex, or kimi", 2)
+    for field in ("model", "effort"):
+        if request[field] is not None and not isinstance(request[field], str):
+            raise handoff.HandoffError(f"remote {field} must be a string or null", 2)
+    if not isinstance(request["pmode"], str) or not request["pmode"]:
+        raise handoff.HandoffError("remote pmode must be a non-empty string", 2)
+    if not isinstance(request["inputs"], list) or not all(isinstance(item, str) for item in request["inputs"]):
+        raise handoff.HandoffError("remote inputs must be a list of paths", 2)
+    if not isinstance(request["readiness_timeout"], (int, float)) or request["readiness_timeout"] <= 0:
+        raise handoff.HandoffError("remote readiness_timeout must be positive", 2)
+    for field in ("confirm_ready", "retain_coordinator"):
+        if not isinstance(request[field], bool):
+            raise handoff.HandoffError(f"remote {field} must be boolean", 2)
+
+    cwd = _remote_path(request["cwd"], "cwd", required=True)
+    state_root = _remote_path(request["state_root"], "state_root")
+    run_dir = _remote_path(request["run_dir"], "run_dir")
+    credential_dir = _remote_path(request["credential_dir"], "credential_dir")
+    if request["retain_coordinator"] and credential_dir is None:
+        raise handoff.HandoffError("managed remote launch requires credential_dir", 2)
+    kickoff_bytes = _decode_remote_file(request["kickoff_b64"], "kickoff", required=True)
+    goal_bytes = _decode_remote_file(request["goal_b64"], "goal")
+
+    source_dir = Path(tempfile.mkdtemp(prefix="handoff-remote-kickoff-"))
+    os.chmod(source_dir, 0o700)
+    kickoff = source_dir / "kickoff.md"
+    try:
+        handoff._write_new(kickoff, kickoff_bytes, 0o600)  # noqa: SLF001
+        if goal_bytes is not None:
+            handoff._write_new(Path(str(kickoff) + ".goal"), goal_bytes, 0o600)  # noqa: SLF001
+        return launch(
+            name=request["name"], kickoff=kickoff, cwd=cwd,
+            agent=request["agent"], backend="tmux", model=request["model"],
+            effort=request["effort"], pmode=request["pmode"],
+            inputs=request["inputs"], state_root=state_root, run_dir=run_dir,
+            readiness_timeout=float(request["readiness_timeout"]),
+            confirm_ready=request["confirm_ready"],
+            retain_coordinator=request["retain_coordinator"],
+            credential_dir=credential_dir, recorded_transport="ssh_tmux",
+        )
+    finally:
+        shutil.rmtree(source_dir, ignore_errors=True)
+
+
+def _ssh_display_command(host: str, remote_argv: list[str]) -> str:
+    return shlex.join(["ssh", host, shlex.join(remote_argv)])
+
+
+def launch_remote(
+    *, host: str, remote_python: str, name: str, kickoff: Path,
+    remote_cwd: Path, agent: str = "claude", model: str | None = None,
+    effort: str | None = None, pmode: str = "bypassPermissions",
+    inputs: list[str] | None = None, state_root: Path | None = None,
+    run_dir: Path | None = None, readiness_timeout: float = 120.0,
+    confirm_ready: bool = False, retain_coordinator: bool = False,
+    credential_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Launch through an installed copy of this module on an SSH host."""
+    host = _remote_host(host)
+    kickoff = Path(kickoff).resolve(strict=True)
+    remote_cwd = _remote_path(str(remote_cwd), "cwd", required=True)
+    credential_dir = _remote_path(str(credential_dir), "credential_dir") if credential_dir is not None else None
+    if retain_coordinator and credential_dir is None:
+        raise handoff.HandoffError(
+            "managed remote launch requires HANDOFF_REMOTE_CREDENTIAL_DIR", 2,
+        )
+    goal_file = Path(str(kickoff) + ".goal")
+    payload = {
+        "name": name,
+        "kickoff_b64": base64.b64encode(kickoff.read_bytes()).decode("ascii"),
+        "goal_b64": base64.b64encode(goal_file.read_bytes()).decode("ascii") if goal_file.is_file() else None,
+        "cwd": str(remote_cwd),
+        "agent": agent,
+        "model": model,
+        "effort": effort,
+        "pmode": pmode,
+        "inputs": inputs or [],
+        "state_root": str(state_root) if state_root is not None else None,
+        "run_dir": str(run_dir) if run_dir is not None else None,
+        "readiness_timeout": readiness_timeout,
+        "confirm_ready": confirm_ready,
+        "retain_coordinator": retain_coordinator,
+        "credential_dir": str(credential_dir) if credential_dir is not None else None,
+    }
+    remote_argv = [
+        remote_python, "-m", "agents.orchestration.handoff_launcher",
+        "--receive-remote-request",
+    ]
+    completed = _run_ssh(
+        host,
+        remote_argv,
+        stdin=json.dumps(payload, ensure_ascii=False),
+        timeout=max(30.0, readiness_timeout + 30.0),
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise AdapterError("remote launcher returned no JSON response")
+    try:
+        remote_result = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise AdapterError("remote launcher returned invalid JSON") from exc
+    if not isinstance(remote_result, dict) or not isinstance(remote_result.get("run_dir"), str):
+        raise AdapterError("remote launcher returned an invalid result object")
+    remote_run_dir = remote_result["run_dir"]
+    remote_handle = remote_result.get("handle")
+    if not isinstance(remote_handle, str):
+        raise AdapterError("remote launcher did not return a session handle")
+    result = dict(remote_result)
+    result.update({
+        "run_dir": f"ssh://{host}{remote_run_dir}",
+        "remote_run_dir": remote_run_dir,
+        "remote_host": host,
+        "transport": "ssh_tmux",
+        "session_transport": "tmux",
+        "handle": f"ssh://{host}/tmux/{remote_handle}",
+        "remote_handle": remote_handle,
+    })
+    if remote_result.get("rescue_command"):
+        result["rescue_command"] = _ssh_display_command(
+            host,
+            ["tmux", "capture-pane", "-p", "-t", remote_handle, "-S", "-2000"],
+        )
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Launch a protocol-managed autonomous coding agent")
+    parser.add_argument("name"); parser.add_argument("prompt_file", type=Path)
+    parser.add_argument("cwd", nargs="?", type=Path)
+    parser.add_argument(
+        "--agent",
+        choices=tuple(AGENT_DEFAULTS),
+        default=os.environ.get("HANDOFF_AGENT", "claude"),
+    )
+    parser.add_argument("--backend", choices=("cmux", "tmux"), default=os.environ.get("HANDOFF_BACKEND") or None)
+    parser.add_argument(
+        "--remote-host",
+        default=os.environ.get("HANDOFF_REMOTE_HOST") or None,
+        help="launch on an SSH host that has this agents package, tmux, and the selected agent installed",
+    )
+    parser.add_argument(
+        "--remote-cwd",
+        type=Path,
+        default=Path(os.environ["HANDOFF_REMOTE_CWD"]) if os.environ.get("HANDOFF_REMOTE_CWD") else None,
+        help="absolute worker checkout path on --remote-host",
+    )
+    parser.add_argument(
+        "--remote-python",
+        default=os.environ.get("HANDOFF_REMOTE_PYTHON", REMOTE_PYTHON_DEFAULT),
+        help="Python executable on --remote-host",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("HANDOFF_MODEL") or None,
+        help="override model (defaults: claude=opus, codex=gpt-5.6-terra, kimi=kimi-code/k3)",
+    )
+    parser.add_argument(
+        "--effort",
+        default=os.environ.get("HANDOFF_EFFORT") or None,
+        help="override reasoning effort (defaults: claude=high, codex=xhigh, kimi=max)",
+    )
+    parser.add_argument("--pmode", default=os.environ.get("HANDOFF_PMODE", "bypassPermissions"))
+    parser.add_argument("--workspace"); parser.add_argument("--input", action="append", default=[])
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument("--state-root", type=Path); destination.add_argument("--run-dir", type=Path)
+    parser.add_argument("--readiness-timeout", type=float, default=120.0)
+    parser.add_argument("--wait-ready", action="store_true", help="wait for the worker-ready checkpoint")
+    parser.add_argument("--retain-coordinator", action="store_true", help="retain the coordinator lease for active monitoring")
+    parser.add_argument("--cmux-binary", default=CMUX_DEFAULT)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    actual_argv = sys.argv[1:] if argv is None else argv
+    if actual_argv == ["--receive-remote-request"]:
+        try:
+            request = json.load(sys.stdin)
+            print(json.dumps(receive_remote_request(request), ensure_ascii=False, sort_keys=True))
+            return 0
+        except (json.JSONDecodeError, handoff.HandoffError) as exc:
+            exit_code = exc.exit_code if isinstance(exc, handoff.HandoffError) else 2
+            print(f"handoff_agent: {exc}", file=sys.stderr)
+            return exit_code
+    try:
+        args = build_parser().parse_args(actual_argv)
+        if args.remote_host:
+            remote_cwd = args.remote_cwd or args.cwd
+            if remote_cwd is None:
+                raise handoff.HandoffError("a remote checkout path is required with --remote-host", 2)
+            if args.backend is not None or args.workspace is not None:
+                raise handoff.HandoffError("--remote-host cannot be combined with --backend or --workspace", 2)
+            configured_remote_private = os.environ.get("HANDOFF_REMOTE_CREDENTIAL_DIR")
+            result = launch_remote(
+                host=args.remote_host, remote_python=args.remote_python,
+                name=args.name, kickoff=args.prompt_file, remote_cwd=remote_cwd,
+                agent=args.agent, model=args.model, effort=args.effort, pmode=args.pmode,
+                inputs=args.input, state_root=args.state_root, run_dir=args.run_dir,
+                readiness_timeout=args.readiness_timeout, confirm_ready=args.wait_ready,
+                retain_coordinator=args.retain_coordinator,
+                credential_dir=Path(configured_remote_private) if configured_remote_private else None,
+            )
+        else:
+            result = launch(
+                name=args.name, kickoff=args.prompt_file, cwd=args.cwd or Path.cwd(), agent=args.agent,
+                backend=args.backend, model=args.model, effort=args.effort, pmode=args.pmode,
+                workspace=args.workspace, inputs=args.input, state_root=args.state_root,
+                run_dir=args.run_dir, readiness_timeout=args.readiness_timeout,
+                cmux_binary=args.cmux_binary, confirm_ready=args.wait_ready,
+                retain_coordinator=args.retain_coordinator,
+            )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        if result["rescue_command"]:
+            print(f"worker readiness timed out; inspect with: {result['rescue_command']}", file=sys.stderr)
+        return 0
+    except handoff.HandoffError as exc:
+        print(f"handoff_agent: {exc}", file=sys.stderr)
+        return exc.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
