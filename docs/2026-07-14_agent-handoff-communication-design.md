@@ -961,8 +961,9 @@ the local-v1 build and must not delay it.
 - Build a harness conformance matrix: which hooks fire on explicit prompts, automatic
   goal continuations, stop, resume, and compaction; which can add model-visible context;
   and which require trust approval.
-- Decide whether Codex app tasks receive an automated task-messaging adapter or remain a
-  documented manual adapter when the relevant app API is unavailable.
+- Keep Codex app task orchestration outside local-v1: the `handoff-agent` skill uses
+  native project-scoped task creation, waiting, reading, and follow-up messaging when
+  those app controls are available, with a documented manual fallback when they are not.
 - Choose archive retention after `accepted` + `integrated`/`abandoned`; never garbage
   collect solely because a run is old while review or integration is pending.
 - Decide whether a future protocol version permits source attachments outside the
