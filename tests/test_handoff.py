@@ -262,6 +262,53 @@ def test_result_acceptance_success_and_integration_are_distinct(run):
     assert integrated["control"]["integration"]["state"] == "integrated"
 
 
+def test_supersede_resumes_awaiting_review_and_binds_fresh_result(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    first = handoff.emit(
+        run_dir, run["worker"], type="result", body="first result",
+        data={
+            "head": None, "dirty": True, "stage": "done", "inbox_cursor": 0,
+            "verification": [], "commitments": [],
+        },
+    )
+    handoff.control_consume(run_dir, run["coordinator"], through=2)
+
+    supersede = handoff.send(
+        run_dir, run["coordinator"], type="supersede",
+        reply_to=first["message"]["message_id"], body="refresh the lookup",
+    )
+    assert supersede["control"]["review_state"] == "superseded"
+    resumed = checkpoint(run, supersede["message"]["seq"])
+    assert resumed["status"]["state"] == "working"
+
+    second = handoff.emit(
+        run_dir, run["worker"], type="result", body="fresh result",
+        data={
+            "head": None, "dirty": True, "stage": "done",
+            "inbox_cursor": supersede["message"]["seq"],
+            "verification": [], "commitments": [],
+        },
+    )
+    consumed = handoff.control_consume(
+        run_dir, run["coordinator"], through=second["message"]["seq"],
+    )
+    assert consumed["control"]["review_state"] == "pending"
+    assert consumed["control"]["review_result_id"] == second["message"]["message_id"]
+    assert handoff.doctor(run_dir)["ok"]
+
+
+def test_supersede_requires_current_awaiting_review_result(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+
+    with pytest.raises(handoff.HandoffError, match="current result"):
+        handoff.send(
+            run_dir, run["coordinator"], type="supersede",
+            reply_to=str(uuid.uuid4()), body="invalid resume",
+        )
+
+
 def test_only_latest_review_disposition_authorizes_worker_transition(run):
     run_dir = Path(run["run_dir"])
     checkpoint(run, 0)

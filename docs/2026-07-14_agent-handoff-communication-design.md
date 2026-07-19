@@ -1,8 +1,9 @@
 # Agent handoff & orchestration: communication design
 
-Date: 2026-07-14 · Revised: 2026-07-17 · Status: DESIGN v1.3
-(normative and implemented for the local protocol plus local and single-worker SSH
-launchers; hook, native-app, and multi-worker roster adapters remain staged follow-ups)
+Date: 2026-07-14 · Revised: 2026-07-18 · Status: DESIGN v1.4
+(normative and implemented for the local protocol, local and single-worker SSH
+launchers, and detached orchestrator watching; hook, concrete native-app messaging,
+and multi-worker roster adapters remain staged follow-ups)
 
 ## 1. Requirements and scope
 
@@ -169,7 +170,7 @@ Rules:
 1. Sequence numbers start at 1 and are contiguous **per journal** across writer
    takeovers. A cursor means the highest contiguous sequence durably processed, not
    merely the highest sequence observed.
-2. Inbox types are `steer`, `answer`, `review`, `input-changed`, `base-changed`,
+2. Inbox types are `steer`, `supersede`, `answer`, `review`, `input-changed`, `base-changed`,
    `integration`, `coordinator-takeover`, `worker-relaunched`, and `stop`. Outbox
    types are `checkpoint`, `question`, `result`, and `error`.
 3. `reply_to` references a stable `message_id`; answers to questions must set it.
@@ -232,7 +233,7 @@ still live in coordinator-owned state.
 ```
 
 `desired_state` is `run` or `stop`; `review_state` is `pending`,
-`changes_requested`, or `accepted`; integration state is `pending`, `integrated`, or
+`changes_requested`, `superseded`, or `accepted`; integration state is `pending`, `integrated`, or
 `abandoned`. `review_result_id` binds the review state to one exact outbox `result`
 message. The orchestrator advances `outbox_cursor` only after consuming all prior
 worker events. `last_command_seq` is the highest inbox command reflected in the
@@ -299,6 +300,8 @@ The launcher embeds these instructions in every kickoff:
   signal.
 - Process inbox records in sequence. Advance `inbox_cursor` only after the instruction
   and any durable reminder it creates have been recorded.
+- Treat a `supersede` tied to the current result as the next instruction: consume it,
+  checkpoint back to `working`, and publish a fresh result when complete.
 - At each checkpoint, use one helper operation to append a concise `checkpoint` event,
   update `status.json`, and mirror the same summary to `progress.md`. The outbox event
   is authoritative if the helper is interrupted between those writes.
@@ -342,6 +345,141 @@ is dead, resume/relaunch with the takeover rules above. Sleep, host suspension, 
 network partitions can look like hangs, so liveness never automatically transfers a
 single-writer resource.
 
+#### 4.6.1 Detached orchestrator watcher and outbox doorbells
+
+The generic `handoffctl watch` command is a read-only observation tool. A managed
+orchestrator additionally needs a **session-owned detached watcher** so that the same
+orchestrator conversation can continue accepting user prompts and spawning workers
+while worker outbox events are detected. This is a layer-2/3 adapter; it does not add a
+message type or weaken the filesystem protocol's authority.
+
+There is one watcher per orchestrator session, not one watcher per worker. The
+orchestrator creates an opaque `coordinator_id` and registers its exact routable session
+target before or with its first worker launch. Each run registry record created by that
+orchestrator carries the same `coordinator_id`. The watcher reloads the registry on
+every poll and selects only records with its ID. A newly spawned worker is therefore
+discovered without restarting the watcher; a run owned by another orchestrator is
+never surfaced to this session. Existing unowned registry records require an explicit
+adopt operation rather than being guessed from repository or terminal proximity.
+
+The session target is transport-specific and must be resolved exactly at registration:
+
+- cmux records the actual workspace reference returned by `cmux current-workspace`
+  plus the orchestrator surface UUID;
+- tmux records an exact session/pane handle; and
+- a native app adapter records the stable thread/task ID accepted by its messaging API.
+
+The watcher stores no recovery, coordinator, or worker token. Its state lives in a
+mode-`0700` private coordinator directory with a mode-`0600` atomic JSON snapshot and a
+single-instance lock. At minimum the snapshot contains:
+
+```json
+{
+  "version": 1,
+  "coordinator_id": "uuid",
+  "transport": "cmux",
+  "target": {"workspace": "workspace:9", "surface": "uuid"},
+  "runs": {
+    "run-uuid": {
+      "observed_through": 7,
+      "doorbell_through": 7,
+      "doorbell_pending": true,
+      "last_doorbell_at": "RFC3339"
+    }
+  }
+}
+```
+
+The follow-up CLI surface is:
+
+```text
+handoffctl watch --coordinator-state ABSOLUTE_PATH [--interval SECONDS]
+```
+
+The orchestrator/session adapter creates the initial state file safely and starts this
+long-running command detached; `handoffctl` itself does not daemonize. Coordinator mode
+is mutually exclusive with `--run`, `--timeout`, `--once`, and `--notify-cmux`, because
+its target, membership, lifecycle, and doorbell policy come from the coordinator state.
+Without `--coordinator-state`, the existing generic JSONL observer behavior remains
+unchanged. Its registry-level `observed_outbox_cursor` is not reused by coordinator
+mode: each coordinator keeps independent delivery state so concurrent observers cannot
+steal notifications from one another.
+
+These are delivery cursors, not semantic-processing state:
+
+- `observed_through` means the watcher has validated outbox records through that
+  sequence;
+- `doorbell_through` means a doorbell covering that sequence has been attempted; and
+- `control.outbox_cursor` remains the only statement that the orchestrator has
+  durably consumed a contiguous outbox prefix.
+
+The watcher must never advance `control.outbox_cursor`, answer a question, review a
+result, acquire a coordinator lease, or write a worker inbox. A doorbell can be
+duplicated or lost without changing protocol truth.
+
+The default polling interval is five seconds. Each iteration performs the following
+steps:
+
+1. Reload and validate the private run registry so new workers are discovered.
+2. Resolve each matching local or remote record on its owning host and read
+   `control.outbox_cursor`, the validated outbox tail, and any records not yet reflected
+   in the watcher's delivery state. Active remote journals remain remote; SSH reads do
+   not copy or synchronize them.
+3. Atomically record the newly observed tail before attempting notification. If the
+   process crashes after the state write but before the doorbell, restart recovery
+   treats the notification as pending and retries it. A crash after the doorbell but
+   before recording success may produce a duplicate, which is harmless.
+4. Coalesce all currently pending runs into one opaque orchestrator doorbell. The
+   doorbell contains only the `coordinator_id`, run IDs, and highest outbox sequences,
+   or a pointer to the private watcher snapshot; it never includes worker message
+   bodies, artifacts, prompts, or credentials.
+5. Leave `doorbell_pending` set until each covered run's
+   `control.outbox_cursor >= doorbell_through`. Events arriving while a doorbell is
+   pending extend the observed tail. If the orchestrator consumes only the older
+   prefix, the watcher sends another coalesced doorbell for the remaining prefix.
+
+Push remains best-effort, so an unacknowledged doorbell is retried with bounded
+backoff rather than every five-second poll. Normal user turns also begin with a cheap
+check for pending watcher state, which recovers from a lost terminal or native-app
+doorbell. This retry is delivery recovery, not worker-staleness detection.
+
+A canonical terminal doorbell is intentionally small:
+
+```text
+Check handoff coordinator <coordinator-id>; pending worker outbox events are recorded.
+```
+
+Prefer a native app/server operation that starts a turn when idle and queues a message
+at the next turn boundary when busy. Terminal injection is a fallback. It must target
+the registered orchestrator handle, submit only the opaque doorbell, and avoid
+pretending that terminal acceptance proves model consumption. If the harness cannot
+safely queue input while the user is typing or the agent is running, send a native
+notification and rely on the next user-turn pending check instead of corrupting the
+composer.
+
+When awakened, the same orchestrator uses its retained conversation context on the
+normal hot path. It reads only the exact status/control snapshots and the unread
+outbox interval needed to process the doorbell. It loads the full `handoffctl context`
+bundle—kickoff, progress, and journals—after compaction or resume, on coordinator
+takeover, when memory is ambiguous, or when durable state conflicts with remembered
+context. Conversational context supplies task understanding; durable state always
+supplies exact sequence numbers, message IDs, cursors, review targets, and current
+worker state.
+
+The orchestrator handles every unread event through a contiguous prefix, writes any
+authorized reply/review through `handoffctl`, rings the worker doorbell only after the
+inbox write is durable, and advances `control.outbox_cursor` according to the existing
+coordinator rules. A question that needs new user authority is surfaced to the user
+rather than guessed; its durable question ID and worker `blocked_on` state remain the
+recovery record.
+
+The watcher is session-owned. It starts once when the orchestrator first requests
+managed observation, reuses its singleton when more workers launch, and stops when the
+registered orchestrator session is explicitly closed or its exact transport target is
+confirmed gone. Watcher exit never deletes run directories or changes worker state.
+On watcher failure, a later launch or user-turn pending check may restart it from the
+private snapshot without losing worker events.
+
 ### 4.7 Review and completion flow
 
 1. The worker publishes `result` and enters `awaiting_review`.
@@ -351,7 +489,9 @@ single-writer resource.
 3. The orchestrator checks the named artifacts and verification results at the exact
    commit; it never treats a terminal success message as evidence.
 4. The orchestrator sends `review` with either requested changes or acceptance and
-   updates `control.json`.
+   updates `control.json`. If a new instruction replaces the pending result instead,
+   it sends `supersede` tied to that exact result; this resumes work without accepting
+   or misclassifying the old result.
 5. Only accepted output is integrated. The orchestrator records the integration commit
    in `control.json`, then requests a graceful stop and archives the run directory.
 
@@ -392,8 +532,11 @@ handoff` and invoked as:
 /opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python -m agents.orchestration.handoffctl ...
 ```
 
-`handoffctl` writes one JSON value to stdout on success and diagnostics to stderr. It
-does not print secrets. Mutating commands accept message bodies from `--body-file`
+Except for `watch`, `handoffctl` writes one JSON value to stdout on success and
+diagnostics to stderr. Generic `watch` writes one JSON object per line as events
+arrive; coordinator `watch` keeps delivery detail in its private atomic snapshot and
+does not print worker event content. The CLI does not print secrets. Mutating commands
+accept message bodies from `--body-file`
 (`-` means stdin), structured type data from `--data-file`, and attachment declarations
 from `--attachments-file`; these inputs are never accepted as an interpolated shell
 program. If omitted, `body` is `""`, `data` is `{}`, and `attachments` is `[]`.
@@ -515,6 +658,7 @@ are strings and `exit_code` is an integer or `null` when the check could not sta
 | Direction/type | Required `data` | Additional rules and projection |
 |---|---|---|
 | inbox `steer` | `{}` | Non-empty `body`; no `reply_to`. |
+| inbox `supersede` | `{}` | Non-empty `body` is the replacement instruction; `reply_to` must name the current result while the worker is `awaiting_review`; sets `review_state` to `superseded`. |
 | inbox `answer` | `{}` | Non-empty `body`; `reply_to` must name an existing outbox `question`. |
 | inbox `review` | `{"disposition":"accepted"|"changes_requested"}` | `reply_to` must name the current outbox `result`; updates `review_state` and `review_result_id`. Changes requested require non-empty `body`. |
 | inbox `input-changed` | `{"path":str,"sha256":hex,"git_blob":str|null}` | The named attachment must match path/digest, either as a current workspace file or copied snapshot. |
@@ -550,7 +694,7 @@ The helper enforces these transitions:
 | `starting`/`working` | `blocked` | blocking question | Question ID is added to `blocked_on`. |
 | `blocked` | `working` | checkpoint | Every prior blocking question has a consumed reply or stop. |
 | `starting`/`working`/`blocked` | `awaiting_review` | result | Cursor is valid and no unresolved blocking question remains. |
-| `awaiting_review` | `working` | checkpoint | A matching `changes_requested` review was consumed. |
+| `awaiting_review` | `working` | checkpoint | A matching `changes_requested` review or `supersede` instruction was consumed. |
 | `awaiting_review`/`succeeded` | `succeeded` | checkpoint | A matching `accepted` review was consumed, remains current, and no later result exists. |
 | Any state except `failed`/`stopped` | `stopped` | checkpoint | Desired state is `stop` and the corresponding stop sequence was consumed. |
 | `starting`/`working`/`blocked`/`awaiting_review` | `failed` | fatal error | Always allowed. |
@@ -562,7 +706,7 @@ require a confirmed-dead worker rotation or a new run; v1 does not silently reop
 completed epoch. A new `result` observed by `control consume` sets
 `review_state` to `pending`, binds `review_result_id` to that message, and resets
 integration to pending/null/null. `send review` is rejected unless it replies to that exact
-result. `control integrate` is allowed only after acceptance of that result and must
+result, and a superseded result cannot later be reviewed. `control integrate` is allowed only after acceptance of that result and must
 append an `integration` event recording the integration commit. `abandoned` is allowed
 after any result, requires a non-empty reason, and appends the corresponding event.
 Integration and abandonment are terminal coordinator decisions.
@@ -636,6 +780,20 @@ handoffctl status --run-dir PATH
 handoffctl ready --run-dir PATH
 handoffctl control show --run-dir PATH
 
+handoffctl runs list
+handoffctl runs show --run SELECTOR
+handoffctl runs adopt --run SELECTOR --coordinator-state ABSOLUTE_PATH
+handoffctl coordinator register --state ABSOLUTE_PATH
+                                --transport cmux|tmux|native-app
+                                [--target HANDLE_OR_THREAD] [--surface UUID]
+handoffctl coordinator show --state ABSOLUTE_PATH
+handoffctl coordinator pending --state ABSOLUTE_PATH [--full-context]
+handoffctl context --run SELECTOR
+handoffctl dispatch --run SELECTOR --body-file FILE
+handoffctl watch [--run SELECTOR ...] [--interval SECONDS]
+                 [--timeout SECONDS] [--once] [--notify-cmux]
+handoffctl watch --coordinator-state ABSOLUTE_PATH [--interval SECONDS]
+
 handoffctl send --run-dir PATH --type TYPE [--message-id UUID] [--reply-to UUID]
                 [--body-file FILE] [--data-file FILE]
                 [--attachments-file FILE]
@@ -690,6 +848,24 @@ most one of `--body-file`, `--data-file`, and `--attachments-file` may be `-`.
 consumes the inbox through its validated tail, and uses a deterministic UUIDv4-shaped
 message ID derived from the run ID so retrying the command is idempotent.
 
+Every successful launcher call writes a mode-`0600` owner-side registry entry under
+`~/.local/state/agents/handoff/registry.json` (overridable with
+`HANDOFF_REGISTRY_FILE`). It records run/session routing and the owner-only credential
+directory plus an optional opaque coordinator ID; public registry output redacts the
+credential directory. A remote launch also writes
+a credential-free proxy entry on the caller while the owning host retains the private
+entry.
+
+`context` resolves a registered selector and returns the durable kickoff, projections,
+progress, and unread journals from the owning host. `dispatch` is a one-shot
+coordinator transaction: after a released lease it takes over with the registered
+recovery credential, sends either `steer` or an exact-result `supersede`, rings the
+registered terminal doorbell, releases the lease, and removes its ephemeral token. A
+remote dispatch performs that owner-side sequence over one SSH invocation with the
+instruction on stdin. `watch` maintains a separate private observer cursor and emits
+new outbox events as JSONL; it never advances the protocol review cursor or makes a
+semantic decision.
+
 After `emit --type result` has durably appended the result, projected
 `awaiting_review`, and fsynced the run directory, the CLI checks the immutable run
 transport. For a cmux run with `CMUX_SURFACE_ID` in the worker environment, it attempts
@@ -714,6 +890,13 @@ Successful JSON output shapes are exact:
 | `control takeover` | `{"message":object,"control":object,"new_token_file":str}` |
 | `control rotate-worker` | `{"message":object,"control":object,"status":object,"new_token_file":str}` |
 | `doctor` or a repair | The report object specified in 4.9.7 |
+| `runs list` / `runs show` | Public registry record(s), with `credential_dir` omitted |
+| `runs adopt` | The adopted public registry record |
+| `coordinator register` / `coordinator show` | The raw credential-free coordinator watcher snapshot |
+| `coordinator pending` | `{"coordinator_id":str,"mode":"hot"|"recovery","pending":[...]}`; hot detail contains exact status/control and unread outbox only, while recovery detail contains the full `context` bundle |
+| `context` | `{"run":object,"status":object,"control":object,"kickoff":str,"progress":str,"unread_inbox":[message,...],"unread_outbox":[message,...],"registry":object}` |
+| `dispatch` | `{"run":object,"takeover":object,"message":object,"superseded_result":str|null,"doorbell_sent":bool,"doorbell_error":str|null,"coordinator_released":bool}` |
+| `watch` | JSONL records containing either `{"run":object,"event":message}` or `{"run":object,"watch_error":str}` |
 
 The library exposes `HandoffError` with an `exit_code` from the table in 4.9.1 and
 functions mirroring each CLI noun/verb. Library calls accept `pathlib.Path` values and
@@ -804,6 +987,8 @@ without a semantic readiness poll. `--wait-ready` explicitly requests the readin
 wait, and `--retain-coordinator` preserves ownership for managed monitoring. A supplied
 `HANDOFF_CREDENTIAL_DIR` is the exact mode-`0700` private directory and therefore has
 fixed token filenames; the coordinator never discovers them with a filesystem search.
+The launcher privately registers the generated directory even when it chose that
+directory itself, so later one-shot dispatch also avoids discovery.
 The Kimi TUI process probe requests cmux output with both refs and UUIDs, which makes its
 returned surface UUID comparable across commands. Process discovery and the later
 appearance of Kimi's actual empty input widget share the normal readiness timeout (120
@@ -823,8 +1008,9 @@ prints a rescue command and leaves the live session and run directory intact; it
 not send the second message or rotate a writer. Doorbells contain only run ID and
 highest inbox sequence. cmux and tmux adapters provide `launch`, `doorbell`, `probe`,
 `capture`, and `stop` operations; only `launch`, `probe`, and the safe readiness behavior
-are required in the first pilot. Hook, Codex-app, automated archival, and multi-worker
-roster adapters are out of local-v1 implementation scope.
+are required in the first pilot. Hook, Codex-app, and automated archival adapters are
+out of local-v1 implementation scope; the private run registry and read-only watcher
+provide the implemented roster/observation layer.
 
 ### 4.11 SSH launcher adapter
 
@@ -917,7 +1103,7 @@ recovery across independent sessions. That is the part to build.
 Build the thin protocol and reuse task/session products where they fit:
 
 1. **Local v1 core:** implement `orchestration/handoff.py` and
-   `handoffctl init|read|send|emit|ready|status|control|doctor` exactly as specified in 4.9,
+   `handoffctl init|read|send|emit|ready|status|control|doctor|dispatch|context|watch` exactly as specified in 4.9,
    including schema validation, role locks, atomic snapshots, epochs/tokens, leases,
    cursor rules, and explicit repair. Add tests for concurrent same-role calls, partial
    journal tails, replay after a crash, stale-token rejection, and readers observing
@@ -930,15 +1116,21 @@ Build the thin protocol and reuse task/session products where they fit:
 3. **Worktree pilot:** launch one worker in a disposable worktree, verify the
    orchestrator and worker share the external run path, test the in-worktree fallback,
    prohibit external branch mutation, and archive before fallback worktree cleanup.
-4. **Hook adapters:** integrate Claude Code and Codex lifecycle hooks, but retain
+4. **Detached orchestrator watcher:** add coordinator-session registration, associate
+   launched runs with `coordinator_id`, reload the registry on every poll, persist
+   per-coordinator notification state, and ring coalesced opaque doorbells as specified
+   in 4.6.1. Preserve the existing generic `watch` behavior when no coordinator state
+   is supplied.
+5. **Hook adapters:** integrate Claude Code and Codex lifecycle hooks, but retain
    checkpoint polling and terminal doorbells. Maintain a conformance matrix rather than
    assuming equivalent behavior.
-5. **Remote hardening:** extend the implemented single-worker SSH adapter with
+6. **Remote hardening:** extend the implemented single-worker SSH adapter with
    disconnect/reconnect conformance tests and keep refusing unsafe failover.
-6. **Optional board:** trial Backlog.md for simple kanban visibility or beads for task
+7. **Optional board:** trial Backlog.md for simple kanban visibility or beads for task
    graphs/distributed memory. Do not conflate either with the live mailbox.
-7. **Derived index later:** add SQLite only when fleet queries justify it; rebuild it
-   from journals.
+8. **Private roster:** retain the implemented JSON registry and observer cursors as a
+   convenience index; add SQLite only when fleet queries justify it and rebuild any
+   derived index from journals.
 
 Acceptance tests for v1 should demonstrate:
 
@@ -952,15 +1144,40 @@ Acceptance tests for v1 should demonstrate:
 - launcher paths and message bodies containing spaces or shell metacharacters are
   passed literally, without command execution.
 
-The part that can be built now is steps 1 and 2, their automated tests, and a local
-worktree pilot when cmux or tmux is available. Steps 4–7 are deliberately excluded from
-the local-v1 build and must not delay it.
+Detached watcher acceptance tests should additionally demonstrate:
+
+- the watcher is a singleton per `coordinator_id` and never selects runs owned by a
+  different coordinator;
+- a worker registered after watcher startup is discovered without restarting the
+  process;
+- observation and doorbell state never advance `control.outbox_cursor`;
+- multiple worker events are coalesced, and a duplicated doorbell is harmless;
+- a crash before or after doorbell delivery recovers from the atomic watcher snapshot
+  without losing the durable worker event;
+- advancing `control.outbox_cursor` clears the corresponding pending notification,
+  while consuming only an older prefix causes another doorbell for the remainder;
+- cmux, tmux, and native-app adapters target only the registered orchestrator handle
+  and put no message body or credential in the doorbell;
+- a normal user turn can inspect pending watcher state when push delivery failed; and
+- the hot path reads only unread protocol state, while simulated compaction/takeover
+  selects the full durable `context` recovery path.
+
+The implemented local-v1 build includes the core, launcher, private roster, fast
+dispatch, generic read-only watcher, and detached orchestrator watcher in 4.6.1.
+Provider-specific hook and native-app messaging adapters, automated archival, and a
+richer derived fleet index remain follow-up work. Native-app coordinator registration
+and exact routing are present; when no provider sender is installed, delivery failure
+stays visible in the pending watcher snapshot and the filesystem hot path remains the
+recovery mechanism.
 
 ## 8. Staged decisions that do not block local v1
 
 - Build a harness conformance matrix: which hooks fire on explicit prompts, automatic
   goal continuations, stop, resume, and compaction; which can add model-visible context;
   and which require trust approval.
+- Determine the safest orchestrator doorbell operation for each harness: prefer native
+  idle-start/next-turn queueing, and use terminal input only after verifying that it
+  cannot corrupt a user's in-progress composer text.
 - Keep Codex app task orchestration outside local-v1: the `handoff-agent` skill uses
   native project-scoped task creation, waiting, reading, and follow-up messaging when
   those app controls are available, with a documented manual fallback when they are not.

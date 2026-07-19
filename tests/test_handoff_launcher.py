@@ -3,7 +3,15 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+
 from agents.orchestration import handoff_launcher
+from agents.orchestration import handoff_registry
+
+
+@pytest.fixture(autouse=True)
+def isolate_handoff_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
 
 
 class Completed:
@@ -514,14 +522,20 @@ def test_launch_only_returns_without_readiness_wait_and_releases_coordinator(tmp
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launch-only must not wait")),
     )
 
+    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     result = handoff_launcher.launch(
         name="fast", kickoff=kickoff, cwd=workspace, agent="codex", backend="tmux",
-        state_root=tmp_path / "state",
+        state_root=tmp_path / "state", coordinator_id=coordinator_id,
     )
 
     assert result["worker_ready"] is None
     assert result["coordinator_released"] is True
     assert result["kickoff_sent"] is True
+    assert result["registry_recorded"] is True
+    registered = handoff_registry.resolve(result["run_id"])
+    assert registered["credential_dir"] == str(private)
+    assert registered["handle"] == "worker-handle"
+    assert registered["coordinator_id"] == coordinator_id
     assert (private / "coordinator.token").is_file()
     control = handoff_launcher.handoff.control_show(Path(result["run_dir"]))
     assert handoff_launcher.handoff._parse_time(control["coordinator_lease_expires_at"]) <= handoff_launcher.handoff._now()
@@ -681,6 +695,10 @@ def test_launch_remote_sends_json_over_stdin_and_returns_remote_uri(tmp_path, mo
     assert result["remote_run_dir"] == "/home/opc/.local/state/run-id"
     assert result["handle"] == "ssh://oci-box/tmux/remote-worker"
     assert result["remote_handle"] == "remote-worker"
+    assert result["registry_recorded"] is True
+    registered = handoff_registry.resolve(result["run_id"])
+    assert registered["host"] == "oci-box"
+    assert registered["credential_dir"] is None
 
 
 def test_remote_host_rejects_ssh_option_injection(tmp_path):

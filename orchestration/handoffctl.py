@@ -7,10 +7,15 @@ import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from agents.orchestration import handoff
+from agents.orchestration import handoff_launcher
+from agents.orchestration import handoff_registry
+from agents.orchestration import handoff_watcher
 
 
 RESULT_NOTIFICATION_TITLE = "Handoff result ready"
@@ -111,6 +116,342 @@ def _notify_result_ready(run_dir: Path) -> None:
         pass
 
 
+def _remote_json(
+    record: dict[str, Any], argv: list[str], *, stdin: str | None = None,
+) -> dict[str, Any] | list[Any]:
+    try:
+        completed = handoff_launcher._run_ssh(  # noqa: SLF001 - shared safe SSH argv adapter
+            record["host"],
+            [record["remote_python"], "-m", "agents.orchestration.handoffctl", *argv],
+            stdin=stdin,
+            timeout=30,
+        )
+        return json.loads(completed.stdout)
+    except (handoff_launcher.AdapterError, json.JSONDecodeError) as exc:
+        raise handoff.HandoffError(f"remote handoff command failed: {exc}", 6) from exc
+
+
+def _context_local(run_dir: Path) -> dict[str, Any]:
+    run_dir = Path(run_dir)
+    status = handoff.status(run_dir)
+    control = handoff.control_show(run_dir)
+    try:
+        kickoff = (run_dir / "kickoff.md").read_text(encoding="utf-8")
+        progress = (run_dir / "progress.md").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise handoff.HandoffError(f"cannot read handoff context: {exc}", 6) from exc
+    return {
+        "run": handoff._load_json(run_dir / "run.json", handoff._validate_run),  # noqa: SLF001
+        "status": status,
+        "control": control,
+        "kickoff": kickoff,
+        "progress": progress,
+        "unread_inbox": handoff.read(run_dir, "inbox", after=status["inbox_cursor"]),
+        "unread_outbox": handoff.read(run_dir, "outbox", after=control["outbox_cursor"]),
+    }
+
+
+def _ring_doorbell(record: dict[str, Any], run_id: str, inbox_seq: int) -> tuple[bool, str | None]:
+    try:
+        if record["session_transport"] == "tmux":
+            adapter: Any = handoff_launcher.TmuxAdapter()
+        elif record["session_transport"] == "cmux":
+            adapter = handoff_launcher.CmuxAdapter(handoff_launcher.CMUX_DEFAULT)
+        else:
+            raise handoff.HandoffError(
+                f"unsupported session transport: {record['session_transport']}", 4,
+            )
+        adapter.doorbell(record["handle"], run_id, inbox_seq)
+        return True, None
+    except (handoff.HandoffError, handoff_launcher.AdapterError) as exc:
+        return False, str(exc)
+
+
+def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
+    if record["host"] is not None or record["credential_dir"] is None:
+        raise handoff.HandoffError("dispatch must execute on the run-owning host", 4)
+    run_dir = Path(record["run_dir"])
+    credential_dir = Path(record["credential_dir"])
+    recovery_file = credential_dir / "recovery.token"
+    try:
+        recovery = recovery_file.read_bytes()
+    except OSError as exc:
+        raise handoff.HandoffError("registered recovery credential is unavailable", 3) from exc
+
+    control = handoff.control_show(run_dir)
+    if handoff._parse_time(control["coordinator_lease_expires_at"]) > handoff._now():  # noqa: SLF001
+        raise handoff.HandoffError(
+            "coordinator lease is active; use the current managed coordinator", 4,
+        )
+    token_file = credential_dir / f"coordinator-dispatch-{uuid.uuid4()}.token"
+    takeover = handoff.control_takeover(
+        run_dir, recovery, new_token_file=token_file,
+        reason="One-shot registry dispatch after released coordinator lease",
+    )
+    token = token_file.read_bytes()
+    released = False
+    completed = False
+    sent: dict[str, Any] | None = None
+    superseded_result: str | None = None
+    doorbell_sent = False
+    doorbell_error: str | None = None
+    try:
+        status = handoff.status(run_dir)
+        if status["state"] in {"succeeded", "failed", "stopped"}:
+            raise handoff.HandoffError(
+                f"worker state {status['state']} cannot accept a new instruction", 4,
+            )
+        if status["state"] == "awaiting_review":
+            outbox = handoff.read(run_dir, "outbox")
+            handoff.control_consume(run_dir, token, through=len(outbox))
+            current = handoff.control_show(run_dir)
+            superseded_result = current["review_result_id"]
+            if superseded_result is None:
+                raise handoff.HandoffError("awaiting_review run has no current result", 5)
+            sent = handoff.send(
+                run_dir, token, type="supersede", body=body,
+                reply_to=superseded_result,
+            )
+        else:
+            sent = handoff.send(run_dir, token, type="steer", body=body)
+        doorbell_sent, doorbell_error = _ring_doorbell(
+            record, record["run_id"], sent["message"]["seq"],
+        )
+        handoff.control_release(run_dir, token)
+        released = True
+        completed = True
+    finally:
+        if not completed and not released:
+            try:
+                handoff.control_release(run_dir, token)
+                released = True
+            except handoff.HandoffError:
+                pass
+        if released:
+            try:
+                token_file.unlink()
+            except OSError:
+                pass
+    if sent is None:
+        raise AssertionError("dispatch completed without a message")
+    return {
+        "run": handoff_registry.public(record),
+        "takeover": takeover["message"],
+        "message": sent["message"],
+        "superseded_result": superseded_result,
+        "doorbell_sent": doorbell_sent,
+        "doorbell_error": doorbell_error,
+        "coordinator_released": released,
+    }
+
+
+def _dispatch_registered(
+    selector: str, body: str,
+) -> dict[str, Any]:
+    record = handoff_registry.resolve(selector, private=True)
+    if record["host"] is None:
+        return _dispatch_local(record, body)
+    argv = ["dispatch", "--run", record["run_id"], "--body-file", "-"]
+    result = _remote_json(record, argv, stdin=body)
+    if not isinstance(result, dict):
+        raise handoff.HandoffError("remote dispatch returned invalid data", 6)
+    return result
+
+
+def _context_registered(selector: str) -> dict[str, Any]:
+    record = handoff_registry.resolve(selector, private=True)
+    if record["host"] is None:
+        context = _context_local(Path(record["run_dir"]))
+    else:
+        context = _remote_json(record, ["context", "--run", record["run_id"]])
+        if not isinstance(context, dict):
+            raise handoff.HandoffError("remote context returned invalid data", 6)
+    context["registry"] = handoff_registry.public(record)
+    return context
+
+
+def _read_registered_outbox(record: dict[str, Any], after: int) -> list[dict[str, Any]]:
+    if record["host"] is None:
+        return handoff.read(Path(record["run_dir"]), "outbox", after=after)
+    result = _remote_json(
+        record,
+        ["read", "--run-dir", record["run_dir"], "--journal", "outbox", "--after", str(after)],
+    )
+    if not isinstance(result, list):
+        raise handoff.HandoffError("remote outbox read returned invalid data", 6)
+    return result
+
+
+def _notify_watched_event(record: dict[str, Any], event: dict[str, Any]) -> None:
+    surface = os.environ.get("CMUX_SURFACE_ID")
+    if not surface:
+        return
+    try:
+        subprocess.run(
+            [
+                "cmux", "notify", "--surface", surface,
+                "--title", f"Handoff {event['type']}: {record['name']}",
+                "--body", f"Outbox sequence {event['seq']} is ready",
+            ],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=RESULT_NOTIFICATION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _send_native_app_doorbell(thread_id: str, body: str) -> None:
+    """Provider hook for native-app messaging adapters.
+
+    The filesystem snapshot remains pending when no installed native adapter can
+    deliver to the registered thread ID.
+    """
+    raise handoff.HandoffError(
+        f"no native-app doorbell adapter is installed for thread {thread_id}", 6,
+    )
+
+
+def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None:
+    del coverage  # The canonical snapshot-pointer doorbell is intentionally opaque.
+    coordinator_id = value["coordinator_id"]
+    target = value["target"]
+    if value["transport"] == "tmux":
+        handoff_launcher.TmuxAdapter().orchestrator_doorbell(
+            target["handle"], coordinator_id,
+        )
+        return
+    if value["transport"] == "cmux":
+        adapter = handoff_launcher.CmuxAdapter(handoff_launcher.CMUX_DEFAULT)
+        adapter.workspace = target["workspace"]
+        adapter.orchestrator_doorbell(target["surface"], coordinator_id)
+        return
+    if value["transport"] == "native_app":
+        _send_native_app_doorbell(
+            target["thread_id"],
+            f"Check handoff coordinator {coordinator_id}; pending worker outbox events are recorded.",
+        )
+        return
+    raise handoff.HandoffError(f"unsupported coordinator transport: {value['transport']}", 4)
+
+
+def _register_coordinator(args: argparse.Namespace) -> dict[str, Any]:
+    if args.transport == "cmux":
+        surface = args.surface or os.environ.get("CMUX_SURFACE_ID")
+        if not surface:
+            raise handoff.HandoffError(
+                "cmux coordinator registration requires --surface or CMUX_SURFACE_ID", 2,
+            )
+        workspace = handoff_launcher._run(  # noqa: SLF001 - exact session registration
+            [args.cmux_binary, "current-workspace"],
+        ).stdout.strip()
+        if not workspace:
+            raise handoff.HandoffError("cmux did not report the current workspace", 6)
+        target = {"workspace": workspace, "surface": surface}
+    elif args.transport == "tmux":
+        if not args.target:
+            raise handoff.HandoffError("tmux coordinator registration requires --target", 2)
+        target = {"handle": args.target}
+    else:
+        if not args.target:
+            raise handoff.HandoffError("native-app coordinator registration requires --target", 2)
+        target = {"thread_id": args.target}
+    transport = "native_app" if args.transport == "native-app" else args.transport
+    return handoff_watcher.initialize(
+        args.state, transport=transport, target=target,
+        coordinator_id=args.coordinator_id,
+    )
+
+
+def _coordinator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
+    value = handoff_watcher.read(path)
+    records = {
+        record["run_id"]: record
+        for record in handoff_registry.list_records(private=True)
+        if record["coordinator_id"] == value["coordinator_id"]
+    }
+    pending: list[dict[str, Any]] = []
+    for run_id, notification in value["runs"].items():
+        if not notification["doorbell_pending"] or run_id not in records:
+            continue
+        record = records[run_id]
+        if full_context:
+            detail = _context_registered(run_id)
+        elif record["host"] is None:
+            run_dir = Path(record["run_dir"])
+            control = handoff.control_show(run_dir)
+            status = handoff.status(run_dir)
+            through = min(notification["observed_through"], status["outbox_seq"])
+            detail = {
+                "status": status,
+                "control": control,
+                "unread_outbox": handoff.read(
+                    run_dir, "outbox", after=control["outbox_cursor"], through=through,
+                ),
+            }
+        else:
+            control = _remote_json(
+                record, ["control", "show", "--run-dir", record["run_dir"]],
+            )
+            status = _remote_json(record, ["status", "--run-dir", record["run_dir"]])
+            if not isinstance(control, dict) or not isinstance(status, dict):
+                raise handoff.HandoffError("remote hot-path state is invalid", 6)
+            through = min(notification["observed_through"], status["outbox_seq"])
+            detail = {
+                "status": status,
+                "control": control,
+                "unread_outbox": _remote_json(record, [
+                    "read", "--run-dir", record["run_dir"], "--journal", "outbox",
+                    "--after", str(control["outbox_cursor"]), "--through", str(through),
+                ]),
+            }
+        pending.append({
+            "run": handoff_registry.public(record),
+            "notification": dict(notification),
+            "detail": detail,
+        })
+    return {
+        "coordinator_id": value["coordinator_id"],
+        "mode": "recovery" if full_context else "hot",
+        "pending": pending,
+    }
+
+
+def _watch(args: argparse.Namespace) -> int:
+    if getattr(args, "coordinator_state", None) is not None:
+        handoff_watcher.watch(
+            args.coordinator_state,
+            interval=args.interval,
+            notifier=_notify_coordinator,
+        )
+        return 0
+    records = (
+        [handoff_registry.resolve(selector, private=True) for selector in args.run]
+        if args.run else handoff_registry.list_records(private=True)
+    )
+    started = time.monotonic()
+    while True:
+        for record in records:
+            try:
+                events = _read_registered_outbox(record, record["observed_outbox_cursor"])
+                for event in events:
+                    payload = {"run": handoff_registry.public(record), "event": event}
+                    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")), flush=True)
+                    if args.notify_cmux:
+                        _notify_watched_event(record, event)
+                    updated = handoff_registry.update_observed(record["run_id"], event["seq"])
+                    record["observed_outbox_cursor"] = updated["observed_outbox_cursor"]
+            except handoff.HandoffError as exc:
+                print(json.dumps({
+                    "run": handoff_registry.public(record),
+                    "watch_error": str(exc),
+                }, ensure_ascii=False, sort_keys=True, separators=(",", ":")), flush=True)
+        if args.once:
+            return 0
+        if args.timeout is not None and time.monotonic() - started >= args.timeout:
+            return 0
+        time.sleep(args.interval)
+
+
 def _add_run(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-dir", required=True, type=_absolute)
 
@@ -150,6 +491,57 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("--journal", required=True, choices=("inbox", "outbox"))
     read.add_argument("--after", type=int, default=0); read.add_argument("--through", type=int)
     status = commands.add_parser("status"); _add_run(status)
+    runs = commands.add_parser("runs", help="list or inspect privately registered runs")
+    run_commands = runs.add_subparsers(dest="runs_command", required=True)
+    run_commands.add_parser("list")
+    run_show = run_commands.add_parser("show")
+    run_show.add_argument("--run", required=True, help="run ID, unique prefix, name, handle, or URI")
+    run_adopt = run_commands.add_parser("adopt", help="explicitly assign an unowned run")
+    run_adopt.add_argument("--run", required=True, help="registered run selector")
+    run_adopt.add_argument("--coordinator-state", required=True, type=_absolute)
+    coordinator = commands.add_parser("coordinator", help="register or inspect a coordinator session")
+    coordinator_commands = coordinator.add_subparsers(dest="coordinator_command", required=True)
+    coordinator_register = coordinator_commands.add_parser("register")
+    coordinator_register.add_argument("--state", required=True, type=_absolute)
+    coordinator_register.add_argument("--transport", required=True, choices=("cmux", "tmux", "native-app"))
+    coordinator_register.add_argument("--target", help="exact tmux handle or native-app thread ID")
+    coordinator_register.add_argument("--surface", help="exact cmux orchestrator surface UUID")
+    coordinator_register.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
+    coordinator_register.add_argument("--coordinator-id")
+    coordinator_show = coordinator_commands.add_parser("show")
+    coordinator_show.add_argument("--state", required=True, type=_absolute)
+    coordinator_pending = coordinator_commands.add_parser("pending")
+    coordinator_pending.add_argument("--state", required=True, type=_absolute)
+    coordinator_pending.add_argument(
+        "--full-context", action="store_true",
+        help="load the full durable context bundle after resume, compaction, or takeover",
+    )
+    context = commands.add_parser("context", help="read durable context for a registered run")
+    context.add_argument("--run", required=True, help="run ID, unique prefix, name, handle, or URI")
+    fast_dispatch = commands.add_parser(
+        "dispatch", help="recover, send, ring the doorbell, and release in one operation",
+    )
+    fast_dispatch.add_argument("--run", required=True, help="registered run selector")
+    fast_dispatch.add_argument(
+        "--body-file", required=True,
+        help="UTF-8 instruction file, or - to read the instruction from stdin",
+    )
+    watch = commands.add_parser("watch", help="stream new outbox events from registered runs")
+    watch.add_argument(
+        "--run", action="append", default=[],
+        help="registered run selector; repeat for multiple runs, omit for all",
+    )
+    watch.add_argument("--interval", type=float, default=5.0, help="poll interval in seconds")
+    watch.add_argument(
+        "--coordinator-state", type=_absolute,
+        help="private session-owned watcher snapshot for detached coordinator mode",
+    )
+    watch.add_argument("--timeout", type=float, help="stop after this many seconds")
+    watch.add_argument("--once", action="store_true", help="read each selected outbox once and exit")
+    watch.add_argument(
+        "--notify-cmux", action="store_true",
+        help="send a metadata-only cmux notification for each new event",
+    )
     ready = commands.add_parser("ready"); _add_run(ready); _add_token(ready)
     send = commands.add_parser("send"); _add_message(send)
     emit = commands.add_parser("emit"); _add_message(emit)
@@ -194,6 +586,23 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
         )
     if args.command == "read": return handoff.read(args.run_dir, args.journal, after=args.after, through=args.through)
     if args.command == "status": return handoff.status(args.run_dir)
+    if args.command == "runs":
+        if args.runs_command == "list": return handoff_registry.list_records(private=False)
+        if args.runs_command == "show": return handoff_registry.resolve(args.run, private=False)
+        if args.runs_command == "adopt":
+            record = handoff_registry.resolve(args.run, private=True)
+            coordinator = handoff_watcher.read(args.coordinator_state)
+            return handoff_registry.public(handoff_registry.adopt(
+                record["run_id"], coordinator["coordinator_id"],
+            ))
+    if args.command == "coordinator":
+        if args.coordinator_command == "register": return _register_coordinator(args)
+        if args.coordinator_command == "show": return handoff_watcher.read(args.state)
+        if args.coordinator_command == "pending":
+            return _coordinator_pending(args.state, full_context=args.full_context)
+    if args.command == "context": return _context_registered(args.run)
+    if args.command == "dispatch":
+        return _dispatch_registered(args.run, _read_text(args.body_file))
     if args.command == "ready": return handoff.ready(args.run_dir, _token(args, "worker"))
     if args.command == "send": return handoff.send(args.run_dir, _token(args, "coordinator"), **_mutation_inputs(args))
     if args.command == "emit":
@@ -240,6 +649,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
+        if args.command == "watch":
+            if args.interval <= 0:
+                raise handoff.HandoffError("--interval must be positive", 2)
+            if args.timeout is not None and args.timeout < 0:
+                raise handoff.HandoffError("--timeout must be non-negative", 2)
+            if args.coordinator_state is not None and (
+                args.run or args.timeout is not None or args.once or args.notify_cmux
+            ):
+                raise handoff.HandoffError(
+                    "--coordinator-state cannot be combined with --run, --timeout, --once, or --notify-cmux",
+                    2,
+                )
+            return _watch(args)
         result = dispatch(args)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         if args.command == "doctor" and not any((args.repair_tail, args.repair_status, args.repair_control, args.repair_progress)) and not result["ok"]:

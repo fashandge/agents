@@ -42,7 +42,7 @@ MAX_ATTACHMENTS = 128
 MAX_ATTACHMENT = 32 * 1024 * 1024
 
 INBOX_TYPES = {
-    "steer", "answer", "review", "input-changed", "base-changed",
+    "steer", "supersede", "answer", "review", "input-changed", "base-changed",
     "integration", "coordinator-takeover", "worker-relaunched", "stop",
 }
 SYSTEM_INBOX_TYPES = {"integration", "coordinator-takeover", "worker-relaunched"}
@@ -397,7 +397,7 @@ def _validate_control(value: Any) -> None:
     _parse_time(value["coordinator_lease_expires_at"])
     if value["desired_state"] not in {"run", "stop"}:
         _fail("invalid desired_state")
-    if value["review_state"] not in {"pending", "changes_requested", "accepted"}:
+    if value["review_state"] not in {"pending", "changes_requested", "superseded", "accepted"}:
         _fail("invalid review_state")
     if value["review_result_id"] is not None:
         _uuid4(value["review_result_id"], "review_result_id")
@@ -462,11 +462,13 @@ def _validate_type_data(direction: str, kind: str, body: str, reply_to: Any, dat
     if len(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) > MAX_DATA:
         _fail(f"data exceeds {MAX_DATA} serialized bytes")
     if direction == "inbox":
-        if kind in {"steer", "answer"}:
+        if kind in {"steer", "supersede", "answer"}:
             _fields(data, set(), "data")
             _string(body, "body", nonempty=True)
             if kind == "steer" and reply_to is not None:
                 _fail("steer cannot set reply_to")
+            if kind == "supersede" and reply_to is None:
+                _fail("supersede requires reply_to")
         elif kind == "review":
             _fields(data, {"disposition"}, "data")
             if data["disposition"] not in {"accepted", "changes_requested"}:
@@ -666,6 +668,7 @@ def _standing_instructions() -> str:
 - Read `run.json`, `control.json`, and all unread inbox messages before beginning; check again after resume or compaction, at every turn or stage boundary, before an irreversible action, before a commit, and before publishing a result.
 - Immediately after the initial read, run the exact `handoffctl ready` command below before substantive work. This is the worker-ready signal; do not inspect helper source or help first.
 - Process inbox records in sequence and advance `inbox_cursor` only after the instruction and any durable reminder it creates are recorded.
+- Treat a `supersede` message tied to the current result as a new instruction that replaces the pending review; consume it, checkpoint back to `working`, and publish a fresh result when done.
 - Use `handoffctl emit` for checkpoints, questions, results, and errors. Checkpoints durably update `status.json` and `progress.md`.
 - Assume the coordinator knows the kickoff but not your live progress. Every blocking question must be self-contained: state the current stage and completed work, concrete evidence, the exact conflict, the decision or authority needed, your recommended resolution, the consequences of the available options, and actions intentionally deferred. Do not rely on earlier checkpoints to supply this context.
 - End the turn after a blocking question. On completion publish an exact result and await review; report `succeeded` only after consuming an accepted review. After a successful result publication, `handoffctl` attempts a best-effort cmux notification for cmux-launched workers; the durable result remains authoritative if notification delivery fails.
@@ -932,6 +935,9 @@ def _apply_inbox(control: dict[str, Any], message: dict[str, Any]) -> None:
     if kind == "review":
         control["review_state"] = message["data"]["disposition"]
         control["review_result_id"] = message["reply_to"]
+    elif kind == "supersede":
+        control["review_state"] = "superseded"
+        control["review_result_id"] = message["reply_to"]
     elif kind == "stop":
         control["desired_state"] = "stop"
     elif kind == "integration":
@@ -965,13 +971,17 @@ def send(
             _fail("integration decision is terminal", 4)
         if type == "answer" and _resolve_reply(outbox, reply_to, "question") is None:
             _fail("answer reply_to must name an outbox question", 4)
-        if type == "review":
+        if type in {"review", "supersede"}:
             if reply_to != control["review_result_id"] or _resolve_reply(outbox, reply_to, "result") is None:
-                _fail("review must reply to the current result", 4)
+                _fail(f"{type} must reply to the current result", 4)
             if control["integration"]["state"] != "pending":
-                _fail("cannot review after integration decision", 4)
+                _fail(f"cannot {type} after integration decision", 4)
             worker_status = _load_json(run_dir / "status.json", _validate_status)
-            if worker_status["state"] == "succeeded" and data["disposition"] == "changes_requested":
+            if type == "supersede" and worker_status["state"] != "awaiting_review":
+                _fail("supersede requires an awaiting_review worker", 4)
+            if type == "review" and control["review_state"] == "superseded":
+                _fail("superseded result cannot be reviewed", 4)
+            if type == "review" and worker_status["state"] == "succeeded" and data["disposition"] == "changes_requested":
                 _fail("changes requested after worker success require worker rotation or a new run", 4)
         if type == "stop" and control["desired_state"] == "stop":
             _fail("stop was already requested", 4)
@@ -1071,8 +1081,13 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
                 new_state = "working"; blocked_on = []
             elif old_state == "awaiting_review":
                 result = _last_result(outbox_before, status_value["worker_epoch"])
-                if result is None or not _matching_review(prefix, result["message_id"], "changes_requested"):
-                    _fail("awaiting_review can resume only after matching changes_requested", 4)
+                changed = result is not None and _matching_review(prefix, result["message_id"], "changes_requested")
+                superseded = result is not None and any(
+                    item["type"] == "supersede" and item["reply_to"] == result["message_id"]
+                    for item in prefix
+                )
+                if not changed and not superseded:
+                    _fail("awaiting_review can resume only after matching changes_requested or supersede", 4)
                 new_state = "working"
             else:
                 _fail(f"invalid checkpoint transition {old_state} -> working", 4)
@@ -1436,7 +1451,7 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
     for message in inbox:
         if message["type"] == "answer" and (message["reply_to"] not in outbox_by_id or outbox_by_id[message["reply_to"]]["type"] != "question"):
             issues.append(_issue("reference", run_dir / "inbox.jsonl", f"answer seq {message['seq']} has invalid reply_to"))
-        if message["type"] in {"review", "integration"} and (message["reply_to"] not in outbox_by_id or outbox_by_id[message["reply_to"]]["type"] != "result"):
+        if message["type"] in {"review", "supersede", "integration"} and (message["reply_to"] not in outbox_by_id or outbox_by_id[message["reply_to"]]["type"] != "result"):
             issues.append(_issue("reference", run_dir / "inbox.jsonl", f"{message['type']} seq {message['seq']} has invalid reply_to"))
     if control:
         if control["last_command_seq"] > len(inbox): issues.append(_issue("cursor", run_dir / "control.json", "last_command_seq exceeds inbox tail"))
@@ -1455,8 +1470,16 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
             expected_result = consumed_results[-1]["message_id"] if consumed_results else None
             expected_review = "pending"
             if expected_result:
-                reviews = [message for message in inbox if message["type"] == "review" and message["reply_to"] == expected_result]
-                if reviews: expected_review = reviews[-1]["data"]["disposition"]
+                decisions = [
+                    message for message in inbox
+                    if message["type"] in {"review", "supersede"} and message["reply_to"] == expected_result
+                ]
+                if decisions:
+                    latest = decisions[-1]
+                    expected_review = (
+                        "superseded" if latest["type"] == "supersede"
+                        else latest["data"]["disposition"]
+                    )
             semantic = {
                 "desired_state": expected_desired, "coordinator_epoch": expected_coordinator_epoch,
                 "worker_epoch": expected_worker_epoch, "review_state": expected_review,
