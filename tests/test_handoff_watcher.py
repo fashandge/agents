@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from agents.orchestration import handoff
+from agents.orchestration import handoff_launcher
 from agents.orchestration import handoff_registry
 from agents.orchestration import handoff_watcher
 from agents.orchestration import handoffctl
@@ -20,6 +21,27 @@ def coordinator_state(tmp_path, *, transport="tmux", target=None):
         owner_pid=os.getpid(),
     )
     return state_path, value
+
+
+def test_retarget_preserves_a_stopped_coordinator_identity_and_runs(tmp_path):
+    surface = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    state_path, original = coordinator_state(
+        tmp_path,
+        transport="cmux",
+        target={"workspace": "workspace:2", "surface": surface},
+    )
+    before = handoff_watcher.read(state_path)
+    before["runs"] = {"run-1": handoff_watcher._empty_run_state()}  # noqa: SLF001 - state fixture
+    handoff_watcher._atomic_write(state_path, before)  # noqa: SLF001 - state fixture
+
+    updated = handoff_watcher.retarget(
+        state_path,
+        {"workspace": "workspace:9", "surface": surface},
+    )
+
+    assert updated["coordinator_id"] == original["coordinator_id"]
+    assert updated["runs"] == {"run-1": handoff_watcher._empty_run_state()}  # noqa: SLF001
+    assert updated["target"] == {"workspace": "workspace:9", "surface": surface}
 
 
 def registered_run(tmp_path, registry, *, name, coordinator_id):
@@ -375,6 +397,81 @@ def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
     assert coordinator_id in calls[2][2]
     assert "run-secret" not in calls[2][2]
     assert "seq 9" not in calls[2][2]
+
+
+def test_coordinator_cmux_uses_native_notification_when_terminal_write_fails(monkeypatch):
+    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    calls = []
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def orchestrator_doorbell(self, handle, observed_id):
+            raise handoff_launcher.AdapterError("Broken pipe")
+
+        def notify(self, handle, *, title, body):
+            calls.append((self.workspace, handle, title, body))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher,
+        "owner_process_status",
+        lambda owner: "alive",
+    )
+
+    handoffctl._notify_coordinator({
+        "coordinator_id": coordinator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    assert calls == [(
+        "workspace:9", None, "Handoff coordinator pending",
+        "Worker updates are ready for coordinator review.",
+    )]
+
+
+def test_coordinator_cmux_uses_macos_notification_when_cmux_writes_fail(monkeypatch):
+    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    calls = []
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def orchestrator_doorbell(self, handle, observed_id):
+            raise handoff_launcher.AdapterError("Broken pipe")
+
+        def notify(self, handle, *, title, body):
+            raise handoff_launcher.AdapterError("Broken pipe")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher,
+        "owner_process_status",
+        lambda owner: "alive",
+    )
+    monkeypatch.setattr(
+        handoffctl,
+        "_notify_macos",
+        lambda title, body: calls.append((title, body)),
+    )
+
+    handoffctl._notify_coordinator({
+        "coordinator_id": coordinator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    assert calls == [(
+        "Handoff coordinator pending",
+        "Worker updates are ready for coordinator review.",
+    )]
 
 
 def test_pending_uses_hot_path_and_full_context_only_for_recovery(

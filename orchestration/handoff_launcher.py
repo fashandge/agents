@@ -246,6 +246,12 @@ class CmuxAdapter:
 
     def launch(self, name: str, cwd: Path, terminal_command: str, workspace: str | None = None) -> str:
         if not workspace:
+            # ``current-workspace`` follows cmux's globally selected workspace,
+            # which can differ from the workspace that owns this coordinator's
+            # terminal.  The inherited ID is scoped to that exact terminal, so
+            # prefer it for worker placement.
+            workspace = os.environ.get("CMUX_WORKSPACE_ID")
+        if not workspace:
             workspace = _run([self.binary, "current-workspace"]).stdout.strip()
         if not workspace:
             raise AdapterError("cmux did not report a current workspace")
@@ -302,6 +308,18 @@ class CmuxAdapter:
             handle,
             f"Check handoff coordinator {coordinator_id}; pending worker outbox events are recorded.",
         )
+
+    def notify(self, handle: str | None, *, title: str, body: str) -> None:
+        """Raise a native cmux alert when terminal input is unavailable."""
+        if not self.workspace:
+            raise AdapterError("cmux workspace was not resolved before notifying")
+        command = [
+            self.binary, "notify", "--title", title, "--body", body,
+            "--workspace", self.workspace,
+        ]
+        if handle is not None:
+            command.extend(["--surface", handle])
+        _run(command)
 
     def send_literal(self, handle: str, text: str) -> bool:
         if not self.workspace:

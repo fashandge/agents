@@ -171,16 +171,13 @@ def test_cmux_probe_requires_surface_and_expected_process(monkeypatch):
     assert not adapter.probe(handle, "claude")
 
 
-def test_cmux_launch_resolves_workspace_and_uses_it_for_every_surface_command(monkeypatch, tmp_path):
+def test_cmux_launch_uses_the_inherited_orchestrator_workspace(monkeypatch, tmp_path):
     inherited_workspace = "CFE4746A-1D2E-4AB9-AA16-C4EFC3AA3336"
-    resolved_workspace = "workspace:9"
     handle = "123e4567-e89b-42d3-a456-426614174000"
     calls = []
 
     def fake_run(argv, check=True):
         calls.append(argv)
-        if argv == ["cmux", "current-workspace"]:
-            return Completed(stdout=f"{resolved_workspace}\n")
         if "new-surface" in argv:
             return Completed(stdout=f"surface {handle}\n")
         return Completed()
@@ -194,17 +191,40 @@ def test_cmux_launch_resolves_workspace_and_uses_it_for_every_surface_command(mo
 
     assert [
         "cmux", "--id-format", "both", "new-surface", "--type", "terminal",
-        "--workspace", resolved_workspace, "--focus", "false",
+        "--workspace", inherited_workspace, "--focus", "false",
     ] in calls
     assert [
-        "cmux", "send", "--workspace", resolved_workspace, "--surface", handle,
+        "cmux", "send", "--workspace", inherited_workspace, "--surface", handle,
         "exec /private/wrapper",
     ] in calls
     assert [
-        "cmux", "send", "--workspace", resolved_workspace, "--surface", handle,
+        "cmux", "send", "--workspace", inherited_workspace, "--surface", handle,
         "Read the kickoff",
     ] in calls
-    assert not any(inherited_workspace in arg for call in calls for arg in call)
+    assert ["cmux", "current-workspace"] not in calls
+
+
+def test_cmux_workspace_notification_omits_an_unwritable_surface(monkeypatch):
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    adapter = handoff_launcher.CmuxAdapter("cmux")
+    adapter.workspace = "workspace:9"
+
+    adapter.notify(
+        None,
+        title="Handoff coordinator pending",
+        body="Worker updates are ready for coordinator review.",
+    )
+
+    assert calls == [[
+        "cmux", "notify", "--title", "Handoff coordinator pending", "--body",
+        "Worker updates are ready for coordinator review.", "--workspace", "workspace:9",
+    ]]
 
 
 def test_wait_ready_needs_live_agent_and_semantic_revision(monkeypatch):

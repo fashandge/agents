@@ -438,21 +438,21 @@ def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monke
             owner.wait(timeout=5)
 
 
-def test_cmux_coordinator_registration_resolves_current_workspace(tmp_path, monkeypatch):
-    class Completed:
-        stdout = "workspace:actual\n"
-
+def test_cmux_coordinator_registration_uses_the_orchestrator_environment(tmp_path, monkeypatch):
+    surface = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    monkeypatch.setenv("CMUX_SURFACE_ID", surface.upper())
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace:orchestrator")
     monkeypatch.setattr(
         handoffctl.handoff_launcher,
         "_run",
-        lambda argv: Completed(),
+        lambda *args, **kwargs: pytest.fail("cmux inventory should not be consulted"),
     )
     state = tmp_path / "coordinator" / "watcher.json"
     args = Namespace(
         state=state,
         transport="cmux",
         target=None,
-        surface="b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+        surface=None,
         cmux_binary="/exact/cmux",
         owner_pid=os.getpid(),
         coordinator_id=None,
@@ -461,9 +461,49 @@ def test_cmux_coordinator_registration_resolves_current_workspace(tmp_path, monk
     value = handoffctl._register_coordinator(args)
 
     assert value["target"] == {
-        "workspace": "workspace:actual",
-        "surface": "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+        "workspace": "workspace:orchestrator",
+        "surface": surface,
     }
+
+
+def test_cmux_coordinator_registration_finds_an_explicit_surface_workspace(tmp_path, monkeypatch):
+    class Completed:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    surface = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+
+    def fake_run(argv, check=True):
+        if argv == ["/exact/cmux", "--id-format", "both", "list-workspaces"]:
+            return Completed("  workspace:2 UUID two\n  workspace:9 UUID nine\n")
+        if argv == [
+            "/exact/cmux", "--id-format", "both", "list-pane-surfaces", "--workspace", "workspace:2",
+        ]:
+            return Completed("surface:2 another-surface\n")
+        if argv == [
+            "/exact/cmux", "--id-format", "both", "list-pane-surfaces", "--workspace", "workspace:9",
+        ]:
+            return Completed(f"surface:9 {surface}\n")
+        raise AssertionError(argv)
+
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
+    monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+    state = tmp_path / "coordinator" / "watcher.json"
+    args = Namespace(
+        state=state,
+        transport="cmux",
+        target=None,
+        surface=surface,
+        cmux_binary="/exact/cmux",
+        owner_pid=os.getpid(),
+        coordinator_id=None,
+    )
+
+    value = handoffctl._register_coordinator(args)
+
+    assert value["target"] == {"workspace": "workspace:9", "surface": surface}
 
 
 def test_cli_explicitly_adopts_unowned_registry_run(tmp_path, monkeypatch):

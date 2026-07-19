@@ -22,6 +22,8 @@ from agents.orchestration import handoff_watcher
 RESULT_NOTIFICATION_TITLE = "Handoff result ready"
 RESULT_NOTIFICATION_BODY = "Awaiting coordinator review"
 RESULT_NOTIFICATION_TIMEOUT_SECONDS = 5
+COORDINATOR_NOTIFICATION_TITLE = "Handoff coordinator pending"
+COORDINATOR_NOTIFICATION_BODY = "Worker updates are ready for coordinator review."
 
 
 def _absolute(value: str) -> Path:
@@ -312,6 +314,31 @@ def _send_native_app_doorbell(thread_id: str, body: str) -> None:
     )
 
 
+def _notify_macos(title: str, body: str) -> None:
+    """Show a credential-free fallback alert when detached cmux writes fail."""
+    if sys.platform != "darwin":
+        raise handoff_launcher.AdapterError(
+            "cmux notification fallback is unavailable outside macOS",
+        )
+    script = f"display notification {json.dumps(body)} with title {json.dumps(title)}"
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise handoff_launcher.AdapterError(
+            f"macOS notification fallback failed: {exc}",
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise handoff_launcher.AdapterError(
+            f"macOS notification fallback failed ({result.returncode}): {detail}",
+        )
+
+
 def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None:
     if handoff_watcher.owner_process_status(value["owner_process"]) != "alive":
         raise handoff.HandoffError(
@@ -328,7 +355,27 @@ def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None
     if value["transport"] == "cmux":
         adapter = handoff_launcher.CmuxAdapter(handoff_launcher.CMUX_DEFAULT)
         adapter.workspace = target["workspace"]
-        adapter.orchestrator_doorbell(target["surface"], coordinator_id)
+        try:
+            adapter.orchestrator_doorbell(target["surface"], coordinator_id)
+        except handoff_launcher.AdapterError as doorbell_error:
+            try:
+                adapter.notify(
+                    None,
+                    title=COORDINATOR_NOTIFICATION_TITLE,
+                    body=COORDINATOR_NOTIFICATION_BODY,
+                )
+            except handoff_launcher.AdapterError as notification_error:
+                try:
+                    _notify_macos(
+                        COORDINATOR_NOTIFICATION_TITLE,
+                        COORDINATOR_NOTIFICATION_BODY,
+                    )
+                except handoff_launcher.AdapterError as macos_error:
+                    raise handoff_launcher.AdapterError(
+                        f"cmux doorbell failed ({doorbell_error}); "
+                        f"notification fallback failed ({notification_error}); "
+                        f"macOS fallback failed ({macos_error})",
+                    ) from macos_error
         return
     if value["transport"] == "native_app":
         _send_native_app_doorbell(
@@ -339,6 +386,45 @@ def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None
     raise handoff.HandoffError(f"unsupported coordinator transport: {value['transport']}", 4)
 
 
+def _cmux_workspace_for_surface(binary: str, surface: str) -> str:
+    """Resolve the workspace owning an exact cmux surface.
+
+    cmux's ``current-workspace`` describes the globally selected workspace, not
+    necessarily the terminal that launched this process.  Its inherited surface
+    and workspace environment variables form an exact pair, so retain that pair
+    when available.  An explicitly supplied surface falls back to a read-only
+    scan of the workspace inventory.
+    """
+    inherited_surface = os.environ.get("CMUX_SURFACE_ID")
+    inherited_workspace = os.environ.get("CMUX_WORKSPACE_ID")
+    if (
+        inherited_workspace
+        and inherited_surface
+        and inherited_surface.lower() == surface.lower()
+    ):
+        return inherited_workspace
+
+    listed = handoff_launcher._run([  # noqa: SLF001 - exact cmux inventory lookup
+        binary, "--id-format", "both", "list-workspaces",
+    ]).stdout
+    workspaces = [
+        token
+        for line in listed.splitlines()
+        for token in line.split()
+        if token.startswith("workspace:")
+    ]
+    for workspace in workspaces:
+        surfaces = handoff_launcher._run(  # noqa: SLF001 - exact cmux inventory lookup
+            [binary, "--id-format", "both", "list-pane-surfaces", "--workspace", workspace],
+            check=False,
+        )
+        if surfaces.returncode == 0 and surface.lower() in surfaces.stdout.lower():
+            return workspace
+    raise handoff.HandoffError(
+        f"cmux could not find coordinator surface {surface} in any workspace", 6,
+    )
+
+
 def _register_coordinator(args: argparse.Namespace) -> dict[str, Any]:
     if args.transport == "cmux":
         surface = args.surface or os.environ.get("CMUX_SURFACE_ID")
@@ -346,11 +432,8 @@ def _register_coordinator(args: argparse.Namespace) -> dict[str, Any]:
             raise handoff.HandoffError(
                 "cmux coordinator registration requires --surface or CMUX_SURFACE_ID", 2,
             )
-        workspace = handoff_launcher._run(  # noqa: SLF001 - exact session registration
-            [args.cmux_binary, "current-workspace"],
-        ).stdout.strip()
-        if not workspace:
-            raise handoff.HandoffError("cmux did not report the current workspace", 6)
+        surface = surface.lower()
+        workspace = _cmux_workspace_for_surface(args.cmux_binary, surface)
         target = {"workspace": workspace, "surface": surface}
     elif args.transport == "tmux":
         if not args.target:
@@ -365,6 +448,27 @@ def _register_coordinator(args: argparse.Namespace) -> dict[str, Any]:
         args.state, transport=transport, target=target,
         owner_pid=args.owner_pid,
         coordinator_id=args.coordinator_id,
+    )
+
+
+def _retarget_coordinator(args: argparse.Namespace) -> dict[str, Any]:
+    value = handoff_watcher.read(args.state)
+    if value["transport"] != "cmux":
+        raise handoff.HandoffError(
+            "coordinator retarget currently supports cmux coordinators only", 2,
+        )
+    surface = args.surface or os.environ.get("CMUX_SURFACE_ID")
+    if not surface:
+        raise handoff.HandoffError(
+            "cmux coordinator retarget requires --surface or CMUX_SURFACE_ID", 2,
+        )
+    surface = surface.lower()
+    return handoff_watcher.retarget(
+        args.state,
+        {
+            "workspace": _cmux_workspace_for_surface(args.cmux_binary, surface),
+            "surface": surface,
+        },
     )
 
 
@@ -583,6 +687,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="PID of the long-lived orchestrator process that owns this watcher",
     )
     coordinator_register.add_argument("--coordinator-id")
+    coordinator_retarget = coordinator_commands.add_parser(
+        "retarget", help="replace a stopped cmux coordinator's terminal target",
+    )
+    coordinator_retarget.add_argument("--state", required=True, type=_absolute)
+    coordinator_retarget.add_argument("--surface", help="exact cmux orchestrator surface UUID")
+    coordinator_retarget.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
     coordinator_start = coordinator_commands.add_parser(
         "start", help="start or reuse the detached watcher for a coordinator session",
     )
@@ -677,6 +787,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
             ))
     if args.command == "coordinator":
         if args.coordinator_command == "register": return _register_coordinator(args)
+        if args.coordinator_command == "retarget": return _retarget_coordinator(args)
         if args.coordinator_command == "start":
             if args.interval <= 0:
                 raise handoff.HandoffError("--interval must be positive", 2)

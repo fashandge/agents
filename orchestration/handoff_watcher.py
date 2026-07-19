@@ -245,6 +245,19 @@ def initialize(
     return value
 
 
+def retarget(path: Path, target: dict[str, str]) -> dict[str, Any]:
+    """Replace a stopped coordinator's transport target without dropping runs."""
+    path = _state_path(path)
+    if is_running(path):
+        raise handoff.HandoffError(
+            "cannot retarget a running coordinator watcher; stop it first", 4,
+        )
+    value = read(path)
+    value["target"] = _target(value["transport"], target)
+    _atomic_write(path, value)
+    return value
+
+
 def read(path: Path) -> dict[str, Any]:
     path = _state_path(path)
     try:
