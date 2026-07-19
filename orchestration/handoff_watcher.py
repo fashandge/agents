@@ -7,20 +7,23 @@ import datetime
 import fcntl
 import json
 import os
+import subprocess
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
 
 from agents.orchestration import handoff
 from agents.orchestration import handoff_launcher
 from agents.orchestration import handoff_registry
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_RETRY_SECONDS = 30.0
 DoorbellNotifier = Callable[[dict[str, Any], dict[str, int]], None]
+OwnerProcessStatus = Literal["alive", "dead", "unknown"]
+OwnerProcessProbe = Callable[[dict[str, Any]], OwnerProcessStatus]
 
 
 def _coordinator_id(value: Any) -> str:
@@ -57,6 +60,68 @@ def _target(transport: Any, target: Any) -> dict[str, str]:
     return dict(target)
 
 
+def _process_start_time(pid: int) -> str:
+    """Return a stable process-start token from the host's POSIX ``ps``."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise handoff.HandoffError(
+            f"cannot inspect orchestrator process {pid}: {exc}", 6,
+        ) from exc
+    started_at = " ".join(completed.stdout.split())
+    if completed.returncode != 0 or not started_at:
+        raise handoff.HandoffError(
+            f"orchestrator process {pid} does not exist or cannot be inspected", 4,
+        )
+    return started_at
+
+
+def _owner_process(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"pid", "started_at"}:
+        raise handoff.HandoffError("invalid coordinator owner process", 5)
+    pid = value["pid"]
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        raise handoff.HandoffError("coordinator owner PID must be greater than one", 5)
+    if not isinstance(value["started_at"], str) or not value["started_at"]:
+        raise handoff.HandoffError("coordinator owner start time must be non-empty", 5)
+    return dict(value)
+
+
+def capture_owner_process(pid: int) -> dict[str, Any]:
+    """Capture a PID plus start token so later PID reuse is detectable."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        raise handoff.HandoffError("coordinator owner PID must be greater than one", 2)
+    return {"pid": pid, "started_at": _process_start_time(pid)}
+
+
+def owner_process_status(owner: dict[str, Any]) -> OwnerProcessStatus:
+    """Return whether the exact registered orchestrator process still exists."""
+    owner = _owner_process(owner)
+    pid = owner["pid"]
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        pass
+    except OSError:
+        return "unknown"
+    try:
+        current_started_at = _process_start_time(pid)
+    except handoff.HandoffError:
+        # A transient ``ps`` failure must not kill a watcher or authorize a
+        # doorbell into a target whose ownership cannot currently be proved.
+        return "unknown"
+    return "alive" if current_started_at == owner["started_at"] else "dead"
+
+
 def _run_state(value: Any) -> dict[str, Any]:
     required = {
         "observed_through", "doorbell_through", "doorbell_pending",
@@ -86,13 +151,14 @@ def _run_state(value: Any) -> dict[str, Any]:
 
 def _validate(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
-        "version", "coordinator_id", "transport", "target", "runs",
+        "version", "coordinator_id", "transport", "target", "owner_process", "runs",
     }:
         raise handoff.HandoffError("invalid coordinator watcher snapshot", 5)
     if value["version"] != STATE_VERSION:
         raise handoff.HandoffError("unsupported coordinator watcher state version", 5)
     _coordinator_id(value["coordinator_id"])
     _target(value["transport"], value["target"])
+    _owner_process(value["owner_process"])
     if not isinstance(value["runs"], dict):
         raise handoff.HandoffError("coordinator watcher runs must be an object", 5)
     for run_id, run_state in value["runs"].items():
@@ -163,7 +229,7 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
 
 def initialize(
     path: Path, *, transport: str, target: dict[str, str],
-    coordinator_id: str | None = None,
+    owner_pid: int, coordinator_id: str | None = None,
 ) -> dict[str, Any]:
     """Create one private coordinator-session watcher snapshot."""
     path = _state_path(path)
@@ -172,6 +238,7 @@ def initialize(
         "coordinator_id": coordinator_id or str(uuid.uuid4()),
         "transport": transport,
         "target": target,
+        "owner_process": capture_owner_process(owner_pid),
         "runs": {},
     })
     _write_new(path, value)
@@ -210,6 +277,43 @@ def instance_lock(path: Path) -> Iterator[None]:
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def start_lock(path: Path) -> Iterator[int]:
+    """Serialize detached watcher check-and-start operations."""
+    path = _state_path(path)
+    lock_path = path.with_suffix(path.suffix + ".start.lock")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(lock_path.parent, 0o700)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield descriptor
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def is_running(path: Path) -> bool:
+    """Report whether a watcher currently holds this state's lifetime lock."""
+    path = _state_path(path)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(lock_path.parent, 0o700)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
         os.close(descriptor)
 
 
@@ -365,11 +469,20 @@ def poll(
 def watch(
     path: Path, *, interval: float = 5.0, notifier: DoorbellNotifier,
     registry_path: Path | None = None,
+    owner_probe: OwnerProcessProbe = owner_process_status,
 ) -> None:
-    """Run the session-owned watcher until the process is stopped."""
+    """Run until stopped or the exact owning orchestrator process exits."""
     if interval <= 0:
         raise handoff.HandoffError("--interval must be positive", 2)
     with instance_lock(path):
         while True:
-            poll(path, registry_path=registry_path, notifier=notifier)
+            value = read(path)
+            status = owner_probe(value["owner_process"])
+            if status == "dead":
+                return
+            if status == "alive":
+                poll(path, registry_path=registry_path, notifier=notifier)
+            # Unknown liveness deliberately suppresses doorbells: a transient
+            # host probe failure is not evidence that the original process is
+            # gone, but neither is it authority to type into its terminal.
             time.sleep(interval)

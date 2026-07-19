@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -372,6 +374,7 @@ def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path):
     registered = run_cli(
         "coordinator", "register", "--state", state,
         "--transport", "tmux", "--target", "orchestrator:0.4",
+        "--owner-pid", os.getpid(),
     )
     assert registered.returncode == 0, registered.stderr
     value = json.loads(registered.stdout)
@@ -386,6 +389,53 @@ def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path):
     )
     assert conflict.returncode == 2
     assert "cannot be combined" in conflict.stderr
+
+
+def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
+    state = tmp_path / "coordinator" / "watcher.json"
+    owner = subprocess.Popen(
+        [PYTHON, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        registered = run_cli(
+            "coordinator", "register", "--state", state,
+            "--transport", "tmux", "--target", "orchestrator:0.4",
+            "--owner-pid", owner.pid,
+        )
+        assert registered.returncode == 0, registered.stderr
+
+        started = run_cli(
+            "coordinator", "start", "--state", state, "--interval", 0.05,
+        )
+        assert started.returncode == 0, started.stderr
+        first = json.loads(started.stdout)
+        assert first["started"] is True
+        assert first["running"] is True
+        assert first["pid"] > 1
+
+        reused = run_cli(
+            "coordinator", "start", "--state", state, "--interval", 0.05,
+        )
+        assert reused.returncode == 0, reused.stderr
+        second = json.loads(reused.stdout)
+        assert second["started"] is False
+        assert second["running"] is True
+        assert second["pid"] == first["pid"]
+
+        owner.terminate()
+        owner.wait(timeout=5)
+        exitcode = state.parent / "watcher-process.exitcode"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not exitcode.exists():
+            time.sleep(0.05)
+        assert exitcode.read_text(encoding="utf-8") == "0"
+    finally:
+        if owner.poll() is None:
+            owner.terminate()
+            owner.wait(timeout=5)
 
 
 def test_cmux_coordinator_registration_resolves_current_workspace(tmp_path, monkeypatch):
@@ -404,6 +454,7 @@ def test_cmux_coordinator_registration_resolves_current_workspace(tmp_path, monk
         target=None,
         surface="b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
         cmux_binary="/exact/cmux",
+        owner_pid=os.getpid(),
         coordinator_id=None,
     )
 
@@ -421,6 +472,7 @@ def test_cli_explicitly_adopts_unowned_registry_run(tmp_path, monkeypatch):
     registered = run_cli(
         "coordinator", "register", "--state", state,
         "--transport", "tmux", "--target", "orchestrator:0.4",
+        "--owner-pid", os.getpid(),
     )
     assert registered.returncode == 0, registered.stderr
 

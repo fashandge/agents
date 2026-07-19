@@ -1,4 +1,5 @@
 import datetime
+import os
 import stat
 from pathlib import Path
 
@@ -16,6 +17,7 @@ def coordinator_state(tmp_path, *, transport="tmux", target=None):
         state_path,
         transport=transport,
         target=target or {"handle": "orchestrator:0.1"},
+        owner_pid=os.getpid(),
     )
     return state_path, value
 
@@ -87,6 +89,7 @@ def test_watcher_is_singleton_and_isolates_coordinators(tmp_path):
         other_path,
         transport="tmux",
         target={"handle": "other:0.1"},
+        owner_pid=os.getpid(),
     )
     owned = registered_run(
         tmp_path, registry, name="owned", coordinator_id=owner["coordinator_id"],
@@ -144,6 +147,60 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
         {first["run"]["run_id"]: 1},
         {second["run"]["run_id"]: 1},
     ]
+
+
+def test_watch_exits_when_owner_process_is_dead(tmp_path, monkeypatch):
+    state_path, _ = coordinator_state(tmp_path)
+    polls = []
+    monkeypatch.setattr(
+        handoff_watcher,
+        "poll",
+        lambda *args, **kwargs: polls.append((args, kwargs)),
+    )
+
+    handoff_watcher.watch(
+        state_path,
+        interval=0.01,
+        notifier=lambda value, coverage: None,
+        owner_probe=lambda owner: "dead",
+    )
+
+    assert polls == []
+    assert handoff_watcher.is_running(state_path) is False
+
+
+def test_watch_suppresses_work_while_owner_liveness_is_unknown(tmp_path, monkeypatch):
+    state_path, _ = coordinator_state(tmp_path)
+    statuses = iter(("unknown", "alive", "dead"))
+    polls = []
+    monkeypatch.setattr(handoff_watcher.time, "sleep", lambda interval: None)
+    monkeypatch.setattr(
+        handoff_watcher,
+        "poll",
+        lambda *args, **kwargs: polls.append((args, kwargs)),
+    )
+
+    handoff_watcher.watch(
+        state_path,
+        interval=0.01,
+        notifier=lambda value, coverage: None,
+        owner_probe=lambda owner: next(statuses),
+    )
+
+    assert len(polls) == 1
+
+
+def test_owner_process_status_rejects_pid_reuse(tmp_path, monkeypatch):
+    _, value = coordinator_state(tmp_path)
+    owner = value["owner_process"]
+    monkeypatch.setattr(handoff_watcher.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(
+        handoff_watcher,
+        "_process_start_time",
+        lambda pid: "Mon Jan  1 00:00:00 2040",
+    )
+
+    assert handoff_watcher.owner_process_status(owner) == "dead"
 
 
 def test_watcher_coalesces_and_never_advances_protocol_cursor(tmp_path):
@@ -283,6 +340,11 @@ def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
     monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Tmux)
     monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
     monkeypatch.setattr(
+        handoffctl.handoff_watcher,
+        "owner_process_status",
+        lambda owner: "alive",
+    )
+    monkeypatch.setattr(
         handoffctl,
         "_send_native_app_doorbell",
         lambda thread_id, body: calls.append(("native_app", thread_id, body)),
@@ -292,16 +354,19 @@ def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
         "coordinator_id": coordinator_id,
         "transport": "tmux",
         "target": {"handle": "session:3.7"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
     handoffctl._notify_coordinator({
         "coordinator_id": coordinator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
     handoffctl._notify_coordinator({
         "coordinator_id": coordinator_id,
         "transport": "native_app",
         "target": {"thread_id": "thread-exact"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
 
     assert calls[0] == ("tmux", "session:3.7", coordinator_id)

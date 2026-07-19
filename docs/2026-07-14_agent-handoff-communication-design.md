@@ -369,16 +369,24 @@ The session target is transport-specific and must be resolved exactly at registr
 - tmux records an exact session/pane handle; and
 - a native app adapter records the stable thread/task ID accepted by its messaging API.
 
+Registration also records the PID of the long-lived orchestrator process and a stable
+process-start token captured from the owning host. The pair, rather than PID alone,
+prevents PID reuse from keeping an orphaned watcher alive or authorizing terminal
+input after the original orchestrator exits. A transient inability to verify this
+identity is an unknown state: the watcher stays alive but suppresses polling and
+doorbells until ownership can be proved again.
+
 The watcher stores no recovery, coordinator, or worker token. Its state lives in a
 mode-`0700` private coordinator directory with a mode-`0600` atomic JSON snapshot and a
 single-instance lock. At minimum the snapshot contains:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "coordinator_id": "uuid",
   "transport": "cmux",
   "target": {"workspace": "workspace:9", "surface": "uuid"},
+  "owner_process": {"pid": 12345, "started_at": "host process-start token"},
   "runs": {
     "run-uuid": {
       "observed_through": 7,
@@ -390,20 +398,24 @@ single-instance lock. At minimum the snapshot contains:
 }
 ```
 
-The follow-up CLI surface is:
+The lifecycle CLI surface is:
 
 ```text
-handoffctl watch --coordinator-state ABSOLUTE_PATH [--interval SECONDS]
+handoffctl coordinator register --state ABSOLUTE_PATH ... --owner-pid PID
+handoffctl coordinator start --state ABSOLUTE_PATH [--interval SECONDS]
 ```
 
-The orchestrator/session adapter creates the initial state file safely and starts this
-long-running command detached; `handoffctl` itself does not daemonize. Coordinator mode
-is mutually exclusive with `--run`, `--timeout`, `--once`, and `--notify-cmux`, because
-its target, membership, lifecycle, and doorbell policy come from the coordinator state.
-Without `--coordinator-state`, the existing generic JSONL observer behavior remains
-unchanged. Its registry-level `observed_outbox_cursor` is not reused by coordinator
-mode: each coordinator keeps independent delivery state so concurrent observers cannot
-steal notifications from one another.
+The orchestrator/session adapter creates the initial state file safely. `coordinator
+start` serializes the check-and-start boundary, reuses a watcher already holding the
+state's lifetime lock, or launches the long-running command with the repository's
+double-fork detached runner. Direct `watch --coordinator-state` remains available for
+foreground diagnostics. Coordinator mode is mutually exclusive with `--run`,
+`--timeout`, `--once`, and `--notify-cmux`, because its target, membership, lifecycle,
+and doorbell policy come from coordinator state. Without `--coordinator-state`, the
+existing generic JSONL observer behavior remains unchanged. Its registry-level
+`observed_outbox_cursor` is not reused by coordinator mode: each coordinator keeps
+independent delivery state so concurrent observers cannot steal notifications from one
+another.
 
 These are delivery cursors, not semantic-processing state:
 
@@ -420,20 +432,23 @@ duplicated or lost without changing protocol truth.
 The default polling interval is five seconds. Each iteration performs the following
 steps:
 
-1. Reload and validate the private run registry so new workers are discovered.
-2. Resolve each matching local or remote record on its owning host and read
+1. Verify that the exact registered PID still has the captured process-start token.
+   Exit cleanly if it is gone or reused; if liveness is temporarily unknown, suppress
+   this iteration without sending terminal input.
+2. Reload and validate the private run registry so new workers are discovered.
+3. Resolve each matching local or remote record on its owning host and read
    `control.outbox_cursor`, the validated outbox tail, and any records not yet reflected
    in the watcher's delivery state. Active remote journals remain remote; SSH reads do
    not copy or synchronize them.
-3. Atomically record the newly observed tail before attempting notification. If the
+4. Atomically record the newly observed tail before attempting notification. If the
    process crashes after the state write but before the doorbell, restart recovery
    treats the notification as pending and retries it. A crash after the doorbell but
    before recording success may produce a duplicate, which is harmless.
-4. Coalesce all currently pending runs into one opaque orchestrator doorbell. The
+5. Coalesce all currently pending runs into one opaque orchestrator doorbell. The
    doorbell contains only the `coordinator_id`, run IDs, and highest outbox sequences,
    or a pointer to the private watcher snapshot; it never includes worker message
    bodies, artifacts, prompts, or credentials.
-5. Leave `doorbell_pending` set until each covered run's
+6. Leave `doorbell_pending` set until each covered run's
    `control.outbox_cursor >= doorbell_through`. Events arriving while a doorbell is
    pending extend the observed tail. If the orchestrator consumes only the older
    prefix, the watcher sends another coalesced doorbell for the remaining prefix.
@@ -473,12 +488,13 @@ coordinator rules. A question that needs new user authority is surfaced to the u
 rather than guessed; its durable question ID and worker `blocked_on` state remain the
 recovery record.
 
-The watcher is session-owned. It starts once when the orchestrator first requests
-managed observation, reuses its singleton when more workers launch, and stops when the
-registered orchestrator session is explicitly closed or its exact transport target is
-confirmed gone. Watcher exit never deletes run directories or changes worker state.
-On watcher failure, a later launch or user-turn pending check may restart it from the
-private snapshot without losing worker events.
+The watcher is session-owned. Continuous monitoring is the normal orchestration
+default: it starts lazily with the first worker handoff and reuses its singleton when
+more workers launch. Explicit fire-and-forget launches omit coordinator state. The
+watcher exits when the exact registered orchestrator process disappears or its PID is
+reused. Watcher exit never deletes run directories or changes worker state. On watcher
+failure, a later launch or user-turn pending check may restart it from the private
+snapshot without losing worker events.
 
 ### 4.7 Review and completion flow
 
@@ -786,6 +802,8 @@ handoffctl runs adopt --run SELECTOR --coordinator-state ABSOLUTE_PATH
 handoffctl coordinator register --state ABSOLUTE_PATH
                                 --transport cmux|tmux|native-app
                                 [--target HANDLE_OR_THREAD] [--surface UUID]
+                                --owner-pid PID
+handoffctl coordinator start --state ABSOLUTE_PATH [--interval SECONDS]
 handoffctl coordinator show --state ABSOLUTE_PATH
 handoffctl coordinator pending --state ABSOLUTE_PATH [--full-context]
 handoffctl context --run SELECTOR
@@ -893,6 +911,7 @@ Successful JSON output shapes are exact:
 | `runs list` / `runs show` | Public registry record(s), with `credential_dir` omitted |
 | `runs adopt` | The adopted public registry record |
 | `coordinator register` / `coordinator show` | The raw credential-free coordinator watcher snapshot |
+| `coordinator start` | `{"coordinator_id":str,"pid":int|null,"running":true,"started":bool,"state":str}` |
 | `coordinator pending` | `{"coordinator_id":str,"mode":"hot"|"recovery","pending":[...]}`; hot detail contains exact status/control and unread outbox only, while recovery detail contains the full `context` bundle |
 | `context` | `{"run":object,"status":object,"control":object,"kickoff":str,"progress":str,"unread_inbox":[message,...],"unread_outbox":[message,...],"registry":object}` |
 | `dispatch` | `{"run":object,"takeover":object,"message":object,"superseded_result":str|null,"doorbell_sent":bool,"doorbell_error":str|null,"coordinator_released":bool}` |
@@ -1150,6 +1169,10 @@ Detached watcher acceptance tests should additionally demonstrate:
   different coordinator;
 - a worker registered after watcher startup is discovered without restarting the
   process;
+- the detached start operation is singleton-safe, and the watcher exits when the exact
+  orchestrator PID plus process-start identity disappears or changes;
+- an unknown liveness probe suppresses polling and doorbells without treating the
+  orchestrator as dead;
 - observation and doorbell state never advance `control.outbox_cursor`;
 - multiple worker events are coalesced, and a duplicated doorbell is harmless;
 - a crash before or after doorbell delivery recovers from the atomic watcher snapshot

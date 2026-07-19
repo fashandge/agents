@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from agents import coding_agents_cli
 from agents.orchestration import handoff
 from agents.orchestration import handoff_launcher
 from agents.orchestration import handoff_registry
@@ -312,6 +313,10 @@ def _send_native_app_doorbell(thread_id: str, body: str) -> None:
 
 
 def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None:
+    if handoff_watcher.owner_process_status(value["owner_process"]) != "alive":
+        raise handoff.HandoffError(
+            "orchestrator process ownership cannot be verified; doorbell suppressed", 6,
+        )
     del coverage  # The canonical snapshot-pointer doorbell is intentionally opaque.
     coordinator_id = value["coordinator_id"]
     target = value["target"]
@@ -358,8 +363,74 @@ def _register_coordinator(args: argparse.Namespace) -> dict[str, Any]:
     transport = "native_app" if args.transport == "native-app" else args.transport
     return handoff_watcher.initialize(
         args.state, transport=transport, target=target,
+        owner_pid=args.owner_pid,
         coordinator_id=args.coordinator_id,
     )
+
+
+def _start_coordinator_watcher(path: Path, interval: float) -> dict[str, Any]:
+    """Start or reuse one fully detached watcher for a coordinator state."""
+    value = handoff_watcher.read(path)
+    if handoff_watcher.owner_process_status(value["owner_process"]) != "alive":
+        raise handoff.HandoffError("coordinator owner process is not alive", 4)
+    output_base = path.parent / "watcher-process"
+    with handoff_watcher.start_lock(path) as start_lock_descriptor:
+        if handoff_watcher.is_running(path):
+            pid_path = Path(f"{output_base}.pid")
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pid = None
+            return {
+                "coordinator_id": value["coordinator_id"],
+                "pid": pid,
+                "running": True,
+                "started": False,
+                "state": str(path),
+            }
+
+        for suffix in ("out", "err", "pid", "exitcode"):
+            Path(f"{output_base}.{suffix}").unlink(missing_ok=True)
+
+        def runner() -> coding_agents_cli.AgentResult:
+            # ``run_detached`` forks without exec. Close the daemon's inherited
+            # copy so flock semantics on Linux cannot keep the short-lived
+            # check-and-start lock held for the watcher's entire lifetime.
+            try:
+                os.close(start_lock_descriptor)
+            except OSError:
+                pass
+            handoff_watcher.watch(
+                path,
+                interval=interval,
+                notifier=_notify_coordinator,
+            )
+            return coding_agents_cli.AgentResult(
+                output="",
+                returncode=0,
+                stderr="",
+                agent=coding_agents_cli.AgentType.CODEX,
+            )
+
+        process = coding_agents_cli.run_detached(runner, output_base)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if handoff_watcher.is_running(path):
+                return {
+                    "coordinator_id": value["coordinator_id"],
+                    "pid": process["pid"],
+                    "running": True,
+                    "started": True,
+                    "state": str(path),
+                }
+            exitcode_path = Path(process["exitcode"])
+            if exitcode_path.exists():
+                detail = Path(process["err"]).read_text(encoding="utf-8").strip()
+                raise handoff.HandoffError(
+                    f"detached coordinator watcher exited during startup: {detail}", 6,
+                )
+            time.sleep(0.05)
+    raise handoff.HandoffError("detached coordinator watcher did not become ready", 6)
 
 
 def _coordinator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
@@ -507,7 +578,16 @@ def build_parser() -> argparse.ArgumentParser:
     coordinator_register.add_argument("--target", help="exact tmux handle or native-app thread ID")
     coordinator_register.add_argument("--surface", help="exact cmux orchestrator surface UUID")
     coordinator_register.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
+    coordinator_register.add_argument(
+        "--owner-pid", required=True, type=int,
+        help="PID of the long-lived orchestrator process that owns this watcher",
+    )
     coordinator_register.add_argument("--coordinator-id")
+    coordinator_start = coordinator_commands.add_parser(
+        "start", help="start or reuse the detached watcher for a coordinator session",
+    )
+    coordinator_start.add_argument("--state", required=True, type=_absolute)
+    coordinator_start.add_argument("--interval", type=float, default=5.0)
     coordinator_show = coordinator_commands.add_parser("show")
     coordinator_show.add_argument("--state", required=True, type=_absolute)
     coordinator_pending = coordinator_commands.add_parser("pending")
@@ -597,6 +677,10 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
             ))
     if args.command == "coordinator":
         if args.coordinator_command == "register": return _register_coordinator(args)
+        if args.coordinator_command == "start":
+            if args.interval <= 0:
+                raise handoff.HandoffError("--interval must be positive", 2)
+            return _start_coordinator_watcher(args.state, args.interval)
         if args.coordinator_command == "show": return handoff_watcher.read(args.state)
         if args.coordinator_command == "pending":
             return _coordinator_pending(args.state, full_context=args.full_context)
