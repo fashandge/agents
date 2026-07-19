@@ -366,6 +366,84 @@ def test_failed_dispatch_releases_ephemeral_coordinator(tmp_path, monkeypatch):
     assert not list(run["private"].glob("coordinator-dispatch-*.token"))
 
 
+def _send_args(run_dir, token_file, body_file, *, no_doorbell=False):
+    return Namespace(
+        command="send",
+        run_dir=Path(run_dir),
+        token_file=Path(token_file),
+        type="steer",
+        message_id=None,
+        reply_to=None,
+        body_file=Path(body_file),
+        data_file=None,
+        attachments_file=None,
+        snapshot_attachments=False,
+        no_doorbell=no_doorbell,
+    )
+
+
+def test_send_rings_doorbell_for_registered_run(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    doorbells = []
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            doorbells.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    body = tmp_path / "body.txt"
+    body.write_text("steer body", encoding="utf-8")
+    sent = handoffctl.dispatch(_send_args(run["run_dir"], run["private"] / "coordinator.token", body))
+
+    assert sent["doorbell_sent"] is True
+    assert sent["doorbell_error"] is None
+    assert doorbells == [("weather-worker", run["run"]["run_id"], sent["message"]["seq"])]
+
+
+def test_send_no_doorbell_skips_ring(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            pytest.fail("--no-doorbell must not ring the doorbell")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    body = tmp_path / "body.txt"
+    body.write_text("steer body", encoding="utf-8")
+    sent = handoffctl.dispatch(_send_args(
+        run["run_dir"], run["private"] / "coordinator.token", body, no_doorbell=True,
+    ))
+
+    assert sent["doorbell_sent"] is False
+    assert sent["doorbell_error"] is None
+
+
+def test_send_unregistered_run_skips_doorbell(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("task", encoding="utf-8")
+    private = tmp_path / "credentials"
+    initialized = handoff.initialize(
+        workspace=workspace, kickoff=kickoff, harness="claude", model="opus",
+        effort="low", transport="tmux", run_dir=tmp_path / "state" / "run",
+        recovery_token_file=private / "recovery.token",
+        coordinator_token_file=private / "coordinator.token",
+        worker_token_file=private / "worker.token",
+    )
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
+
+    body = tmp_path / "body.txt"
+    body.write_text("steer body", encoding="utf-8")
+    sent = handoffctl.dispatch(_send_args(initialized["run_dir"], private / "coordinator.token", body))
+
+    assert sent["message"]["type"] == "steer"
+    assert sent["doorbell_sent"] is False
+    assert "not registered" in sent["doorbell_error"]
+
+
 def test_context_and_watch_use_durable_registered_state(tmp_path, monkeypatch, capsys):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])

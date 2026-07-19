@@ -176,6 +176,26 @@ def _ring_doorbell(record: dict[str, Any], run_id: str, inbox_seq: int) -> tuple
         return False, str(exc)
 
 
+def _send_with_doorbell(args: argparse.Namespace) -> dict[str, Any]:
+    result = handoff.send(args.run_dir, _token(args, "coordinator"), **_mutation_inputs(args))
+    doorbell_sent = False
+    doorbell_error: str | None = None
+    if not args.no_doorbell:
+        try:
+            record = handoff_registry.resolve(str(args.run_dir), private=True)
+        except handoff.HandoffError:
+            record = None
+        if record is None:
+            doorbell_error = "run is not registered; doorbell skipped"
+        elif record["host"] is not None:
+            doorbell_error = "run is remote; doorbell skipped"
+        else:
+            doorbell_sent, doorbell_error = _ring_doorbell(
+                record, record["run_id"], result["message"]["seq"],
+            )
+    return {**result, "doorbell_sent": doorbell_sent, "doorbell_error": doorbell_error}
+
+
 def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
     if record["host"] is not None or record["credential_dir"] is None:
         raise handoff.HandoffError("dispatch must execute on the run-owning host", 4)
@@ -976,6 +996,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ready = commands.add_parser("ready"); _add_run(ready); _add_token(ready)
     send = commands.add_parser("send"); _add_message(send)
+    send.add_argument(
+        "--no-doorbell", action="store_true",
+        help="append only; skip the best-effort terminal doorbell for a registered run",
+    )
     emit = commands.add_parser("emit"); _add_message(emit)
 
     control = commands.add_parser("control")
@@ -1044,7 +1068,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
     if args.command == "dispatch":
         return _dispatch_registered(args.run, _read_text(args.body_file))
     if args.command == "ready": return handoff.ready(args.run_dir, _token(args, "worker"))
-    if args.command == "send": return handoff.send(args.run_dir, _token(args, "coordinator"), **_mutation_inputs(args))
+    if args.command == "send": return _send_with_doorbell(args)
     if args.command == "emit":
         result = handoff.emit(args.run_dir, _token(args, "worker"), **_mutation_inputs(args))
         if args.type == "result":
