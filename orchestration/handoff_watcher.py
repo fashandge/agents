@@ -136,9 +136,10 @@ def _run_state(value: Any) -> dict[str, Any]:
         "last_doorbell_at", "control_through", "doorbell_after_cursor",
         "last_doorbell_error",
     }
-    # ``last_doorbell_method`` and ``acknowledged_through`` are optional so
-    # snapshots written before those fields existed remain readable.
-    optional = {"last_doorbell_method", "acknowledged_through"}
+    # ``last_doorbell_method``, ``acknowledged_through``, and
+    # ``dismissed_through`` are optional so snapshots written before those
+    # fields existed remain readable.
+    optional = {"last_doorbell_method", "acknowledged_through", "dismissed_through"}
     if not isinstance(value, dict) or not required <= set(value) <= required | optional:
         raise handoff.HandoffError("invalid coordinator run notification state", 5)
     for field in (
@@ -151,6 +152,9 @@ def _run_state(value: Any) -> dict[str, Any]:
     acknowledged = value.get("acknowledged_through", 0)
     if isinstance(acknowledged, bool) or not isinstance(acknowledged, int) or acknowledged < 0:
         raise handoff.HandoffError("coordinator run acknowledged_through must be non-negative", 5)
+    dismissed = value.get("dismissed_through", 0)
+    if isinstance(dismissed, bool) or not isinstance(dismissed, int) or dismissed < 0:
+        raise handoff.HandoffError("coordinator run dismissed_through must be non-negative", 5)
     if value["doorbell_through"] > value["observed_through"]:
         raise handoff.HandoffError("doorbell cursor exceeds observed cursor", 5)
     if not isinstance(value["doorbell_pending"], bool):
@@ -355,6 +359,7 @@ def _empty_run_state() -> dict[str, Any]:
         "last_doorbell_error": None,
         "last_doorbell_method": None,
         "acknowledged_through": 0,
+        "dismissed_through": 0,
     }
 
 
@@ -391,6 +396,39 @@ def acknowledge(path: Path, acks: dict[str, int]) -> dict[str, Any]:
     return value
 
 
+def dismiss(path: Path, dismissals: dict[str, int]) -> dict[str, Any]:
+    """Record that the coordinator has dismissed each run's events through a seq.
+
+    ``coordinator dismiss`` calls this without consuming the protocol outbox so
+    the watcher stops ringing for the current worker state.  The cursor only
+    advances (monotonic ``max``); a strictly newer ``observed_through`` still
+    doorbells.
+
+    Lock-free by design.  ``poll`` re-derives every other run field from
+    protocol truth each interval and never touches ``dismissed_through``, so a
+    lost update against a concurrent poll costs at most one extra doorbell and
+    self-heals on the next ``dismiss`` call.  Runs absent from the snapshot are
+    ignored.
+    """
+    path = _state_path(path)
+    if not dismissals:
+        return read(path)
+    value = read(path)
+    changed = False
+    for run_id, through in dismissals.items():
+        if isinstance(through, bool) or not isinstance(through, int) or through < 0:
+            raise handoff.HandoffError("dismiss cursor must be non-negative", 2)
+        run_state = value["runs"].get(run_id)
+        if run_state is None:
+            continue
+        if through > run_state.get("dismissed_through", 0):
+            run_state["dismissed_through"] = through
+            changed = True
+    if changed:
+        _atomic_write(path, value)
+    return value
+
+
 def _remote_json(record: dict[str, Any], argv: list[str]) -> Any:
     try:
         completed = handoff_launcher._run_ssh(  # noqa: SLF001
@@ -406,20 +444,22 @@ def _remote_json(record: dict[str, Any], argv: list[str]) -> Any:
 
 def _protocol_state(
     record: dict[str, Any], after: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], int]:
     if record["host"] is None:
         run_dir = Path(record["run_dir"])
         control = handoff.control_show(run_dir)
+        status = handoff.status(run_dir)
         records = handoff._journal(run_dir, "outbox")  # noqa: SLF001 - validated tail is required
         if after > len(records):
             raise handoff.HandoffError("watcher observed cursor exceeds outbox tail", 5)
         if control["outbox_cursor"] > len(records):
             raise handoff.HandoffError("control outbox cursor exceeds outbox tail", 5)
-        return control, records[after:], len(records)
+        return control, status, records[after:], len(records)
     control = _remote_json(
         record,
         ["control", "show", "--run-dir", record["run_dir"]],
     )
+    status = _remote_json(record, ["status", "--run-dir", record["run_dir"]])
     events = _remote_json(
         record,
         [
@@ -427,12 +467,14 @@ def _protocol_state(
             "--after", str(after),
         ],
     )
-    if not isinstance(control, dict) or not isinstance(events, list):
+    if not isinstance(status, dict) or not isinstance(control, dict) or not isinstance(events, list):
         raise handoff.HandoffError("remote watcher read returned invalid data", 6)
+    if status.get("state") not in handoff.WORKER_STATES or not isinstance(status.get("blocked_on"), list):
+        raise handoff.HandoffError("remote watcher status is invalid", 6)
     tail = events[-1]["seq"] if events else after
     if control["outbox_cursor"] > tail:
         raise handoff.HandoffError("remote control outbox cursor exceeds observed tail", 5)
-    return control, events, tail
+    return control, status, events, tail
 
 
 def _retry_due(run_state: dict[str, Any], now: datetime.datetime, retry_seconds: float) -> bool:
@@ -465,6 +507,7 @@ def poll(
     current_time = now or datetime.datetime.now(datetime.timezone.utc)
     errors: list[dict[str, str]] = []
     changed = False
+    observations: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
 
     records = handoff_registry.list_records(path=registry_path, private=True)
     owned = [
@@ -476,7 +519,9 @@ def poll(
         run_id = record["run_id"]
         run_state = value["runs"].setdefault(run_id, _empty_run_state())
         try:
-            control, events, tail = _protocol_state(record, run_state["observed_through"])
+            control, status, events, tail = _protocol_state(
+                record, run_state["observed_through"],
+            )
             if tail < run_state["observed_through"]:
                 raise handoff.HandoffError("worker outbox tail regressed", 5)
             previous = dict(run_state)
@@ -485,6 +530,7 @@ def poll(
             run_state["doorbell_pending"] = tail > control["outbox_cursor"]
             if events and events[-1]["seq"] != tail:
                 raise handoff.HandoffError("worker outbox observation is not contiguous", 5)
+            observations[run_id] = (status, events)
             changed = changed or run_state != previous
         except handoff.HandoffError as exc:
             errors.append({"run_id": run_id, "error": str(exc)})
@@ -498,7 +544,26 @@ def poll(
     for run_id, run_state in value["runs"].items():
         if run_id not in owned_ids or not run_state["doorbell_pending"]:
             continue
-        if run_state["observed_through"] <= run_state.get("acknowledged_through", 0):
+        observation = observations.get(run_id)
+        if observation is None:
+            continue
+        status, events = observation
+        if run_state["observed_through"] <= run_state.get("dismissed_through", 0):
+            continue
+        new_events = run_state["observed_through"] > run_state["doorbell_through"]
+        partial_consumption = (
+            run_state["control_through"] > run_state["doorbell_after_cursor"]
+            and run_state["control_through"] < run_state["observed_through"]
+        )
+        state = status["state"]
+        blocking = state == "blocked" and bool(status["blocked_on"])
+        ring_once = state in {"awaiting_review", "failed"}
+        error_while_working = state in {"starting", "working"} and any(
+            event["type"] == "error" for event in events
+        )
+        if not blocking and not ring_once and not error_while_working:
+            continue
+        if not blocking and run_state["observed_through"] <= run_state.get("acknowledged_through", 0):
             # The orchestrator has already loaded every observed event via
             # ``coordinator pending``.  Do not re-ring until a strictly newer
             # event arrives.  Without this gate an unconsumed-but-seen result
@@ -507,12 +572,19 @@ def poll(
             # on every interval — even when the coordinator has no lease to
             # consume with and has already acted on the event.
             continue
-        new_events = run_state["observed_through"] > run_state["doorbell_through"]
-        partial_consumption = (
-            run_state["control_through"] > run_state["doorbell_after_cursor"]
-            and run_state["control_through"] < run_state["observed_through"]
-        )
-        if new_events or partial_consumption or _retry_due(run_state, current_time, retry_seconds):
+        if blocking:
+            should_ring = new_events or _retry_due(run_state, current_time, retry_seconds)
+        elif error_while_working:
+            # A nonfatal error observed while the worker remains active is
+            # actionable, but it does not become a retrying notification.
+            should_ring = True
+        else:
+            should_ring = (
+                new_events
+                or partial_consumption
+                or _retry_due(run_state, current_time, retry_seconds)
+            )
+        if should_ring:
             coverage[run_id] = run_state["observed_through"]
 
     if coverage:

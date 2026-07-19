@@ -843,6 +843,26 @@ def _coordinator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
     }
 
 
+def _coordinator_dismiss(path: Path, selector: str) -> dict[str, Any]:
+    """Dismiss the currently observed events for one registered watcher run."""
+    value = handoff_watcher.read(path)
+    record = handoff_registry.resolve(selector, private=True)
+    run_id = record["run_id"]
+    notification = value["runs"].get(run_id)
+    if notification is None:
+        raise handoff.HandoffError(f"unknown handoff run: {selector}", 4)
+    updated = handoff_watcher.dismiss(
+        path, {run_id: notification["observed_through"]},
+    )
+    return {
+        "coordinator_id": value["coordinator_id"],
+        "dismissed": {
+            "run_id": run_id,
+            "dismissed_through": updated["runs"][run_id].get("dismissed_through", 0),
+        },
+    }
+
+
 def _print_coordinator_poll(result: dict[str, Any]) -> None:
     """Log doorbell activity so a surface-hosted watcher's tab shows history.
 
@@ -975,6 +995,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-context", action="store_true",
         help="load the full durable context bundle after resume, compaction, or takeover",
     )
+    coordinator_dismiss = coordinator_commands.add_parser("dismiss")
+    coordinator_dismiss.add_argument("--state", required=True, type=_absolute)
+    coordinator_dismiss.add_argument(
+        "--run", required=True,
+        help="run ID, unique prefix, name, handle, or URI",
+    )
     context = commands.add_parser("context", help="read durable context for a registered run")
     context.add_argument("--run", required=True, help="run ID, unique prefix, name, handle, or URI")
     fast_dispatch = commands.add_parser(
@@ -1071,6 +1097,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
         if args.coordinator_command == "show": return handoff_watcher.read(args.state)
         if args.coordinator_command == "pending":
             return _coordinator_pending(args.state, full_context=args.full_context)
+        if args.coordinator_command == "dismiss":
+            return _coordinator_dismiss(args.state, args.run)
     if args.command == "context": return _context_registered(args.run)
     if args.command == "dispatch":
         return _dispatch_registered(args.run, _read_text(args.body_file))

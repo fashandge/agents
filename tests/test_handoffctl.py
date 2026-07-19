@@ -521,6 +521,54 @@ def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path):
     assert "cannot be combined" in conflict.stderr
 
 
+def test_cli_coordinator_dismiss_resolves_registered_run_and_writes_cursor(
+    tmp_path, monkeypatch,
+):
+    run = registered_run(tmp_path, monkeypatch)
+    state = tmp_path / "coordinator" / "watcher.json"
+    registered = run_cli(
+        "coordinator", "register", "--state", state,
+        "--transport", "tmux", "--target", "orchestrator:0.4",
+        "--owner-pid", os.getpid(),
+    )
+    assert registered.returncode == 0, registered.stderr
+    coordinator_id = json.loads(registered.stdout)["coordinator_id"]
+    handoff_registry.adopt(run["run"]["run_id"], coordinator_id)
+    handoff.emit(
+        Path(run["run_dir"]),
+        run["worker"],
+        type="checkpoint",
+        body="ordinary progress",
+        data={
+            "state": "working",
+            "stage": "implementation",
+            "current_activity": "ordinary progress",
+            "inbox_cursor": 0,
+            "commitments": [],
+        },
+    )
+    handoff_watcher.poll(
+        state,
+        notifier=lambda value, coverage: pytest.fail("working progress must not ring"),
+    )
+
+    dismissed = run_cli(
+        "coordinator", "dismiss", "--state", state, "--run", "weather",
+    )
+
+    assert dismissed.returncode == 0, dismissed.stderr
+    assert json.loads(dismissed.stdout) == {
+        "coordinator_id": coordinator_id,
+        "dismissed": {
+            "run_id": run["run"]["run_id"],
+            "dismissed_through": 1,
+        },
+    }
+    assert handoff_watcher.read(state)["runs"][run["run"]["run_id"]][
+        "dismissed_through"
+    ] == 1
+
+
 def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monkeypatch):
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
     state = tmp_path / "coordinator" / "watcher.json"

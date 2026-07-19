@@ -86,7 +86,7 @@ def registered_run(tmp_path, registry, *, name, coordinator_id):
     }
 
 
-def checkpoint(run, activity):
+def worker_checkpoint(run, activity, *, state="working", inbox_cursor=0):
     run_dir = Path(run["run_dir"])
     return handoff.emit(
         run_dir,
@@ -94,9 +94,62 @@ def checkpoint(run, activity):
         type="checkpoint",
         body=activity,
         data={
-            "state": "working",
+            "state": state,
             "stage": "implementation",
             "current_activity": activity,
+            "inbox_cursor": inbox_cursor,
+            "commitments": [],
+        },
+    )
+
+
+def checkpoint(run, activity):
+    return worker_checkpoint(run, activity)
+
+
+def blocked(run, question="Which option should I take?"):
+    return handoff.emit(
+        Path(run["run_dir"]),
+        run["worker"],
+        type="question",
+        body=question,
+        data={
+            "blocking": True,
+            "stage": "implementation",
+            "current_activity": "Awaiting coordinator direction",
+            "inbox_cursor": 0,
+            "commitments": [],
+        },
+    )
+
+
+def awaiting_review(run, body="Ready for coordinator review"):
+    return handoff.emit(
+        Path(run["run_dir"]),
+        run["worker"],
+        type="result",
+        body=body,
+        data={
+            "head": None,
+            "dirty": False,
+            "stage": "implementation",
+            "inbox_cursor": 0,
+            "verification": [],
+            "commitments": [],
+        },
+    )
+
+
+def nonfatal_error(run, body="Recoverable worker error"):
+    return handoff.emit(
+        Path(run["run_dir"]),
+        run["worker"],
+        type="error",
+        body=body,
+        data={
+            "fatal": False,
+            "category": "transient",
+            "stage": "implementation",
             "inbox_cursor": 0,
             "commitments": [],
         },
@@ -119,8 +172,8 @@ def test_watcher_is_singleton_and_isolates_coordinators(tmp_path):
     foreign = registered_run(
         tmp_path, registry, name="foreign", coordinator_id=other["coordinator_id"],
     )
-    checkpoint(owned, "owned body must stay on disk")
-    checkpoint(foreign, "foreign body must never surface")
+    awaiting_review(owned, "owned body must stay on disk")
+    awaiting_review(foreign, "foreign body must never surface")
     calls = []
 
     assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
@@ -149,7 +202,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
         first = registered_run(
             tmp_path, registry, name="first", coordinator_id=owner["coordinator_id"],
         )
-        checkpoint(first, "first")
+        awaiting_review(first, "first")
         handoff_watcher.poll(
             state_path,
             registry_path=registry,
@@ -158,7 +211,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
         second = registered_run(
             tmp_path, registry, name="second", coordinator_id=owner["coordinator_id"],
         )
-        checkpoint(second, "second")
+        awaiting_review(second, "second")
         handoff_watcher.poll(
             state_path,
             registry_path=registry,
@@ -256,8 +309,8 @@ def test_watcher_coalesces_and_never_advances_protocol_cursor(tmp_path):
     second = registered_run(
         tmp_path, registry, name="second", coordinator_id=owner["coordinator_id"],
     )
-    checkpoint(first, "secret first body")
-    checkpoint(second, "secret second body")
+    awaiting_review(first, "secret first body")
+    awaiting_review(second, "secret second body")
     calls = []
     now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
 
@@ -299,7 +352,7 @@ def test_watcher_recovers_both_notification_crash_windows(
     run = registered_run(
         tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
     )
-    checkpoint(run, "durable event")
+    awaiting_review(run, "durable event")
     delivered = []
 
     def crash(value, coverage):
@@ -336,7 +389,7 @@ def test_partial_consumption_redoorbells_remainder_and_full_consumption_clears(t
     )
     checkpoint(run, "one")
     checkpoint(run, "two")
-    checkpoint(run, "three")
+    awaiting_review(run, "three")
     calls = []
     handoff_watcher.poll(
         state_path,
@@ -633,7 +686,7 @@ def test_watcher_records_doorbell_channel_and_clears_it_on_failure(tmp_path):
     run = registered_run(
         tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
     )
-    checkpoint(run, "secret body")
+    awaiting_review(run, "secret body")
     now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
 
     handoff_watcher.poll(
@@ -681,7 +734,7 @@ def test_pending_uses_hot_path_and_full_context_only_for_recovery(
         tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
     )
     first = checkpoint(run, "first")
-    second = checkpoint(run, "second")
+    second = awaiting_review(run, "second")
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
@@ -712,7 +765,7 @@ def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
     registry = tmp_path / "registry.json"
     state_path, owner = coordinator_state(tmp_path)
     run = registered_run(tmp_path, registry, name="worker", coordinator_id=None)
-    checkpoint(run, "unowned")
+    awaiting_review(run, "unowned")
     calls = []
 
     handoff_watcher.poll(
@@ -732,14 +785,14 @@ def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
     assert calls == [{run["run"]["run_id"]: 1}]
 
 
-def test_pending_acknowledges_and_stops_reringing(tmp_path, monkeypatch):
+def test_awaiting_review_result_rings_once_then_acknowledge_stops_reringing(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
     state_path, owner = coordinator_state(tmp_path)
     run = registered_run(
         tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
     )
-    checkpoint(run, "result body")
+    awaiting_review(run, "result body")
     calls = []
     now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
 
@@ -777,7 +830,7 @@ def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
     run = registered_run(
         tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
     )
-    checkpoint(run, "first")
+    awaiting_review(run, "first")
     calls = []
     now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
 
@@ -797,7 +850,7 @@ def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
     assert calls == [{run["run"]["run_id"]: 1}]
 
     # A strictly newer worker event rings again despite the earlier ack.
-    checkpoint(run, "second")
+    nonfatal_error(run, "second")
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
@@ -817,8 +870,8 @@ def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
     second = registered_run(
         tmp_path, registry, name="second", coordinator_id=owner["coordinator_id"],
     )
-    checkpoint(first, "first body")
-    checkpoint(second, "second body")
+    awaiting_review(first, "first body")
+    awaiting_review(second, "second body")
     calls = []
     now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
 
@@ -837,7 +890,7 @@ def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
     assert runs[second["run"]["run_id"]]["acknowledged_through"] == 1
 
     # A new event on ONLY the second worker rings only that worker.
-    checkpoint(second, "second follow-up")
+    nonfatal_error(second, "second follow-up")
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
@@ -877,6 +930,170 @@ def test_run_state_from_a_snapshot_without_acknowledged_through(tmp_path):
     assert handoff_watcher.read(state_path)["runs"]["run-1"] == legacy
 
 
+def test_run_state_accepts_snapshots_with_and_without_dismissed_through():
+    current = handoff_watcher._empty_run_state()  # noqa: SLF001 - state fixture
+    legacy = dict(current)
+    del legacy["dismissed_through"]
+
+    assert handoff_watcher._run_state(current) == current  # noqa: SLF001 - state validation
+    assert handoff_watcher._run_state(legacy) == legacy  # noqa: SLF001 - state validation
+
+
+def test_working_checkpoint_does_not_ring(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = coordinator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+    )
+    checkpoint(run, "ordinary progress")
+    calls = []
+
+    result = handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+    )
+
+    assert calls == []
+    assert result["pending"] == {run["run"]["run_id"]: 1}
+
+
+def test_blocked_question_rerings_after_acknowledge_until_worker_resumes(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = coordinator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+    )
+    question = blocked(run)
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now,
+    )
+    handoff_watcher.acknowledge(state_path, {run["run"]["run_id"]: 1})
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=31),
+    )
+
+    handoff.send(
+        Path(run["run_dir"]),
+        run["coordinator"],
+        type="answer",
+        body="Use the recommended option.",
+        reply_to=question["message"]["message_id"],
+    )
+    worker_checkpoint(
+        run, "resumed after coordinator answer", inbox_cursor=1,
+    )
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=62),
+    )
+
+    assert calls == [
+        {run["run"]["run_id"]: 1},
+        {run["run"]["run_id"]: 1},
+    ]
+
+
+@pytest.mark.parametrize("state", ["succeeded", "stopped"])
+def test_terminal_worker_state_does_not_ring(tmp_path, state):
+    registry = tmp_path / "registry.json"
+    state_path, owner = coordinator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+    )
+    if state == "succeeded":
+        result = awaiting_review(run)
+        handoff.control_consume(Path(run["run_dir"]), run["coordinator"], through=1)
+        handoff.send(
+            Path(run["run_dir"]),
+            run["coordinator"],
+            type="review",
+            data={"disposition": "accepted"},
+            reply_to=result["message"]["message_id"],
+        )
+    else:
+        handoff.send(
+            Path(run["run_dir"]),
+            run["coordinator"],
+            type="stop",
+            body="Stop this worker.",
+            data={"reason": "No longer needed"},
+        )
+    worker_checkpoint(run, f"worker {state}", state=state, inbox_cursor=1)
+    calls = []
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+    )
+
+    notification = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
+    assert calls == []
+    assert notification["doorbell_pending"] is True
+
+
+def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = coordinator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+    )
+    blocked(run)
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now,
+    )
+    handoff_watcher.dismiss(state_path, {run["run"]["run_id"]: 1})
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=31),
+    )
+    handoff.emit(
+        Path(run["run_dir"]),
+        run["worker"],
+        type="question",
+        body="Additional context for the same decision.",
+        data={
+            "blocking": False,
+            "stage": "implementation",
+            "current_activity": "Still awaiting coordinator direction",
+            "inbox_cursor": 0,
+            "commitments": [],
+        },
+    )
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=62),
+    )
+
+    assert calls == [
+        {run["run"]["run_id"]: 1},
+        {run["run"]["run_id"]: 2},
+    ]
+    assert handoff.control_show(Path(run["run_dir"]))["outbox_cursor"] == 0
+
+
 def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     state_path, owner = coordinator_state(tmp_path)
@@ -901,6 +1118,8 @@ def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, m
 
     def remote_json(record, argv):
         commands.append((record["host"], list(argv)))
+        if argv[0] == "status":
+            return {"state": "blocked", "blocked_on": ["question-id"]}
         if argv[0:2] == ["control", "show"]:
             return {"outbox_cursor": 0}
         return [{"seq": 1, "type": "question", "body": "remains remote"}]
@@ -916,6 +1135,7 @@ def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, m
     assert calls == [{"remote-run": 1}]
     assert commands == [
         ("worker", ["control", "show", "--run-dir", "/remote/state/run"]),
+        ("worker", ["status", "--run-dir", "/remote/state/run"]),
         (
             "worker",
             [
