@@ -33,12 +33,22 @@ from agents.orchestration import handoff_registry
 CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 REMOTE_PYTHON_DEFAULT = "python3"
 KIMI_SUBMIT_SETTLE_SECONDS = 0.5
+TUI_SUBMIT_SETTLE_SECONDS = 0.7
 REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
 AGENT_DEFAULTS = {
     "claude": ("opus", "high"),
     "codex": ("gpt-5.6-terra", "xhigh"),
     "kimi": ("kimi-code/k3", "max"),
 }
+ORCHESTRATOR_DOORBELL_TITLE = "Handoff coordinator pending"
+
+
+def orchestrator_doorbell_body(coordinator_id: str) -> str:
+    """Return the opaque snapshot-pointer text for a coordinator doorbell."""
+    return (
+        f"Check handoff coordinator {coordinator_id}; "
+        "pending worker outbox events are recorded."
+    )
 
 
 def _compact_terminal_text(value: str) -> str:
@@ -51,6 +61,20 @@ def _kimi_instruction_count(screen: str, instruction: str) -> int:
     return _compact_terminal_text(visible_agent_output).count(
         _compact_terminal_text(instruction),
     )
+
+
+def _tui_submit_pending(screen: str, text: str) -> bool:
+    """Heuristic: the typed text still sits near the bottom of the screen.
+
+    Agent TUIs keep their input composer on the last screen lines; text that
+    remains there after a synthetic Enter was most likely coalesced into a
+    bracketed paste and never submitted.  A transcript echo of a *successful*
+    submit can also appear near the bottom, so a positive here only justifies
+    a harmless retry Enter (an empty-composer Enter is a no-op), never a
+    failure verdict.
+    """
+    tail = [line for line in screen.splitlines() if line.strip()][-10:]
+    return _compact_terminal_text(text) in _compact_terminal_text("\n".join(tail))
 
 
 def _kimi_input_ready(screen: str) -> bool:
@@ -180,6 +204,19 @@ class TmuxAdapter:
         _run([self.binary, "send-keys", "-t", handle, "-l", text])
         _run([self.binary, "send-keys", "-t", handle, "Enter"])
 
+    def _type_tui(self, handle: str, text: str) -> None:
+        # Agent TUIs coalesce a same-burst text+Enter into a bracketed paste,
+        # turning Enter into an input newline and leaving the text unsent.
+        # Settle between the literal insert and the submit, then retry the
+        # submit once if the text still sits in the composer.  Keep _type()
+        # for shell commands, which have no paste-detection hazard.
+        _run([self.binary, "send-keys", "-t", handle, "-l", text])
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        _run([self.binary, "send-keys", "-t", handle, "Enter"])
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        if _tui_submit_pending(self.capture(handle), text):
+            _run([self.binary, "send-keys", "-t", handle, "Enter"])
+
     def probe(self, handle: str, expected_agent: str) -> bool:
         if _run([self.binary, "has-session", "-t", handle], check=False).returncode != 0:
             return False
@@ -207,13 +244,10 @@ class TmuxAdapter:
         return _run([self.binary, "capture-pane", "-p", "-t", handle, "-S", "-2000"]).stdout
 
     def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
-        self._type(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
+        self._type_tui(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
 
     def orchestrator_doorbell(self, handle: str, coordinator_id: str) -> None:
-        self._type(
-            handle,
-            f"Check handoff coordinator {coordinator_id}; pending worker outbox events are recorded.",
-        )
+        self._type_tui(handle, orchestrator_doorbell_body(coordinator_id))
 
     def send_literal(self, handle: str, text: str) -> bool:
         previous_count = _kimi_instruction_count(self.capture(handle), text)
@@ -274,6 +308,18 @@ class CmuxAdapter:
         _run([self.binary, "send", "--workspace", self.workspace, "--surface", handle, text])
         _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
 
+    def _type_tui(self, handle: str, text: str) -> None:
+        # Same paste-coalescing hazard as TmuxAdapter._type_tui: settle before
+        # the submit, then retry once if the text still sits in the composer.
+        if not self.workspace:
+            raise AdapterError("cmux workspace was not resolved before sending input")
+        _run([self.binary, "send", "--workspace", self.workspace, "--surface", handle, text])
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        if _tui_submit_pending(self.capture(handle), text):
+            _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
+
     def probe(self, handle: str, expected_agent: str) -> bool:
         surfaces = _run(
             [self.binary, "--id-format", "both", "list-pane-surfaces"],
@@ -301,12 +347,22 @@ class CmuxAdapter:
         ]).stdout
 
     def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
-        self._type(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
+        self._type_tui(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
 
     def orchestrator_doorbell(self, handle: str, coordinator_id: str) -> None:
-        self._type(
+        """Raise the surface's native visible alert rather than typing input.
+
+        A zero exit from ``cmux send`` only proves the socket accepted the
+        write; code-mode and desktop-backed agent surfaces never echo that
+        input, so a typed doorbell is silently lost while looking
+        successful.  ``cmux notify`` raises a user-visible alert on any
+        surface type.  Interactive terminal coordinators reachable through
+        tmux keep the raw-input path on :class:`TmuxAdapter`.
+        """
+        self.notify(
             handle,
-            f"Check handoff coordinator {coordinator_id}; pending worker outbox events are recorded.",
+            title=ORCHESTRATOR_DOORBELL_TITLE,
+            body=orchestrator_doorbell_body(coordinator_id),
         )
 
     def notify(self, handle: str | None, *, title: str, body: str) -> None:

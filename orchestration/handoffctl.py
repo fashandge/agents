@@ -22,7 +22,7 @@ from agents.orchestration import handoff_watcher
 RESULT_NOTIFICATION_TITLE = "Handoff result ready"
 RESULT_NOTIFICATION_BODY = "Awaiting coordinator review"
 RESULT_NOTIFICATION_TIMEOUT_SECONDS = 5
-COORDINATOR_NOTIFICATION_TITLE = "Handoff coordinator pending"
+COORDINATOR_NOTIFICATION_TITLE = handoff_launcher.ORCHESTRATOR_DOORBELL_TITLE
 COORDINATOR_NOTIFICATION_BODY = "Worker updates are ready for coordinator review."
 
 
@@ -196,6 +196,7 @@ def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
     completed = False
     sent: dict[str, Any] | None = None
     superseded_result: str | None = None
+    answered_question: str | None = None
     doorbell_sent = False
     doorbell_error: str | None = None
     try:
@@ -214,6 +215,15 @@ def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
             sent = handoff.send(
                 run_dir, token, type="supersede", body=body,
                 reply_to=superseded_result,
+            )
+        elif status["state"] == "blocked" and status["blocked_on"]:
+            # A steer can never clear a blocking question: the worker cannot
+            # advance its inbox cursor across an unanswered blocking question,
+            # so the only deliverable dispatch here is the linked answer.
+            answered_question = status["blocked_on"][-1]
+            sent = handoff.send(
+                run_dir, token, type="answer", body=body,
+                reply_to=answered_question,
             )
         else:
             sent = handoff.send(run_dir, token, type="steer", body=body)
@@ -242,6 +252,7 @@ def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
         "takeover": takeover["message"],
         "message": sent["message"],
         "superseded_result": superseded_result,
+        "answered_question": answered_question,
         "doorbell_sent": doorbell_sent,
         "doorbell_error": doorbell_error,
         "coordinator_released": released,
@@ -315,7 +326,7 @@ def _send_native_app_doorbell(thread_id: str, body: str) -> None:
 
 
 def _notify_macos(title: str, body: str) -> None:
-    """Show a credential-free fallback alert when detached cmux writes fail."""
+    """Show a credential-free fallback alert when cmux notifications fail."""
     if sys.platform != "darwin":
         raise handoff_launcher.AdapterError(
             "cmux notification fallback is unavailable outside macOS",
@@ -339,7 +350,14 @@ def _notify_macos(title: str, body: str) -> None:
         )
 
 
-def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None:
+def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> str:
+    """Deliver one coalesced, opaque coordinator doorbell.
+
+    Returns a label for the channel that accepted the attempt.  Acceptance
+    means the transport acknowledged the request (for cmux/tmux, a zero
+    subprocess exit); no channel reports back that the user actually saw
+    the alert, and the watcher records it with exactly that meaning.
+    """
     if handoff_watcher.owner_process_status(value["owner_process"]) != "alive":
         raise handoff.HandoffError(
             "orchestrator process ownership cannot be verified; doorbell suppressed", 6,
@@ -351,12 +369,13 @@ def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None
         handoff_launcher.TmuxAdapter().orchestrator_doorbell(
             target["handle"], coordinator_id,
         )
-        return
+        return "terminal_input"
     if value["transport"] == "cmux":
         adapter = handoff_launcher.CmuxAdapter(handoff_launcher.CMUX_DEFAULT)
         adapter.workspace = target["workspace"]
         try:
             adapter.orchestrator_doorbell(target["surface"], coordinator_id)
+            return "cmux_notify"
         except handoff_launcher.AdapterError as doorbell_error:
             try:
                 adapter.notify(
@@ -364,25 +383,26 @@ def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> None
                     title=COORDINATOR_NOTIFICATION_TITLE,
                     body=COORDINATOR_NOTIFICATION_BODY,
                 )
+                return "cmux_notify_workspace"
             except handoff_launcher.AdapterError as notification_error:
                 try:
                     _notify_macos(
                         COORDINATOR_NOTIFICATION_TITLE,
                         COORDINATOR_NOTIFICATION_BODY,
                     )
+                    return "macos_notification"
                 except handoff_launcher.AdapterError as macos_error:
                     raise handoff_launcher.AdapterError(
                         f"cmux doorbell failed ({doorbell_error}); "
                         f"notification fallback failed ({notification_error}); "
                         f"macOS fallback failed ({macos_error})",
                     ) from macos_error
-        return
     if value["transport"] == "native_app":
         _send_native_app_doorbell(
             target["thread_id"],
-            f"Check handoff coordinator {coordinator_id}; pending worker outbox events are recorded.",
+            handoff_launcher.orchestrator_doorbell_body(coordinator_id),
         )
-        return
+        return "native_app"
     raise handoff.HandoffError(f"unsupported coordinator transport: {value['transport']}", 4)
 
 

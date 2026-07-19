@@ -227,6 +227,82 @@ def test_cmux_workspace_notification_omits_an_unwritable_surface(monkeypatch):
     ]]
 
 
+def test_cmux_orchestrator_doorbell_uses_visible_notification_not_terminal_input(monkeypatch):
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    adapter = handoff_launcher.CmuxAdapter("cmux")
+    adapter.workspace = "workspace:9"
+
+    adapter.orchestrator_doorbell(
+        "surface-uuid", "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+    )
+
+    assert calls == [[
+        "cmux", "notify", "--title", "Handoff coordinator pending",
+        "--body",
+        "Check handoff coordinator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
+        "pending worker outbox events are recorded.",
+        "--workspace", "workspace:9", "--surface", "surface-uuid",
+    ]]
+
+
+def test_tmux_orchestrator_doorbell_retains_terminal_input(monkeypatch):
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+    adapter = handoff_launcher.TmuxAdapter("tmux")
+
+    adapter.orchestrator_doorbell(
+        "session:3.7", "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+    )
+
+    body = (
+        "Check handoff coordinator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
+        "pending worker outbox events are recorded."
+    )
+    assert calls == [
+        ["tmux", "send-keys", "-t", "session:3.7", "-l", body],
+        ["tmux", "send-keys", "-t", "session:3.7", "Enter"],
+        ["tmux", "capture-pane", "-p", "-t", "session:3.7", "-S", "-2000"],
+    ]
+
+
+def test_tmux_doorbell_retries_submit_when_text_sits_in_composer(monkeypatch):
+    calls = []
+    body = "Check handoff run 7481a493-2f1d-498e-a728-a4144990259e; inbox now through seq 4."
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1] == "capture-pane":
+            # First capture: text still pending in the composer; second: gone.
+            pending = sum(1 for call in calls if call[1] == "capture-pane") == 1
+            return Completed(stdout=f"transcript\n> {body}\n" if pending else "transcript\n> \n")
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+    adapter = handoff_launcher.TmuxAdapter("tmux")
+
+    adapter.doorbell("worker", "7481a493-2f1d-498e-a728-a4144990259e", 4)
+
+    assert calls == [
+        ["tmux", "send-keys", "-t", "worker", "-l", body],
+        ["tmux", "send-keys", "-t", "worker", "Enter"],
+        ["tmux", "capture-pane", "-p", "-t", "worker", "-S", "-2000"],
+        ["tmux", "send-keys", "-t", "worker", "Enter"],
+    ]
+
+
 def test_wait_ready_needs_live_agent_and_semantic_revision(monkeypatch):
     class Adapter:
         def __init__(self): self.probes = iter([False, True, True])

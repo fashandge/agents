@@ -282,6 +282,55 @@ def test_fast_dispatch_supersedes_result_rings_doorbell_and_releases(tmp_path, m
     assert resumed["status"]["state"] == "working"
 
 
+def test_fast_dispatch_answers_blocking_question(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="ready",
+        data={
+            "state": "working", "stage": "lookup", "current_activity": "working",
+            "inbox_cursor": 0, "commitments": [],
+        },
+    )
+    question = handoff.emit(
+        run_dir, run["worker"], type="question", body="Need a decision",
+        data={
+            "blocking": True, "stage": "lookup", "current_activity": "Waiting",
+            "inbox_cursor": 0, "commitments": [],
+        },
+    )
+    handoff.control_release(run_dir, run["coordinator"])
+    doorbells = []
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            doorbells.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    dispatched = handoffctl._dispatch_registered("weather", "use option A")
+
+    assert dispatched["answered_question"] == question["message"]["message_id"]
+    assert dispatched["message"]["type"] == "answer"
+    assert dispatched["message"]["reply_to"] == question["message"]["message_id"]
+    assert dispatched["superseded_result"] is None
+    assert dispatched["doorbell_sent"] is True
+    assert dispatched["coordinator_released"] is True
+    assert doorbells == [(
+        "weather-worker", run["run"]["run_id"], dispatched["message"]["seq"],
+    )]
+    assert not list(run["private"].glob("coordinator-dispatch-*.token"))
+    resumed = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="resumed",
+        data={
+            "state": "working", "stage": "lookup", "current_activity": "unblocked",
+            "inbox_cursor": dispatched["message"]["seq"], "commitments": [],
+        },
+    )
+    assert resumed["status"]["state"] == "working"
+    assert resumed["status"]["blocked_on"] == []
+
+
 def test_failed_dispatch_releases_ephemeral_coordinator(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])
