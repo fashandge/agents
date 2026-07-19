@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -24,6 +26,10 @@ RESULT_NOTIFICATION_BODY = "Awaiting coordinator review"
 RESULT_NOTIFICATION_TIMEOUT_SECONDS = 5
 COORDINATOR_NOTIFICATION_TITLE = handoff_launcher.ORCHESTRATOR_DOORBELL_TITLE
 COORDINATOR_NOTIFICATION_BODY = "Worker updates are ready for coordinator review."
+SURFACE_WATCHER_READY_TIMEOUT_SECONDS = 20.0
+WATCHER_MODES = ("auto", "detached", "surface")
+WATCHER_WORKSPACE_TITLE = "handoff-watchers"
+_UUID_RE = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
 
 
 def _absolute(value: str) -> Path:
@@ -353,10 +359,17 @@ def _notify_macos(title: str, body: str) -> None:
 def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> str:
     """Deliver one coalesced, opaque coordinator doorbell.
 
-    Returns a label for the channel that accepted the attempt.  Acceptance
-    means the transport acknowledged the request (for cmux/tmux, a zero
-    subprocess exit); no channel reports back that the user actually saw
-    the alert, and the watcher records it with exactly that meaning.
+    Returns a ``+``-joined label of every channel that accepted the attempt.
+    Acceptance means the transport acknowledged the request (for cmux/tmux, a
+    zero subprocess exit; for ``cmux_input``, additionally a visible echo of
+    the typed text); no channel reports back that the user actually saw the
+    alert, and the watcher records it with exactly that meaning.
+
+    A cmux doorbell attempts two complementary channels: typed input into the
+    coordinator surface, which is the only channel that pushes a hosted agent
+    to read its pending outboxes, and the native visible alert, which reaches
+    the human even when the surface does not echo input.  The attempt fails
+    (and stays pending) only when every channel fails.
     """
     if handoff_watcher.owner_process_status(value["owner_process"]) != "alive":
         raise handoff.HandoffError(
@@ -373,30 +386,44 @@ def _notify_coordinator(value: dict[str, Any], coverage: dict[str, int]) -> str:
     if value["transport"] == "cmux":
         adapter = handoff_launcher.CmuxAdapter(handoff_launcher.CMUX_DEFAULT)
         adapter.workspace = target["workspace"]
+        accepted: list[str] = []
+        failures: list[str] = []
+        try:
+            if adapter.orchestrator_doorbell_input(target["surface"], coordinator_id):
+                accepted.append("cmux_input")
+            else:
+                failures.append(
+                    "cmux input was accepted but never echoed on the surface",
+                )
+        except handoff_launcher.AdapterError as input_error:
+            failures.append(f"cmux input failed ({input_error})")
         try:
             adapter.orchestrator_doorbell(target["surface"], coordinator_id)
-            return "cmux_notify"
+            accepted.append("cmux_notify")
         except handoff_launcher.AdapterError as doorbell_error:
+            failures.append(f"cmux surface notification failed ({doorbell_error})")
             try:
                 adapter.notify(
                     None,
                     title=COORDINATOR_NOTIFICATION_TITLE,
                     body=COORDINATOR_NOTIFICATION_BODY,
                 )
-                return "cmux_notify_workspace"
+                accepted.append("cmux_notify_workspace")
             except handoff_launcher.AdapterError as notification_error:
-                try:
-                    _notify_macos(
-                        COORDINATOR_NOTIFICATION_TITLE,
-                        COORDINATOR_NOTIFICATION_BODY,
-                    )
-                    return "macos_notification"
-                except handoff_launcher.AdapterError as macos_error:
-                    raise handoff_launcher.AdapterError(
-                        f"cmux doorbell failed ({doorbell_error}); "
-                        f"notification fallback failed ({notification_error}); "
-                        f"macOS fallback failed ({macos_error})",
-                    ) from macos_error
+                failures.append(
+                    f"cmux workspace notification failed ({notification_error})",
+                )
+        if not accepted:
+            try:
+                _notify_macos(
+                    COORDINATOR_NOTIFICATION_TITLE,
+                    COORDINATOR_NOTIFICATION_BODY,
+                )
+                accepted.append("macos_notification")
+            except handoff_launcher.AdapterError as macos_error:
+                failures.append(f"macOS fallback failed ({macos_error})")
+                raise handoff_launcher.AdapterError("; ".join(failures)) from macos_error
+        return "+".join(accepted)
     if value["transport"] == "native_app":
         _send_native_app_doorbell(
             target["thread_id"],
@@ -492,12 +519,178 @@ def _retarget_coordinator(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
-def _start_coordinator_watcher(path: Path, interval: float) -> dict[str, Any]:
-    """Start or reuse one fully detached watcher for a coordinator state."""
+def _resolve_watcher_mode(mode: str, transport: str) -> str:
+    """Pick the hosting mode a coordinator's doorbells actually need.
+
+    The cmux server rejects socket clients outside its own process tree under
+    the default ``socketControlMode: "cmuxOnly"``, so a detached (launchd-
+    orphaned) watcher can never raise a native cmux alert and every doorbell
+    degrades to a transient macOS banner.  cmux coordinators therefore default
+    to a watcher hosted inside a dedicated cmux terminal surface; tmux and
+    native-app coordinators keep the detached daemon, which their channels
+    accept.  An explicit ``detached`` request for a cmux coordinator remains
+    allowed for callers that accept the degraded fallback.
+    """
+    if mode == "auto":
+        return "surface" if transport == "cmux" else "detached"
+    if mode == "surface" and transport != "cmux":
+        raise handoff.HandoffError(
+            "a surface-hosted watcher requires a cmux coordinator", 2,
+        )
+    return mode
+
+
+def _cmux_workspace_rows(binary: str) -> list[dict[str, str]]:
+    """Parse the workspace inventory into UUID/title rows."""
+    listed = handoff_launcher._run([  # noqa: SLF001 - read-only cmux inventory
+        binary, "--id-format", "both", "list-workspaces",
+    ]).stdout
+    rows: list[dict[str, str]] = []
+    for line in listed.splitlines():
+        match = re.search(rf"workspace:\d+\s+({_UUID_RE})\s+(.*)$", line)
+        if not match:
+            continue
+        title = match.group(2).replace("[selected]", "").strip()
+        rows.append({"uuid": match.group(1).lower(), "title": title})
+    return rows
+
+
+def _workspace_title(binary: str, workspace: str) -> str | None:
+    for row in _cmux_workspace_rows(binary):
+        if row["uuid"] == workspace.lower():
+            return row["title"]
+    return None
+
+
+def _watcher_workspace(binary: str) -> str:
+    """Find or create the parked workspace that hosts watcher tabs.
+
+    Watcher tabs are utility furniture, not working context, so they live
+    together in one dedicated workspace kept at the bottom of the sidebar
+    instead of cluttering the coordinator's own workspace.  Closing that
+    workspace kills its watchers; ``coordinator start`` relaunches them.
+    """
+    rows = _cmux_workspace_rows(binary)
+    for row in rows:
+        if row["title"] == WATCHER_WORKSPACE_TITLE:
+            return row["uuid"]
+    # ``new-workspace`` prints only a short ref, not a UUID, so resolve the
+    # created workspace by title from a fresh inventory listing.
+    handoff_launcher._run([  # noqa: SLF001 - shared safe cmux argv adapter
+        binary, "--id-format", "both", "new-workspace",
+        "--name", WATCHER_WORKSPACE_TITLE, "--focus", "false",
+    ])
+    workspace = next(
+        (
+            row["uuid"] for row in _cmux_workspace_rows(binary)
+            if row["title"] == WATCHER_WORKSPACE_TITLE
+        ),
+        None,
+    )
+    if workspace is None:
+        raise handoff.HandoffError(
+            "cmux did not report the new watcher workspace in its inventory", 6,
+        )
+    if rows:
+        # Cosmetic placement only; the watcher works wherever the tab lands.
+        handoff_launcher._run([  # noqa: SLF001
+            binary, "reorder-workspace", "--workspace", workspace,
+            "--after", rows[-1]["uuid"],
+        ], check=False)
+    return workspace
+
+
+def _watcher_tab_name(
+    binary: str, hosting_workspace: str, coordinator_title: str | None,
+    coordinator_id: str,
+) -> str:
+    """Name a watcher tab after what it watches, disambiguating collisions.
+
+    Tab names are cosmetic — every programmatic path addresses surfaces by
+    UUID — but two coordinators in the same workspace would otherwise produce
+    identical tabs, so a short coordinator-ID suffix is added only when the
+    plain name is already taken in the parked workspace.
+    """
+    if not coordinator_title:
+        return f"watcher: coordinator {coordinator_id[:8]}"
+    base = f"watcher: {coordinator_title}"
+    listed = handoff_launcher._run([  # noqa: SLF001 - read-only cmux inventory
+        binary, "--id-format", "both", "list-pane-surfaces",
+        "--workspace", hosting_workspace,
+    ], check=False)
+    if listed.returncode == 0 and base in listed.stdout:
+        return f"{base} ({coordinator_id[:8]})"
+    return base
+
+
+def _surface_watcher_command(path: Path, interval: float) -> str:
+    return "exec " + shlex.join([
+        sys.executable, "-m", "agents.orchestration.handoffctl",
+        "watch", "--coordinator-state", str(path),
+        "--interval", str(interval),
+    ])
+
+
+def _start_surface_watcher(
+    path: Path, value: dict[str, Any], interval: float, cmux_binary: str,
+) -> dict[str, Any]:
+    """Host the watcher in a new in-tree cmux terminal surface.
+
+    The surface's foreground process is a direct member of the cmux process
+    tree, so its ``cmux notify`` doorbells are accepted without relaxing
+    ``socketControlMode``.  The tab doubles as the watcher's visible log, and
+    its lifetime is surface-bound: closing the tab kills the watcher and a
+    later ``coordinator start`` relaunches it.  Tabs are named after the
+    coordinator workspace they watch and parked together in the dedicated
+    bottom ``handoff-watchers`` workspace rather than the working workspace.
+    """
+    coordinator_title = _workspace_title(cmux_binary, value["target"]["workspace"])
+    hosting_workspace = _watcher_workspace(cmux_binary)
+    adapter = handoff_launcher.CmuxAdapter(cmux_binary)
+    handle = adapter.launch(
+        _watcher_tab_name(
+            cmux_binary, hosting_workspace, coordinator_title,
+            value["coordinator_id"],
+        ),
+        path.parent,
+        _surface_watcher_command(path, interval),
+        hosting_workspace,
+    )
+    surface_record = path.parent / "watcher-surface"
+    surface_record.write_text(handle + "\n", encoding="utf-8")
+    os.chmod(surface_record, 0o600)
+    deadline = time.monotonic() + SURFACE_WATCHER_READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if handoff_watcher.is_running(path):
+            return {
+                "coordinator_id": value["coordinator_id"],
+                "mode": "surface",
+                "pid": None,
+                "surface": handle,
+                "workspace": hosting_workspace,
+                "coordinator_workspace": value["target"]["workspace"],
+                "running": True,
+                "started": True,
+                "state": str(path),
+            }
+        time.sleep(0.05)
+    raise handoff.HandoffError(
+        "surface-hosted coordinator watcher did not become ready; "
+        f"inspect with: {adapter.rescue_command(handle)}", 6,
+    )
+
+
+def _start_coordinator_watcher(
+    path: Path, interval: float, *,
+    mode: str = "auto", cmux_binary: str = handoff_launcher.CMUX_DEFAULT,
+) -> dict[str, Any]:
+    """Start or reuse one singleton watcher for a coordinator state."""
     value = handoff_watcher.read(path)
     if handoff_watcher.owner_process_status(value["owner_process"]) != "alive":
         raise handoff.HandoffError("coordinator owner process is not alive", 4)
+    mode = _resolve_watcher_mode(mode, value["transport"])
     output_base = path.parent / "watcher-process"
+    surface_record = path.parent / "watcher-surface"
     with handoff_watcher.start_lock(path) as start_lock_descriptor:
         if handoff_watcher.is_running(path):
             pid_path = Path(f"{output_base}.pid")
@@ -505,9 +698,15 @@ def _start_coordinator_watcher(path: Path, interval: float) -> dict[str, Any]:
                 pid = int(pid_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 pid = None
+            try:
+                surface = surface_record.read_text(encoding="utf-8").strip() or None
+            except OSError:
+                surface = None
             return {
                 "coordinator_id": value["coordinator_id"],
+                "mode": "surface" if surface else "detached",
                 "pid": pid,
+                "surface": surface,
                 "running": True,
                 "started": False,
                 "state": str(path),
@@ -515,6 +714,10 @@ def _start_coordinator_watcher(path: Path, interval: float) -> dict[str, Any]:
 
         for suffix in ("out", "err", "pid", "exitcode"):
             Path(f"{output_base}.{suffix}").unlink(missing_ok=True)
+        surface_record.unlink(missing_ok=True)
+
+        if mode == "surface":
+            return _start_surface_watcher(path, value, interval, cmux_binary)
 
         def runner() -> coding_agents_cli.AgentResult:
             # ``run_detached`` forks without exec. Close the daemon's inherited
@@ -542,7 +745,9 @@ def _start_coordinator_watcher(path: Path, interval: float) -> dict[str, Any]:
             if handoff_watcher.is_running(path):
                 return {
                     "coordinator_id": value["coordinator_id"],
+                    "mode": "detached",
                     "pid": process["pid"],
+                    "surface": None,
                     "running": True,
                     "started": True,
                     "state": str(path),
@@ -611,12 +816,24 @@ def _coordinator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
     }
 
 
+def _print_coordinator_poll(result: dict[str, Any]) -> None:
+    """Log doorbell activity so a surface-hosted watcher's tab shows history.
+
+    Quiet polls stay silent; only polls that attempted a doorbell or hit an
+    error are worth a line.  The poll summary carries run IDs and cursors
+    only — never event bodies or credentials.
+    """
+    if result["attempted"] or result["errors"]:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")), flush=True)
+
+
 def _watch(args: argparse.Namespace) -> int:
     if getattr(args, "coordinator_state", None) is not None:
         handoff_watcher.watch(
             args.coordinator_state,
             interval=args.interval,
             notifier=_notify_coordinator,
+            on_poll=_print_coordinator_poll,
         )
         return 0
     records = (
@@ -714,10 +931,15 @@ def build_parser() -> argparse.ArgumentParser:
     coordinator_retarget.add_argument("--surface", help="exact cmux orchestrator surface UUID")
     coordinator_retarget.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
     coordinator_start = coordinator_commands.add_parser(
-        "start", help="start or reuse the detached watcher for a coordinator session",
+        "start", help="start or reuse the singleton watcher for a coordinator session",
     )
     coordinator_start.add_argument("--state", required=True, type=_absolute)
     coordinator_start.add_argument("--interval", type=float, default=5.0)
+    coordinator_start.add_argument(
+        "--mode", choices=WATCHER_MODES, default="auto",
+        help="watcher hosting: auto picks surface for cmux coordinators and detached otherwise",
+    )
+    coordinator_start.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
     coordinator_show = coordinator_commands.add_parser("show")
     coordinator_show.add_argument("--state", required=True, type=_absolute)
     coordinator_pending = coordinator_commands.add_parser("pending")
@@ -811,7 +1033,10 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
         if args.coordinator_command == "start":
             if args.interval <= 0:
                 raise handoff.HandoffError("--interval must be positive", 2)
-            return _start_coordinator_watcher(args.state, args.interval)
+            return _start_coordinator_watcher(
+                args.state, args.interval,
+                mode=args.mode, cmux_binary=args.cmux_binary,
+            )
         if args.coordinator_command == "show": return handoff_watcher.read(args.state)
         if args.coordinator_command == "pending":
             return _coordinator_pending(args.state, full_context=args.full_context)

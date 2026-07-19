@@ -212,6 +212,28 @@ def test_watch_suppresses_work_while_owner_liveness_is_unknown(tmp_path, monkeyp
     assert len(polls) == 1
 
 
+def test_watch_reports_each_live_poll_to_on_poll(tmp_path, monkeypatch):
+    state_path, _ = coordinator_state(tmp_path)
+    statuses = iter(("alive", "unknown", "dead"))
+    reported = []
+    monkeypatch.setattr(handoff_watcher.time, "sleep", lambda interval: None)
+    monkeypatch.setattr(
+        handoff_watcher,
+        "poll",
+        lambda *args, **kwargs: {"attempted": {"run-1": 2}, "errors": []},
+    )
+
+    handoff_watcher.watch(
+        state_path,
+        interval=0.01,
+        notifier=lambda value, coverage: None,
+        owner_probe=lambda owner: next(statuses),
+        on_poll=reported.append,
+    )
+
+    assert reported == [{"attempted": {"run-1": 2}, "errors": []}]
+
+
 def test_owner_process_status_rejects_pid_reuse(tmp_path, monkeypatch):
     _, value = coordinator_state(tmp_path)
     owner = value["owner_process"]
@@ -356,6 +378,10 @@ def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
             self.binary = binary
             self.workspace = None
 
+        def orchestrator_doorbell_input(self, surface, observed_id):
+            calls.append(("cmux_input", self.workspace, surface, observed_id))
+            return True
+
         def orchestrator_doorbell(self, surface, observed_id):
             calls.append(("cmux", self.workspace, surface, observed_id))
 
@@ -372,34 +398,38 @@ def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
         lambda thread_id, body: calls.append(("native_app", thread_id, body)),
     )
 
-    handoffctl._notify_coordinator({
+    tmux_method = handoffctl._notify_coordinator({
         "coordinator_id": coordinator_id,
         "transport": "tmux",
         "target": {"handle": "session:3.7"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
-    handoffctl._notify_coordinator({
+    cmux_method = handoffctl._notify_coordinator({
         "coordinator_id": coordinator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
-    handoffctl._notify_coordinator({
+    native_method = handoffctl._notify_coordinator({
         "coordinator_id": coordinator_id,
         "transport": "native_app",
         "target": {"thread_id": "thread-exact"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
 
+    assert tmux_method == "terminal_input"
+    assert cmux_method == "cmux_input+cmux_notify"
+    assert native_method == "native_app"
     assert calls[0] == ("tmux", "session:3.7", coordinator_id)
-    assert calls[1] == ("cmux", "workspace:9", "surface-uuid", coordinator_id)
-    assert calls[2][0:2] == ("native_app", "thread-exact")
-    assert coordinator_id in calls[2][2]
-    assert "run-secret" not in calls[2][2]
-    assert "seq 9" not in calls[2][2]
+    assert calls[1] == ("cmux_input", "workspace:9", "surface-uuid", coordinator_id)
+    assert calls[2] == ("cmux", "workspace:9", "surface-uuid", coordinator_id)
+    assert calls[3][0:2] == ("native_app", "thread-exact")
+    assert coordinator_id in calls[3][2]
+    assert "run-secret" not in calls[3][2]
+    assert "seq 9" not in calls[3][2]
 
 
-def test_coordinator_cmux_uses_native_notification_when_terminal_write_fails(monkeypatch):
+def test_coordinator_cmux_falls_back_to_workspace_notification(monkeypatch):
     coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
@@ -407,6 +437,9 @@ def test_coordinator_cmux_uses_native_notification_when_terminal_write_fails(mon
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
+
+        def orchestrator_doorbell_input(self, handle, observed_id):
+            raise handoff_launcher.AdapterError("Broken pipe")
 
         def orchestrator_doorbell(self, handle, observed_id):
             raise handoff_launcher.AdapterError("Broken pipe")
@@ -421,20 +454,21 @@ def test_coordinator_cmux_uses_native_notification_when_terminal_write_fails(mon
         lambda owner: "alive",
     )
 
-    handoffctl._notify_coordinator({
+    method = handoffctl._notify_coordinator({
         "coordinator_id": coordinator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
 
+    assert method == "cmux_notify_workspace"
     assert calls == [(
         "workspace:9", None, "Handoff coordinator pending",
         "Worker updates are ready for coordinator review.",
     )]
 
 
-def test_coordinator_cmux_uses_macos_notification_when_cmux_writes_fail(monkeypatch):
+def test_coordinator_cmux_uses_macos_notification_when_cmux_notifications_fail(monkeypatch):
     coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
@@ -442,6 +476,9 @@ def test_coordinator_cmux_uses_macos_notification_when_cmux_writes_fail(monkeypa
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
+
+        def orchestrator_doorbell_input(self, handle, observed_id):
+            raise handoff_launcher.AdapterError("Broken pipe")
 
         def orchestrator_doorbell(self, handle, observed_id):
             raise handoff_launcher.AdapterError("Broken pipe")
@@ -461,17 +498,177 @@ def test_coordinator_cmux_uses_macos_notification_when_cmux_writes_fail(monkeypa
         lambda title, body: calls.append((title, body)),
     )
 
-    handoffctl._notify_coordinator({
+    method = handoffctl._notify_coordinator({
         "coordinator_id": coordinator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
 
+    assert method == "macos_notification"
     assert calls == [(
         "Handoff coordinator pending",
         "Worker updates are ready for coordinator review.",
     )]
+
+
+def test_coordinator_cmux_reports_combined_error_when_every_channel_fails(monkeypatch):
+    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def orchestrator_doorbell_input(self, handle, observed_id):
+            raise handoff_launcher.AdapterError("input rejected")
+
+        def orchestrator_doorbell(self, handle, observed_id):
+            raise handoff_launcher.AdapterError("surface gone")
+
+        def notify(self, handle, *, title, body):
+            raise handoff_launcher.AdapterError("workspace gone")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher,
+        "owner_process_status",
+        lambda owner: "alive",
+    )
+
+    def fail_macos(title, body):
+        raise handoff_launcher.AdapterError("osascript unavailable")
+
+    monkeypatch.setattr(handoffctl, "_notify_macos", fail_macos)
+
+    with pytest.raises(handoff_launcher.AdapterError) as captured:
+        handoffctl._notify_coordinator({
+            "coordinator_id": coordinator_id,
+            "transport": "cmux",
+            "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+            "owner_process": {"pid": os.getpid(), "started_at": "test"},
+        }, {"run-secret": 9})
+
+    message = str(captured.value)
+    assert "input rejected" in message
+    assert "surface gone" in message
+    assert "workspace gone" in message
+    assert "osascript unavailable" in message
+
+
+def test_coordinator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch):
+    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def orchestrator_doorbell_input(self, handle, observed_id):
+            # Zero-exit send with no visible echo: the code-mode surface trap.
+            return False
+
+        def orchestrator_doorbell(self, handle, observed_id):
+            pass
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher,
+        "owner_process_status",
+        lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_coordinator({
+        "coordinator_id": coordinator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    assert method == "cmux_notify"
+
+
+def test_coordinator_cmux_confirmed_input_survives_notification_failure(monkeypatch):
+    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def orchestrator_doorbell_input(self, handle, observed_id):
+            return True
+
+        def orchestrator_doorbell(self, handle, observed_id):
+            raise handoff_launcher.AdapterError("surface alert gone")
+
+        def notify(self, handle, *, title, body):
+            raise handoff_launcher.AdapterError("workspace alert gone")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher,
+        "owner_process_status",
+        lambda owner: "alive",
+    )
+    monkeypatch.setattr(
+        handoffctl,
+        "_notify_macos",
+        lambda title, body: pytest.fail("macOS fallback must not fire after agent push"),
+    )
+
+    method = handoffctl._notify_coordinator({
+        "coordinator_id": coordinator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    assert method == "cmux_input"
+
+
+def test_watcher_records_doorbell_channel_and_clears_it_on_failure(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = coordinator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+    )
+    checkpoint(run, "secret body")
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: "cmux_notify",
+        now=now,
+    )
+    state = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
+    assert state["last_doorbell_method"] == "cmux_notify"
+    assert state["last_doorbell_error"] is None
+
+    def unavailable(value, coverage):
+        raise handoff.HandoffError("push unavailable", 6)
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=unavailable,
+        now=now + datetime.timedelta(seconds=31),
+    )
+    state = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
+    assert state["last_doorbell_method"] is None
+    assert state["last_doorbell_error"] == "push unavailable"
+
+
+def test_run_state_from_an_older_snapshot_without_doorbell_method(tmp_path):
+    state_path, owner = coordinator_state(tmp_path)
+    value = handoff_watcher.read(state_path)
+    legacy = handoff_watcher._empty_run_state()  # noqa: SLF001 - state fixture
+    del legacy["last_doorbell_method"]
+    value["runs"] = {"run-1": legacy}
+    handoff_watcher._atomic_write(state_path, value)  # noqa: SLF001 - state fixture
+
+    assert handoff_watcher.read(state_path)["runs"]["run-1"] == legacy
 
 
 def test_pending_uses_hot_path_and_full_context_only_for_recovery(

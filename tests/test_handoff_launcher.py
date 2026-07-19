@@ -251,6 +251,42 @@ def test_cmux_orchestrator_doorbell_uses_visible_notification_not_terminal_input
     ]]
 
 
+def test_cmux_orchestrator_doorbell_input_requires_visible_echo(monkeypatch):
+    body = (
+        "Check handoff coordinator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
+        "pending worker outbox events are recorded."
+    )
+    filler = "\n".join(f"transcript line {index}" for index in range(12))
+    screens = {"value": f"> {body}\n{filler}\n"}
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1] == "read-screen":
+            return Completed(stdout=screens["value"])
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+    adapter = handoff_launcher.CmuxAdapter("cmux")
+    adapter.workspace = "workspace:9"
+
+    confirmed = adapter.orchestrator_doorbell_input(
+        "surface-uuid", "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+    )
+    assert confirmed is True
+    assert [
+        "cmux", "send", "--workspace", "workspace:9", "--surface", "surface-uuid", body,
+    ] in calls
+
+    # A code-mode surface accepts the write but never echoes the text.
+    screens["value"] = "desktop surface without an input transcript\n"
+    dropped = adapter.orchestrator_doorbell_input(
+        "surface-uuid", "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+    )
+    assert dropped is False
+
+
 def test_tmux_orchestrator_doorbell_retains_terminal_input(monkeypatch):
     calls = []
 

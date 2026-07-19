@@ -1,6 +1,8 @@
 import json
 import os
+import shlex
 import subprocess
+import sys
 import time
 from argparse import Namespace
 from pathlib import Path
@@ -10,6 +12,7 @@ import pytest
 from agents.orchestration import handoffctl
 from agents.orchestration import handoff
 from agents.orchestration import handoff_registry
+from agents.orchestration import handoff_watcher
 
 
 PYTHON = "/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python"
@@ -485,6 +488,227 @@ def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monke
         if owner.poll() is None:
             owner.terminate()
             owner.wait(timeout=5)
+
+
+def test_cmux_coordinator_start_hosts_watcher_in_dedicated_surface(tmp_path, monkeypatch):
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
+    state = tmp_path / "coordinator" / "watcher.json"
+    handle = "01923456-89ab-4cde-8f01-23456789abcd"
+    launches = []
+    watchers = []
+    owner = subprocess.Popen(
+        [PYTHON, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        value = handoff_watcher.initialize(
+            state,
+            transport="cmux",
+            target={"workspace": "workspace:9", "surface": "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"},
+            owner_pid=owner.pid,
+        )
+
+        class RecordingAdapter:
+            def __init__(self, binary):
+                self.binary = binary
+                self.workspace = None
+
+            def launch(self, name, cwd, terminal_command, workspace=None):
+                launches.append({
+                    "binary": self.binary, "name": name,
+                    "command": terminal_command, "workspace": workspace,
+                })
+                # Execute the exact command the surface's terminal would run so
+                # the test proves it is a working watcher invocation.
+                watchers.append(subprocess.Popen(
+                    shlex.split(terminal_command.removeprefix("exec ")),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ))
+                return handle
+
+            def rescue_command(self, target):
+                return f"read-screen {target}"
+
+        monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", RecordingAdapter)
+        hosting = "11111111-2222-4333-8444-555555555555"
+        monkeypatch.setattr(handoffctl, "_watcher_workspace", lambda binary: hosting)
+        monkeypatch.setattr(handoffctl, "_workspace_title", lambda binary, workspace: "agents")
+        monkeypatch.setattr(
+            handoffctl, "_watcher_tab_name",
+            lambda binary, workspace, title, coordinator_id: f"watcher: {title}",
+        )
+
+        first = handoffctl._start_coordinator_watcher(
+            state, 0.05, mode="auto", cmux_binary="/exact/cmux",
+        )
+        assert first["mode"] == "surface"
+        assert first["started"] is True
+        assert first["running"] is True
+        assert first["surface"] == handle
+        assert first["workspace"] == hosting
+        assert first["coordinator_workspace"] == "workspace:9"
+        assert launches == [{
+            "binary": "/exact/cmux",
+            "name": "watcher: agents",
+            "command": "exec " + shlex.join([
+                sys.executable, "-m", "agents.orchestration.handoffctl",
+                "watch", "--coordinator-state", str(state), "--interval", "0.05",
+            ]),
+            "workspace": hosting,
+        }]
+
+        reused = handoffctl._start_coordinator_watcher(
+            state, 0.05, mode="auto", cmux_binary="/exact/cmux",
+        )
+        assert reused["started"] is False
+        assert reused["running"] is True
+        assert reused["mode"] == "surface"
+        assert reused["surface"] == handle
+        assert len(watchers) == 1
+
+        owner.terminate()
+        owner.wait(timeout=5)
+        assert watchers[0].wait(timeout=10) == 0
+    finally:
+        for watcher in watchers:
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+        if owner.poll() is None:
+            owner.terminate()
+            owner.wait(timeout=5)
+
+
+def test_surface_watcher_start_timeout_reports_rescue_command(tmp_path, monkeypatch):
+    state = tmp_path / "coordinator" / "watcher.json"
+    handoff_watcher.initialize(
+        state,
+        transport="cmux",
+        target={"workspace": "workspace:9", "surface": "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"},
+        owner_pid=os.getpid(),
+    )
+
+    class InertAdapter:
+        def __init__(self, binary):
+            self.workspace = None
+
+        def launch(self, name, cwd, terminal_command, workspace=None):
+            return "01923456-89ab-4cde-8f01-23456789abcd"
+
+        def rescue_command(self, target):
+            return f"read-screen {target}"
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", InertAdapter)
+    monkeypatch.setattr(handoffctl, "SURFACE_WATCHER_READY_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        handoffctl, "_watcher_workspace",
+        lambda binary: "11111111-2222-4333-8444-555555555555",
+    )
+    monkeypatch.setattr(handoffctl, "_workspace_title", lambda binary, workspace: None)
+
+    with pytest.raises(handoff.HandoffError, match="read-screen 01923456"):
+        handoffctl._start_coordinator_watcher(state, 0.05)
+
+
+def test_watcher_workspace_reuses_or_creates_the_parked_bottom_workspace(monkeypatch):
+    hosting = "11111111-2222-4333-8444-555555555555"
+    coordinator = "afa9c531-4d04-4f12-8e06-e97facc4fe2e"
+    state = {"listing": (
+        "  workspace:1 18AA46FA-7CC9-4676-AAC5-B190559B34C7  stock picker\n"
+        f"* workspace:9 {coordinator.upper()}  agents  [selected]\n"
+    )}
+    calls = []
+
+    class Completed:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[-1] == "list-workspaces":
+            return Completed(state["listing"])
+        if argv[3:5] == ["new-workspace", "--name"]:
+            # The real CLI reports only a short ref; the row appears in the
+            # next inventory listing.
+            state["listing"] += f"  workspace:12 {hosting.upper()}  handoff-watchers\n"
+            return Completed("OK workspace:12\n")
+        return Completed()
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+
+    assert handoffctl._workspace_title("/exact/cmux", coordinator.upper()) == "agents"
+
+    created = handoffctl._watcher_workspace("/exact/cmux")
+    assert created == hosting
+    assert [
+        "/exact/cmux", "--id-format", "both", "new-workspace",
+        "--name", "handoff-watchers", "--focus", "false",
+    ] in calls
+    assert [
+        "/exact/cmux", "reorder-workspace", "--workspace", hosting,
+        "--after", coordinator,
+    ] in calls
+
+    creations = len(calls)
+    assert handoffctl._watcher_workspace("/exact/cmux") == hosting
+    assert [argv for argv in calls[creations:] if "new-workspace" in argv] == []
+
+
+def test_surface_watcher_mode_requires_cmux_coordinator(tmp_path):
+    state = tmp_path / "coordinator" / "watcher.json"
+    handoff_watcher.initialize(
+        state,
+        transport="tmux",
+        target={"handle": "orchestrator:0.4"},
+        owner_pid=os.getpid(),
+    )
+
+    result = run_cli("coordinator", "start", "--state", state, "--mode", "surface")
+
+    assert result.returncode == 2
+    assert "requires a cmux coordinator" in result.stderr
+
+
+def test_watcher_tab_name_disambiguates_only_on_collision(monkeypatch):
+    coordinator_id = "de7f8206-f9c7-49c2-b1d1-a266c577cb61"
+    surfaces = {"stdout": "  surface:1 UUID  other tab\n"}
+
+    class Completed:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    monkeypatch.setattr(
+        handoffctl.handoff_launcher, "_run",
+        lambda argv, check=True: Completed(surfaces["stdout"]),
+    )
+
+    assert handoffctl._watcher_tab_name(
+        "/exact/cmux", "workspace-uuid", "agents", coordinator_id,
+    ) == "watcher: agents"
+
+    surfaces["stdout"] += "  surface:2 UUID  watcher: agents\n"
+    assert handoffctl._watcher_tab_name(
+        "/exact/cmux", "workspace-uuid", "agents", coordinator_id,
+    ) == "watcher: agents (de7f8206)"
+
+    assert handoffctl._watcher_tab_name(
+        "/exact/cmux", "workspace-uuid", None, coordinator_id,
+    ) == "watcher: coordinator de7f8206"
+
+
+def test_coordinator_poll_printer_logs_only_doorbell_activity(capsys):
+    handoffctl._print_coordinator_poll(
+        {"attempted": {}, "errors": [], "pending": {}},
+    )
+    assert capsys.readouterr().out == ""
+
+    active = {"attempted": {"run-1": 3}, "errors": [], "pending": {"run-1": 3}}
+    handoffctl._print_coordinator_poll(active)
+    assert json.loads(capsys.readouterr().out) == active
 
 
 def test_cmux_coordinator_registration_uses_the_orchestrator_environment(tmp_path, monkeypatch):

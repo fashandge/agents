@@ -21,7 +21,15 @@ from agents.orchestration import handoff_registry
 
 STATE_VERSION = 2
 DEFAULT_RETRY_SECONDS = 30.0
-DoorbellNotifier = Callable[[dict[str, Any], dict[str, int]], None]
+DoorbellNotifier = Callable[[dict[str, Any], dict[str, int]], str | None]
+"""Delivers one coalesced doorbell; returns the channel(s) that accepted it.
+
+The returned label (for example ``terminal_input``, a ``+``-joined multi-
+channel result such as ``cmux_input+cmux_notify``, or a fallback such as
+``macos_notification``) is recorded as the run's ``last_doorbell_method``.
+A return without an exception means only that a channel accepted the
+request — never that the user saw the alert.
+"""
 OwnerProcessStatus = Literal["alive", "dead", "unknown"]
 OwnerProcessProbe = Callable[[dict[str, Any]], OwnerProcessStatus]
 
@@ -128,7 +136,9 @@ def _run_state(value: Any) -> dict[str, Any]:
         "last_doorbell_at", "control_through", "doorbell_after_cursor",
         "last_doorbell_error",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    # ``last_doorbell_method`` is optional so snapshots written before the
+    # delivery-channel field existed remain readable.
+    if not isinstance(value, dict) or not required <= set(value) <= required | {"last_doorbell_method"}:
         raise handoff.HandoffError("invalid coordinator run notification state", 5)
     for field in (
         "observed_through", "doorbell_through", "control_through",
@@ -141,8 +151,8 @@ def _run_state(value: Any) -> dict[str, Any]:
         raise handoff.HandoffError("doorbell cursor exceeds observed cursor", 5)
     if not isinstance(value["doorbell_pending"], bool):
         raise handoff.HandoffError("doorbell_pending must be boolean", 5)
-    for field in ("last_doorbell_at", "last_doorbell_error"):
-        if value[field] is not None and not isinstance(value[field], str):
+    for field in ("last_doorbell_at", "last_doorbell_error", "last_doorbell_method"):
+        if value.get(field) is not None and not isinstance(value.get(field), str):
             raise handoff.HandoffError(f"{field} must be null or a string", 5)
     if value["last_doorbell_at"] is not None:
         handoff._parse_time(value["last_doorbell_at"])  # noqa: SLF001
@@ -339,6 +349,7 @@ def _empty_run_state() -> dict[str, Any]:
         "control_through": 0,
         "doorbell_after_cursor": 0,
         "last_doorbell_error": None,
+        "last_doorbell_method": None,
     }
 
 
@@ -398,7 +409,17 @@ def poll(
     notifier: DoorbellNotifier, retry_seconds: float = DEFAULT_RETRY_SECONDS,
     now: datetime.datetime | None = None,
 ) -> dict[str, Any]:
-    """Observe one dynamic registry snapshot and attempt one coalesced doorbell."""
+    """Observe one dynamic registry snapshot and attempt one coalesced doorbell.
+
+    Doorbell bookkeeping records *attempts*, never confirmed visibility: a
+    notifier that returns without raising has only shown that its channel
+    accepted the request (for cmux/tmux, a zero subprocess exit).  The
+    channel label the notifier returns is stored as ``last_doorbell_method``
+    so operators can tell a visible ``cmux notify`` alert apart from raw
+    terminal input or a degraded fallback.  ``last_doorbell_error`` is null
+    exactly when a channel accepted; when every channel fails, the method is
+    null and the error describes the combined failure.
+    """
     if retry_seconds <= 0:
         raise handoff.HandoffError("watcher retry interval must be positive", 2)
     path = _state_path(path)
@@ -449,8 +470,9 @@ def poll(
 
     if coverage:
         notification_error: str | None = None
+        delivered_method: str | None = None
         try:
-            notifier(value, coverage)
+            delivered_method = notifier(value, coverage)
         except Exception as exc:  # Push failure never changes protocol truth.
             notification_error = str(exc)
             errors.append({"run_id": ",".join(sorted(coverage)), "error": notification_error})
@@ -464,6 +486,9 @@ def poll(
             run_state["last_doorbell_at"] = attempted_at
             run_state["doorbell_after_cursor"] = run_state["control_through"]
             run_state["last_doorbell_error"] = notification_error
+            run_state["last_doorbell_method"] = (
+                delivered_method if notification_error is None else None
+            )
         _atomic_write(path, value)
 
     return {
@@ -483,6 +508,7 @@ def watch(
     path: Path, *, interval: float = 5.0, notifier: DoorbellNotifier,
     registry_path: Path | None = None,
     owner_probe: OwnerProcessProbe = owner_process_status,
+    on_poll: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Run until stopped or the exact owning orchestrator process exits."""
     if interval <= 0:
@@ -494,7 +520,9 @@ def watch(
             if status == "dead":
                 return
             if status == "alive":
-                poll(path, registry_path=registry_path, notifier=notifier)
+                result = poll(path, registry_path=registry_path, notifier=notifier)
+                if on_poll is not None:
+                    on_poll(result)
             # Unknown liveness deliberately suppresses doorbells: a transient
             # host probe failure is not evidence that the original process is
             # gone, but neither is it authority to type into its terminal.

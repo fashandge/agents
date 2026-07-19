@@ -365,6 +365,20 @@ class CmuxAdapter:
             body=orchestrator_doorbell_body(coordinator_id),
         )
 
+    def orchestrator_doorbell_input(self, handle: str, coordinator_id: str) -> bool:
+        """Type the doorbell into the coordinator surface and confirm the echo.
+
+        A visible alert never pushes a surface-hosted agent to act; typed
+        input into an interactive agent TUI does — the text lands in the
+        composer, Enter submits it, and the agent processes it as a prompt.
+        Code-mode and desktop-backed surfaces instead accept the socket write
+        with a zero exit and silently drop it, so the send counts as delivered
+        only when the doorbell text is visible on the surface afterward.
+        """
+        body = orchestrator_doorbell_body(coordinator_id)
+        self._type_tui(handle, body)
+        return _compact_terminal_text(body) in _compact_terminal_text(self.capture(handle))
+
     def notify(self, handle: str | None, *, title: str, body: str) -> None:
         """Raise a native cmux alert when terminal input is unavailable."""
         if not self.workspace:
