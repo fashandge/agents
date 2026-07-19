@@ -43,8 +43,11 @@ target_window=$(
   "$cmux_bin" --id-format uuids list-windows | while read -r line; do
     w=$(uuid_of "$line")
     [[ -n "$w" ]] || continue
-    if "$cmux_bin" --id-format uuids list-workspaces --window "$w" 2>/dev/null \
-        | grep -qi "$after_ws"; then
+    # Do not pipe the cmux listing into `grep -q`: with `pipefail`, grep's
+    # intentional early exit can make cmux report SIGPIPE and turn this
+    # successful match into a false negative.
+    window_workspaces=$("$cmux_bin" --id-format uuids list-workspaces --window "$w" 2>/dev/null)
+    if grep -qiF "$after_ws" <<<"$window_workspaces"; then
       echo "$w"; break
     fi
   done
@@ -69,22 +72,36 @@ place() {
 
 # --- Path A: connection already up -> silent per-session RPC attach ---------
 if sessions_json=$("$cmux_bin" rpc remote.tmux.sessions "{\"host\":\"$host\"}" 2>/dev/null); then
-  echo "$sessions_json" | grep -oE '"name" *: *"[^"]+"' | sed -E 's/.*: *"([^"]+)"/\1/' \
-    | while read -r session; do
-      wanted "$session" || continue
-      "$cmux_bin" rpc remote.tmux.attach "{\"host\":\"$host\",\"session\":\"$session\"}" >/dev/null 2>&1 || true
-    done
+  typeset -a remote_sessions
+  remote_sessions=("${(@f)$(print -r -- "$sessions_json" | grep -oE '"name" *: *"[^"]+"' | sed -E 's/.*: *"([^"]+)"/\1/')}")
+
+  for session in "${remote_sessions[@]}"; do
+    wanted "$session" || continue
+    "$cmux_bin" rpc remote.tmux.attach "{\"host\":\"$host\",\"session\":\"$session\"}" >/dev/null 2>&1 || true
+  done
   sleep 2
-  echo "$sessions_json" | grep -oE '"name" *: *"[^"]+"' | sed -E 's/.*: *"([^"]+)"/\1/' \
-    | while read -r session; do
-      wanted "$session" || continue
-      line=$("$cmux_bin" --id-format uuids list-workspaces 2>/dev/null \
-        | grep -iE " $session( +\[selected\])?\$" | head -1 || true)
-      ws_uuid=$(uuid_of "${line:-}")
-      [[ -n "$ws_uuid" ]] && place "$session" "$ws_uuid" || echo "workspace ? $session (no view found)"
-    done
-  echo "mode rpc-attach (no window created)"
-  exit 0
+
+  # Recent cmux versions can acknowledge an RPC attach without creating a
+  # visible local workspace. Only use the no-window path when every requested
+  # mirror actually materialized; otherwise use ssh-tmux below.
+  rpc_views_complete=true
+  for session in "${remote_sessions[@]}"; do
+    wanted "$session" || continue
+    line=$("$cmux_bin" --id-format uuids list-workspaces 2>/dev/null \
+      | grep -iE " $session( +\[selected\])?\$" | head -1 || true)
+    ws_uuid=$(uuid_of "${line:-}" || true)
+    if [[ -n "$ws_uuid" ]]; then
+      place "$session" "$ws_uuid"
+    else
+      rpc_views_complete=false
+      echo "workspace ? $session (RPC attach returned without a view)"
+    fi
+  done
+  if [[ "$rpc_views_complete" == true ]]; then
+    echo "mode rpc-attach (no window created)"
+    exit 0
+  fi
+  echo "RPC attach did not materialize every requested view; falling back to ssh-tmux"
 fi
 
 # --- Path B: cold connection -> ssh-tmux window flow ------------------------
