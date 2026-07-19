@@ -732,6 +732,151 @@ def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
     assert calls == [{run["run"]["run_id"]: 1}]
 
 
+def test_pending_acknowledges_and_stops_reringing(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
+    state_path, owner = coordinator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+    )
+    checkpoint(run, "result body")
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now,
+    )
+    assert calls == [{run["run"]["run_id"]: 1}]
+
+    # Loading the run's events records an acknowledgment cursor.
+    handoffctl._coordinator_pending(state_path, full_context=False)
+    acked = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
+    assert acked["acknowledged_through"] == 1
+
+    # A poll well past the retry interval must NOT re-ring the seen event,
+    # even though the protocol outbox cursor was never advanced.
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=61),
+    )
+    assert calls == [{run["run"]["run_id"]: 1}]
+    assert handoff_watcher.read(state_path)["runs"][
+        run["run"]["run_id"]
+    ]["doorbell_pending"] is True
+
+
+def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
+    state_path, owner = coordinator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+    )
+    checkpoint(run, "first")
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now,
+    )
+    handoffctl._coordinator_pending(state_path, full_context=False)
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=61),
+    )
+    assert calls == [{run["run"]["run_id"]: 1}]
+
+    # A strictly newer worker event rings again despite the earlier ack.
+    checkpoint(run, "second")
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=122),
+    )
+    assert calls == [{run["run"]["run_id"]: 1}, {run["run"]["run_id"]: 2}]
+
+
+def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
+    state_path, owner = coordinator_state(tmp_path)
+    first = registered_run(
+        tmp_path, registry, name="first", coordinator_id=owner["coordinator_id"],
+    )
+    second = registered_run(
+        tmp_path, registry, name="second", coordinator_id=owner["coordinator_id"],
+    )
+    checkpoint(first, "first body")
+    checkpoint(second, "second body")
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now,
+    )
+    assert calls == [{first["run"]["run_id"]: 1, second["run"]["run_id"]: 1}]
+
+    # One pending call acknowledges every surfaced worker at its own cursor.
+    handoffctl._coordinator_pending(state_path, full_context=False)
+    runs = handoff_watcher.read(state_path)["runs"]
+    assert runs[first["run"]["run_id"]]["acknowledged_through"] == 1
+    assert runs[second["run"]["run_id"]]["acknowledged_through"] == 1
+
+    # A new event on ONLY the second worker rings only that worker.
+    checkpoint(second, "second follow-up")
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        now=now + datetime.timedelta(seconds=61),
+    )
+    assert calls == [
+        {first["run"]["run_id"]: 1, second["run"]["run_id"]: 1},
+        {second["run"]["run_id"]: 2},
+    ]
+
+
+def test_acknowledge_is_monotonic_and_ignores_unknown_runs(tmp_path):
+    state_path, _ = coordinator_state(tmp_path)
+    value = handoff_watcher.read(state_path)
+    value["runs"] = {"run-1": handoff_watcher._empty_run_state()}  # noqa: SLF001
+    handoff_watcher._atomic_write(state_path, value)  # noqa: SLF001
+
+    handoff_watcher.acknowledge(state_path, {"run-1": 5, "ghost": 9})
+    state = handoff_watcher.read(state_path)
+    assert state["runs"]["run-1"]["acknowledged_through"] == 5
+    assert "ghost" not in state["runs"]
+
+    # A lower cursor never regresses the acknowledgment.
+    handoff_watcher.acknowledge(state_path, {"run-1": 2})
+    assert handoff_watcher.read(state_path)["runs"]["run-1"]["acknowledged_through"] == 5
+
+
+def test_run_state_from_a_snapshot_without_acknowledged_through(tmp_path):
+    state_path, _ = coordinator_state(tmp_path)
+    value = handoff_watcher.read(state_path)
+    legacy = handoff_watcher._empty_run_state()  # noqa: SLF001 - state fixture
+    del legacy["acknowledged_through"]
+    value["runs"] = {"run-1": legacy}
+    handoff_watcher._atomic_write(state_path, value)  # noqa: SLF001 - state fixture
+
+    assert handoff_watcher.read(state_path)["runs"]["run-1"] == legacy
+
+
 def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     state_path, owner = coordinator_state(tmp_path)

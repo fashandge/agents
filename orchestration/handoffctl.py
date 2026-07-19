@@ -790,17 +790,20 @@ def _coordinator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
         if record["coordinator_id"] == value["coordinator_id"]
     }
     pending: list[dict[str, Any]] = []
+    acks: dict[str, int] = {}
     for run_id, notification in value["runs"].items():
         if not notification["doorbell_pending"] or run_id not in records:
             continue
         record = records[run_id]
         if full_context:
             detail = _context_registered(run_id)
+            acks[run_id] = notification["observed_through"]
         elif record["host"] is None:
             run_dir = Path(record["run_dir"])
             control = handoff.control_show(run_dir)
             status = handoff.status(run_dir)
             through = min(notification["observed_through"], status["outbox_seq"])
+            acks[run_id] = through
             detail = {
                 "status": status,
                 "control": control,
@@ -816,6 +819,7 @@ def _coordinator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
             if not isinstance(control, dict) or not isinstance(status, dict):
                 raise handoff.HandoffError("remote hot-path state is invalid", 6)
             through = min(notification["observed_through"], status["outbox_seq"])
+            acks[run_id] = through
             detail = {
                 "status": status,
                 "control": control,
@@ -829,6 +833,9 @@ def _coordinator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
             "notification": dict(notification),
             "detail": detail,
         })
+    # Record that the coordinator has now loaded these events so the watcher
+    # stops re-ringing them; a strictly newer worker event still doorbells.
+    handoff_watcher.acknowledge(path, acks)
     return {
         "coordinator_id": value["coordinator_id"],
         "mode": "recovery" if full_context else "hot",

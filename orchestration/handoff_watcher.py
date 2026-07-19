@@ -136,9 +136,10 @@ def _run_state(value: Any) -> dict[str, Any]:
         "last_doorbell_at", "control_through", "doorbell_after_cursor",
         "last_doorbell_error",
     }
-    # ``last_doorbell_method`` is optional so snapshots written before the
-    # delivery-channel field existed remain readable.
-    if not isinstance(value, dict) or not required <= set(value) <= required | {"last_doorbell_method"}:
+    # ``last_doorbell_method`` and ``acknowledged_through`` are optional so
+    # snapshots written before those fields existed remain readable.
+    optional = {"last_doorbell_method", "acknowledged_through"}
+    if not isinstance(value, dict) or not required <= set(value) <= required | optional:
         raise handoff.HandoffError("invalid coordinator run notification state", 5)
     for field in (
         "observed_through", "doorbell_through", "control_through",
@@ -147,6 +148,9 @@ def _run_state(value: Any) -> dict[str, Any]:
         counter = value[field]
         if isinstance(counter, bool) or not isinstance(counter, int) or counter < 0:
             raise handoff.HandoffError(f"coordinator run {field} must be non-negative", 5)
+    acknowledged = value.get("acknowledged_through", 0)
+    if isinstance(acknowledged, bool) or not isinstance(acknowledged, int) or acknowledged < 0:
+        raise handoff.HandoffError("coordinator run acknowledged_through must be non-negative", 5)
     if value["doorbell_through"] > value["observed_through"]:
         raise handoff.HandoffError("doorbell cursor exceeds observed cursor", 5)
     if not isinstance(value["doorbell_pending"], bool):
@@ -350,7 +354,41 @@ def _empty_run_state() -> dict[str, Any]:
         "doorbell_after_cursor": 0,
         "last_doorbell_error": None,
         "last_doorbell_method": None,
+        "acknowledged_through": 0,
     }
+
+
+def acknowledge(path: Path, acks: dict[str, int]) -> dict[str, Any]:
+    """Record that the coordinator has loaded each run's events through a seq.
+
+    ``coordinator pending`` calls this after surfacing a run's unread outbox so
+    the watcher stops re-ringing events the orchestrator has already seen.  The
+    cursor only advances (monotonic ``max``); a strictly newer ``observed_through``
+    still doorbells.
+
+    Lock-free by design.  ``poll`` re-derives every other run field from
+    protocol truth each interval and never touches ``acknowledged_through``, so
+    a lost update against a concurrent poll costs at most one extra doorbell and
+    self-heals on the next ``pending`` call.  Runs absent from the snapshot are
+    ignored.
+    """
+    path = _state_path(path)
+    if not acks:
+        return read(path)
+    value = read(path)
+    changed = False
+    for run_id, through in acks.items():
+        if isinstance(through, bool) or not isinstance(through, int) or through < 0:
+            raise handoff.HandoffError("acknowledge cursor must be non-negative", 2)
+        run_state = value["runs"].get(run_id)
+        if run_state is None:
+            continue
+        if through > run_state.get("acknowledged_through", 0):
+            run_state["acknowledged_through"] = through
+            changed = True
+    if changed:
+        _atomic_write(path, value)
+    return value
 
 
 def _remote_json(record: dict[str, Any], argv: list[str]) -> Any:
@@ -459,6 +497,15 @@ def poll(
     coverage: dict[str, int] = {}
     for run_id, run_state in value["runs"].items():
         if run_id not in owned_ids or not run_state["doorbell_pending"]:
+            continue
+        if run_state["observed_through"] <= run_state.get("acknowledged_through", 0):
+            # The orchestrator has already loaded every observed event via
+            # ``coordinator pending``.  Do not re-ring until a strictly newer
+            # event arrives.  Without this gate an unconsumed-but-seen result
+            # doorbells forever, because ``doorbell_pending`` stays true until
+            # the protocol outbox cursor advances and ``_retry_due`` re-fires
+            # on every interval — even when the coordinator has no lease to
+            # consume with and has already acted on the event.
             continue
         new_events = run_state["observed_through"] > run_state["doorbell_through"]
         partial_consumption = (
