@@ -665,6 +665,7 @@ def _standing_instructions() -> str:
     helper = f"{shlex.quote(sys.executable)} -m agents.orchestration.handoffctl"
     return f"""# Handoff worker contract
 
+- You are a delegated worker in a coordinator-managed run. Independently execute the stated task within scope; report durable progress, results, and blockers through Handoff. Route scope changes, cross-worker coordination, final acceptance, integration, and user-policy decisions to the coordinator.
 - Read `run.json`, `control.json`, and all unread inbox messages before beginning; check again after resume or compaction, at every turn or stage boundary, before an irreversible action, before a commit, and before publishing a result.
 - Immediately after the initial read, run the exact `handoffctl ready` command below before substantive work. This is the worker-ready signal; do not inspect helper source or help first.
 - Process inbox records in sequence and advance `inbox_cursor` only after the instruction and any durable reminder it creates are recorded.

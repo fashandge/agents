@@ -291,6 +291,10 @@ and worktree isolation remain necessary.
 
 The launcher embeds these instructions in every kickoff:
 
+- You are a delegated worker in a coordinator-managed run. Independently execute the
+  stated task within scope; report durable progress, results, and blockers through
+  Handoff. Route scope changes, cross-worker coordination, final acceptance,
+  integration, and user-policy decisions to the coordinator.
 - Read `run.json`, `control.json`, and all unread inbox messages before beginning; also
   check after resume/compaction, at every turn or stage boundary, before an irreversible
   action, before a commit, and before publishing a result.

@@ -120,6 +120,8 @@ def test_init_is_complete_private_and_external_to_workspace(run):
     assert "do not inspect helper source or help first" in (run_dir / "kickoff.md").read_text()
     assert "dirty Git workspace does not block work" in (run_dir / "kickoff.md").read_text()
     contract = (run_dir / "kickoff.md").read_text()
+    assert "delegated worker in a coordinator-managed run" in contract
+    assert "Route scope changes, cross-worker coordination, final acceptance" in contract
     assert "coordinator knows the kickoff but not your live progress" in contract
     assert "Every blocking question must be self-contained" in contract
     for required_context in (
