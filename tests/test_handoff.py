@@ -119,6 +119,19 @@ def test_init_is_complete_private_and_external_to_workspace(run):
     assert "handoffctl ready --run-dir \"$HANDOFF_RUN_DIR\"" in (run_dir / "kickoff.md").read_text()
     assert "do not inspect helper source or help first" in (run_dir / "kickoff.md").read_text()
     assert "dirty Git workspace does not block work" in (run_dir / "kickoff.md").read_text()
+    contract = (run_dir / "kickoff.md").read_text()
+    assert "coordinator knows the kickoff but not your live progress" in contract
+    assert "Every blocking question must be self-contained" in contract
+    for required_context in (
+        "current stage and completed work",
+        "concrete evidence",
+        "exact conflict",
+        "decision or authority needed",
+        "recommended resolution",
+        "consequences of the available options",
+        "actions intentionally deferred",
+    ):
+        assert required_context in contract
     assert run["run"]["workspace"]["path"] == str(run["workspace"])
     for kind in ("recovery", "coordinator", "worker"):
         path = Path(run["credential_files"][kind])

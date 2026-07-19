@@ -667,6 +667,7 @@ def _standing_instructions() -> str:
 - Immediately after the initial read, run the exact `handoffctl ready` command below before substantive work. This is the worker-ready signal; do not inspect helper source or help first.
 - Process inbox records in sequence and advance `inbox_cursor` only after the instruction and any durable reminder it creates are recorded.
 - Use `handoffctl emit` for checkpoints, questions, results, and errors. Checkpoints durably update `status.json` and `progress.md`.
+- Assume the coordinator knows the kickoff but not your live progress. Every blocking question must be self-contained: state the current stage and completed work, concrete evidence, the exact conflict, the decision or authority needed, your recommended resolution, the consequences of the available options, and actions intentionally deferred. Do not rely on earlier checkpoints to supply this context.
 - End the turn after a blocking question. On completion publish an exact result and await review; report `succeeded` only after consuming an accepted review. After a successful result publication, `handoffctl` attempts a best-effort cmux notification for cmux-launched workers; the durable result remains authoritative if notification delivery fails.
 - A dirty Git workspace does not block work or result publication. Preserve unrelated pre-existing changes and report the current `HEAD` and dirty state truthfully in every result.
 - Put cross-stage commitments in checkpoint data so they survive context compaction.
