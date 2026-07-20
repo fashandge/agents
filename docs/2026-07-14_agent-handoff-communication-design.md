@@ -171,7 +171,7 @@ Rules:
    takeovers. A cursor means the highest contiguous sequence durably processed, not
    merely the highest sequence observed.
 2. Inbox types are `steer`, `supersede`, `answer`, `review`, `input-changed`, `base-changed`,
-   `integration`, `coordinator-takeover`, `worker-relaunched`, and `stop`. Outbox
+   `integration`, `orchestrator-takeover`, `worker-relaunched`, and `stop`. Outbox
    types are `checkpoint`, `question`, `result`, and `error`.
 3. `reply_to` references a stable `message_id`; answers to questions must set it.
 4. Artifact attachments use workspace-relative paths plus a digest. Message bodies are
@@ -216,10 +216,10 @@ still live in orchestrator-owned state.
   "protocol_version": 1,
   "run_id": "8df1f10b-5bcb-4f40-a557-2f77e15012ae",
   "revision": 5,
-  "coordinator_epoch": 1,
-  "coordinator_token_sha256": "...",
+  "orchestrator_epoch": 1,
+  "orchestrator_token_sha256": "...",
   "recovery_token_sha256": "...",
-  "coordinator_lease_expires_at": "2026-07-14T19:06:00Z",
+  "orchestrator_lease_expires_at": "2026-07-14T19:06:00Z",
   "worker_epoch": 1,
   "worker_token_sha256": "...",
   "desired_state": "run",
@@ -261,7 +261,7 @@ independent files can be updated as one atomic transaction.
 All protocol mutations go through `handoffctl`; direct `echo >>` is unsupported.
 
 1. There is one **logical writer role** per file. `handoffctl` takes an advisory
-   `coordinator.lock` or `worker.lock` for the entire append-and-project operation, not
+   `orchestrator.lock` or `worker.lock` for the entire append-and-project operation, not
    merely for one file, so two processes acting for the same role cannot interleave
    sequence assignment and projection. It rereads and revalidates the token, epoch,
    journal tail, and snapshot after acquiring the lock.
@@ -277,7 +277,7 @@ All protocol mutations go through `handoffctl`; direct `echo >>` is unsupported.
    process. `control.json` stores epochs and token hashes; mutation helpers reject stale
    tokens. Orchestrator takeover requires the recovery token, acquires the orchestrator
    lock, increments the epoch, and rotates the writer token after an explicit release or
-   host-time lease expiry. The new orchestrator appends a `coordinator-takeover` event
+   host-time lease expiry. The new orchestrator appends a `orchestrator-takeover` event
    before issuing other commands.
 5. Worker relaunch increments the worker epoch only after the previous process is
    confirmed dead. Never relaunch a writer into the same writable worktree while the
@@ -358,9 +358,9 @@ while worker outbox events are detected. This is a layer-2/3 adapter; it does no
 message type or weaken the filesystem protocol's authority.
 
 There is one watcher per orchestrator session, not one watcher per worker. The
-orchestrator creates an opaque `coordinator_id` and registers its exact routable session
+orchestrator creates an opaque `orchestrator_id` and registers its exact routable session
 target before or with its first worker launch. Each run registry record created by that
-orchestrator carries the same `coordinator_id`. The watcher reloads the registry on
+orchestrator carries the same `orchestrator_id`. The watcher reloads the registry on
 every poll and selects only records with its ID. A newly spawned worker is therefore
 discovered without restarting the watcher; a run owned by another orchestrator is
 never surfaced to this session. Existing unowned registry records require an explicit
@@ -387,7 +387,7 @@ single-instance lock. At minimum the snapshot contains:
 ```json
 {
   "version": 2,
-  "coordinator_id": "uuid",
+  "orchestrator_id": "uuid",
   "transport": "cmux",
   "target": {"workspace": "workspace:9", "surface": "uuid"},
   "owner_process": {"pid": 12345, "started_at": "host process-start token"},
@@ -449,7 +449,7 @@ steps:
    treats the notification as pending and retries it. A crash after the doorbell but
    before recording success may produce a duplicate, which is harmless.
 5. Coalesce all currently pending runs into one opaque orchestrator doorbell. The
-   doorbell contains only the `coordinator_id`, run IDs, and highest outbox sequences,
+   doorbell contains only the `orchestrator_id`, run IDs, and highest outbox sequences,
    or a pointer to the private watcher snapshot; it never includes worker message
    bodies, artifacts, prompts, or credentials.
 6. Leave `doorbell_pending` set until each covered run's
@@ -684,7 +684,7 @@ are strings and `exit_code` is an integer or `null` when the check could not sta
 | inbox `input-changed` | `{"path":str,"sha256":hex,"git_blob":str|null}` | The named attachment must match path/digest, either as a current workspace file or copied snapshot. |
 | inbox `base-changed` | `{"base_commit":str}` | Commit must resolve in the launch repository when local; non-empty `body`. |
 | inbox `integration` | `{"state":"integrated"|"abandoned","commit":str|null,"reason":str|null}` | Created only by `control integrate|abandon`; `reply_to` names the accepted/current result. Integrated requires a commit and null reason; abandoned requires a non-empty reason. |
-| inbox `coordinator-takeover` | `{"previous_epoch":int,"new_epoch":int,"reason":str,"forced":bool}` | Created only by `control takeover`; epochs must be consecutive. |
+| inbox `orchestrator-takeover` | `{"previous_epoch":int,"new_epoch":int,"reason":str,"forced":bool}` | Created only by `control takeover`; epochs must be consecutive. |
 | inbox `worker-relaunched` | `{"previous_epoch":int,"new_epoch":int,"reason":str}` | Created only by `control rotate-worker`; epochs must be consecutive. |
 | inbox `stop` | `{"reason":str}` | Created by `send stop`; sets desired state `stop`. |
 | outbox `checkpoint` | `{"state":"working"|"succeeded"|"stopped","stage":str,"current_activity":str,"inbox_cursor":int,"commitments":[str]}` | Advances the worker projection and appends the progress marker. Preconditions for terminal states are in 4.9.4. |
@@ -699,7 +699,7 @@ that question, or a `stop`. Every emitted event sets `outbox_seq` to its sequenc
 increments the status revision, and updates `updated_at`; events other than a
 nonblocking question also update `last_progress_at`.
 
-`integration`, `coordinator-takeover`, and `worker-relaunched` are system-generated
+`integration`, `orchestrator-takeover`, and `worker-relaunched` are system-generated
 inbox message types: generic `send` rejects them. Their bodies are audit summaries,
 not credentials.
 
@@ -747,7 +747,7 @@ an active orchestrator process. `init` writes the tokens as raw lowercase hexade
 plus newline to caller-selected credential files using `O_CREAT|O_EXCL` and mode
 `0600`; it writes only their SHA-256 hashes into `control.json`. Credential files must
 be outside `<run-dir>`. The CLI reports their paths, never their contents. Mutating
-commands accept `--token-file`; otherwise they use `HANDOFF_COORDINATOR_TOKEN_FILE`,
+commands accept `--token-file`; otherwise they use `HANDOFF_ORCHESTRATOR_TOKEN_FILE`,
 `HANDOFF_WORKER_TOKEN_FILE`, or, where explicitly required,
 `HANDOFF_RECOVERY_TOKEN_FILE`. Tokens are never accepted directly in argv. Library
 callers pass token bytes in memory.
@@ -761,7 +761,7 @@ host-now and records `released_at` only in the command's JSON response; a subseq
 takeover still writes the durable takeover event. This release does not stop the
 worker.
 
-`control takeover` requires the recovery token, acquires `coordinator.lock`, rereads
+`control takeover` requires the recovery token, acquires `orchestrator.lock`, rereads
 the host clock and token state, and succeeds only after expiry or release. `--force`
 additionally permits takeover before expiry but requires a non-empty audit reason. It
 calculates the next epoch, creates the rotated token in a new `O_EXCL` credential file,
@@ -915,8 +915,8 @@ Successful JSON output shapes are exact:
 | `runs list` / `runs show` | Public registry record(s), with `credential_dir` omitted |
 | `runs adopt` | The adopted public registry record |
 | `orchestrator register` / `orchestrator show` | The raw credential-free orchestrator watcher snapshot |
-| `orchestrator start` | `{"coordinator_id":str,"pid":int|null,"running":true,"started":bool,"state":str}` |
-| `orchestrator pending` | `{"coordinator_id":str,"mode":"hot"|"recovery","pending":[...]}`; hot detail contains exact status/control and unread outbox only, while recovery detail contains the full `context` bundle |
+| `orchestrator start` | `{"orchestrator_id":str,"pid":int|null,"running":true,"started":bool,"state":str}` |
+| `orchestrator pending` | `{"orchestrator_id":str,"mode":"hot"|"recovery","pending":[...]}`; hot detail contains exact status/control and unread outbox only, while recovery detail contains the full `context` bundle |
 | `context` | `{"run":object,"status":object,"control":object,"kickoff":str,"progress":str,"unread_inbox":[message,...],"unread_outbox":[message,...],"registry":object}` |
 | `dispatch` | `{"run":object,"takeover":object,"message":object,"superseded_result":str|null,"doorbell_sent":bool,"doorbell_error":str|null,"orchestrator_released":bool}` |
 | `watch` | JSONL records containing either `{"run":object,"event":message}` or `{"run":object,"watch_error":str}` |
@@ -1140,7 +1140,7 @@ Build the thin protocol and reuse task/session products where they fit:
    orchestrator and worker share the external run path, test the in-worktree fallback,
    prohibit external branch mutation, and archive before fallback worktree cleanup.
 4. **Detached orchestrator watcher:** add orchestrator-session registration, associate
-   launched runs with `coordinator_id`, reload the registry on every poll, persist
+   launched runs with `orchestrator_id`, reload the registry on every poll, persist
    per-orchestrator notification state, and ring coalesced opaque doorbells as specified
    in 4.6.1. Preserve the existing generic `watch` behavior when no orchestrator state
    is supplied.
@@ -1169,7 +1169,7 @@ Acceptance tests for v1 should demonstrate:
 
 Detached watcher acceptance tests should additionally demonstrate:
 
-- the watcher is a singleton per `coordinator_id` and never selects runs owned by a
+- the watcher is a singleton per `orchestrator_id` and never selects runs owned by a
   different orchestrator;
 - a worker registered after watcher startup is discovered without restarting the
   process;

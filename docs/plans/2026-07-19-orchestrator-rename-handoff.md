@@ -1,12 +1,21 @@
 # Handoff: rename "coordinator" → "orchestrator" across the handoff stack
 
-**Status (2026-07-20):** **Phase 1 done, reviewed, and pushed.**
-**Phase 2 deliberately deferred — and its approach has changed; see below.**
+**Status (2026-07-20):** **Phase 1 done, reviewed, and pushed. Phase 2 done —
+committed locally, not yet pushed** (the orchestrator reviews and owns the push).
 
 - Phase 1 landed via a delegated Kimi worker: agents `940aa14` (code, tests,
   `handoff_coordinator_ensure.sh` → `handoff_orchestrator_ensure.sh`) and
   `ee7ece8` (docs); skills `cd9839e` (SKILL.md + all four references).
   Both repos pushed.
+- Phase 2 landed via a delegated Kimi worker on a quiescent machine (no
+  watchers, no workers): agents `332ee01` (persisted-spelling code rename,
+  no compat layer) plus a follow-up commit with
+  `scripts/migrate_handoff_state_orchestrator.py` and the docs/skill updates;
+  skills repo commit for the two handoff-agent references. The migration ran
+  in the same change: backup at
+  `~/.local/state/agents/handoff.pre-orchestrator-migration-20260720T174813Z`,
+  94 files migrated (registry=1, watcher=10, control=38, inbox=7, lock=38),
+  idempotent re-run clean. See "Phase 2 outcome" below.
 - Independently verified at review: 175 tests pass; `orchestrator` and the
   `coordinator` alias resolve identically; **zero diff lines touched any
   persisted spelling**; every live `watcher.json` still uses `coordinator_id`;
@@ -282,3 +291,62 @@ flag (for an `awaiting_review` worker it sends `supersede`). A managed run
 orchestrator intends to send a formal `review` later. Worth considering as a
 protocol/CLI improvement: a registry-backed review path that takes over the
 lease the way `dispatch` does.
+
+## Phase 2 outcome (2026-07-20)
+
+Done on a quiescent machine (no watcher processes, no worker sessions), clean
+rename with **no backward-compatibility layer**, code and state migration in
+the same change. `protocol_version` stays `local-v1`.
+
+Renamed in code and migrated on disk:
+
+- `control.json` fields `coordinator_epoch` / `coordinator_token_sha256` /
+  `coordinator_lease_expires_at` → `orchestrator_*` (38 files).
+- Inbox event type `coordinator-takeover` → `orchestrator-takeover`,
+  including the persisted events in 7 existing `inbox.jsonl` journals (the
+  original migration table missed these; without it the new strict journal
+  validation would reject those runs' inboxes).
+- Lock `coordinator.lock` → `orchestrator.lock` (38 files) via the
+  `_lock(run_dir, "orchestrator")` role literal; the same role rename moves
+  the derived credential env var to `HANDOFF_ORCHESTRATOR_TOKEN_FILE`.
+- Credential filename `coordinator.token` → `orchestrator.token` for new
+  launches (existing token files on disk deliberately NOT renamed —
+  `credential_dir` paths recorded in the registry would otherwise dangle).
+- Registry / watcher-state key `coordinator_id` → `orchestrator_id`,
+  including the CLI JSON outputs that mirror it (25 registry records in one
+  `registry.json`, 10 `watcher.json` snapshots).
+- `HANDOFF_COORDINATOR_STATE` → `HANDOFF_ORCHESTRATOR_STATE`
+  (`--orchestrator-state` fallback default).
+- New session dirs go to `~/.local/state/agents/handoff/orchestrators/`
+  (`scripts/handoff_orchestrator_ensure.sh`); the existing `coordinators/`
+  directory stays in place and its `watcher.json` files were migrated in
+  place.
+
+Migration: `scripts/migrate_handoff_state_orchestrator.py` (idempotent,
+`--dry-run` support, atomic writes preserving modes). Backup before any
+modification:
+`~/.local/state/agents/handoff.pre-orchestrator-migration-20260720T174813Z`.
+94 files changed (registry=1, watcher=10, control=38, inbox=7, lock=38); a
+re-run `--dry-run` reports zero remaining changes. Verified after migration:
+`handoffctl runs list` (25 runs), `runs show`, `status`, and `doctor` all
+work on migrated state; the 25 pre-existing `status-projection` doctor
+notices on old runs reproduce identically with the pre-rename code on the
+pristine backup, so they are historical artifacts, not migration damage.
+
+### Deliberately still "coordinator" after Phase 2
+
+- **Remote wire keys** `retain_coordinator` and `coordinator_id` in the SSH
+  JSON payload (`REMOTE_REQUEST_FIELDS` and friends in
+  `handoff_launcher.py`, marked with a comment): the remote host (`oci-box`)
+  still runs the pre-rename package and validates that exact field set.
+  **Remaining work:** rename these only in step with updating the remote
+  installed package. For the same reason the remote-side credential file and
+  env var stay `coordinator.token` / `HANDOFF_COORDINATOR_TOKEN_FILE` on the
+  remote host until then (noted in the skill's `remote-and-viewers.md`).
+- The **CLI aliases** kept from Phase 1 (`coordinator` subcommand alias,
+  `--coordinator-id` / `--coordinator-state` / `--coordinator-token-file` /
+  `--retain-coordinator` flags).
+- Existing on-disk `coordinator.token` files and the `coordinators/` state
+  directory name (see above), plus free-text prose mentioning the role in
+  historical `kickoff.md` / `progress.md` / message bodies, and historical
+  plan-doc transcripts.
