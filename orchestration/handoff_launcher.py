@@ -157,6 +157,8 @@ def _orchestrator_id_from_state(path: Path | None) -> str | None:
         raise handoff.HandoffError("orchestrator state path must be absolute", 2)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict) and "coordinator_id" in value and "orchestrator_id" not in value:
+            handoff._pre_orchestrator_rename("coordinator_id", path)  # noqa: SLF001
         orchestrator_id = value["orchestrator_id"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise handoff.HandoffError(f"invalid orchestrator state {path}: {exc}", 5) from exc

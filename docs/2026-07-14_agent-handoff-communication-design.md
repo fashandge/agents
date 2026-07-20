@@ -579,6 +579,7 @@ Exit codes are stable:
 | 4 | State, cursor, sequence, or ownership conflict |
 | 5 | Journal or snapshot corruption requiring `doctor` or manual recovery |
 | 6 | Filesystem, Git-probe, or session-adapter I/O failure |
+| 7 | Persisted handoff state predates the orchestrator rename and requires `scripts/migrate_handoff_state_orchestrator.py` |
 
 #### 4.9.2 Complete file schemas
 

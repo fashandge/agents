@@ -283,7 +283,10 @@ def read(path: Path) -> dict[str, Any]:
     except OSError as exc:
         raise handoff.HandoffError(f"cannot read orchestrator state {path}: {exc}", 6) from exc
     try:
-        return _validate(handoff._decode_json(raw, path))  # noqa: SLF001
+        value = handoff._decode_json(raw, path)  # noqa: SLF001
+        if isinstance(value, dict) and "coordinator_id" in value and "orchestrator_id" not in value:
+            handoff._pre_orchestrator_rename("coordinator_id", path)  # noqa: SLF001
+        return _validate(value)
     except handoff.HandoffError:
         raise
 

@@ -15,6 +15,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, OpenClaw, H
 - Invoke native code review: add `--codex-review` to pass the prompt through headless `codex exec review`, or `--claude-review-command code-review|review` (and an optional PR `--claude-review-target` for review).
 - Long runs (> ~6 min) launched from a cmux-hosted Claude Code session: add `--detach OUTPUT_BASE` — runs in its own session (immune to the cmux idle reaper), answer in `OUTPUT_BASE.out`, `.exitcode` written last (poll for it). Short runs don't need it.
 - Create/inspect a durable handoff run: `/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python -m agents.orchestration.handoffctl --help`; launch one through local cmux/tmux or remote SSH+tmux with `scripts/handoff_agent.sh --help`.
+- Update a host checkout and migrate its handoff state together: `scripts/update_agents.sh`; use `--dry-run` to inspect migration work without pulling or writing state.
 
 ## Architecture (details: docs/architecture.md)
 

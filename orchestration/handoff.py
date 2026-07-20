@@ -76,6 +76,7 @@ MESSAGE_FIELDS = {
     "reply_to", "body", "data", "attachments",
 }
 ATTACHMENT_FIELDS = {"path", "sha256", "size", "git_blob", "snapshot"}
+PRE_ORCHESTRATOR_RENAME_EXIT_CODE = 7
 
 
 class HandoffError(Exception):
@@ -85,6 +86,15 @@ class HandoffError(Exception):
         super().__init__(message)
         self.exit_code = exit_code
         self.report = report
+
+
+def _pre_orchestrator_rename(found: str, path: Path) -> None:
+    raise HandoffError(
+        f'handoff state predates the orchestrator rename (found "{found}" in {path}). '
+        f"Run: {sys.executable} scripts/migrate_handoff_state_orchestrator.py --dry-run; "
+        "then run the same command without --dry-run to apply.",
+        PRE_ORCHESTRATOR_RENAME_EXIT_CODE,
+    )
 
 
 def _fail(message: str, code: int = 2) -> None:
@@ -232,7 +242,10 @@ def _load_json(path: Path, validator: Any) -> dict[str, Any]:
         raise HandoffError(f"cannot read {path}: {exc}", 6) from exc
     value = _decode_json(raw, str(path))
     try:
-        validator(value)
+        if validator is _validate_control:
+            validator(value, path=path)
+        else:
+            validator(value)
     except HandoffError as exc:
         if exc.exit_code == 2:
             raise HandoffError(f"corrupt snapshot {path}: {exc}", 5) from exc
@@ -384,7 +397,15 @@ def _validate_status(value: Any) -> None:
     _parse_time(value["updated_at"])
 
 
-def _validate_control(value: Any) -> None:
+def _validate_control(value: Any, *, path: Path | None = None) -> None:
+    if path is not None and isinstance(value, dict):
+        for old, new in (
+            ("coordinator_epoch", "orchestrator_epoch"),
+            ("coordinator_token_sha256", "orchestrator_token_sha256"),
+            ("coordinator_lease_expires_at", "orchestrator_lease_expires_at"),
+        ):
+            if old in value and new not in value:
+                _pre_orchestrator_rename(old, path)
     value = _fields(value, CONTROL_FIELDS, "control")
     if value["protocol_version"] != 1:
         _fail("unsupported protocol version")
@@ -596,6 +617,11 @@ def _journal_unlocked(path: Path, direction: str) -> list[dict[str, Any]]:
         if len(line) + 1 > MAX_JOURNAL_LINE:
             _fail(f"journal line {seq} exceeds size limit", 5)
         value = _decode_json(line, f"{path}:{seq}")
+        if (
+            direction == "inbox" and isinstance(value, dict)
+            and value.get("type") == "coordinator-takeover"
+        ):
+            _pre_orchestrator_rename("coordinator-takeover", path)
         try:
             _validate_message(value, direction, expected_seq=seq)
         except HandoffError as exc:

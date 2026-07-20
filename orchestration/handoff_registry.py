@@ -38,9 +38,11 @@ def _empty() -> dict[str, Any]:
     return {"version": REGISTRY_VERSION, "runs": {}}
 
 
-def _validate_record(record: Any) -> dict[str, Any]:
+def _validate_record(record: Any, *, path: Path | None = None) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise handoff.HandoffError("registry record must be an object", 5)
+    if path is not None and "coordinator_id" in record and "orchestrator_id" not in record:
+        handoff._pre_orchestrator_rename("coordinator_id", path)  # noqa: SLF001
     required = {
         "run_id", "name", "run_dir", "run_uri", "host", "remote_python",
         "transport", "session_transport", "handle", "agent", "model", "effort",
@@ -77,13 +79,13 @@ def _validate_record(record: Any) -> dict[str, Any]:
     return record
 
 
-def _validate(value: Any) -> dict[str, Any]:
+def _validate(value: Any, *, path: Path | None = None) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"version", "runs"}:
         raise handoff.HandoffError("registry must contain version and runs", 5)
     if value["version"] != REGISTRY_VERSION or not isinstance(value["runs"], dict):
         raise handoff.HandoffError("unsupported or invalid registry", 5)
     for run_id, record in list(value["runs"].items()):
-        normalized = _validate_record(record)
+        normalized = _validate_record(record, path=path)
         if run_id != normalized["run_id"]:
             raise handoff.HandoffError("registry run key does not match record", 5)
         value["runs"][run_id] = normalized
@@ -94,7 +96,7 @@ def _read_unlocked(path: Path) -> dict[str, Any]:
     if not path.exists():
         return _empty()
     try:
-        return _validate(json.loads(path.read_text(encoding="utf-8")))
+        return _validate(json.loads(path.read_text(encoding="utf-8")), path=path)
     except (OSError, json.JSONDecodeError) as exc:
         raise handoff.HandoffError(f"cannot read handoff registry {path}: {exc}", 5) from exc
 
