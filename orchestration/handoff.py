@@ -304,7 +304,7 @@ def _authorize(control: dict[str, Any], token: bytes, role: str, *, lease: bool 
     if not secrets.compare_digest(_token_hash(token), control[field]):
         _fail(f"invalid or stale {role} credential", 3)
     if lease and _parse_time(control["coordinator_lease_expires_at"]) <= _now():
-        _fail("coordinator credential lease has expired", 3)
+        _fail("orchestrator credential lease has expired", 3)
 
 
 def _new_token_file(path: Path, token: bytes | None = None) -> bytes:
@@ -665,13 +665,13 @@ def _standing_instructions() -> str:
     helper = f"{shlex.quote(sys.executable)} -m agents.orchestration.handoffctl"
     return f"""# Handoff worker contract
 
-- You are a delegated worker in a coordinator-managed run. Independently execute the stated task within scope; report durable progress, results, and blockers through Handoff. Route scope changes, cross-worker coordination, final acceptance, integration, and user-policy decisions to the coordinator.
+- You are a delegated worker in an orchestrator-managed run. Independently execute the stated task within scope; report durable progress, results, and blockers through Handoff. Route scope changes, cross-worker coordination, final acceptance, integration, and user-policy decisions to the orchestrator.
 - Read `run.json`, `control.json`, and all unread inbox messages before beginning; check again after resume or compaction, at every turn or stage boundary, before an irreversible action, before a commit, and before publishing a result.
 - Immediately after the initial read, run the exact `handoffctl ready` command below before substantive work. This is the worker-ready signal; do not inspect helper source or help first.
 - Process inbox records in sequence and advance `inbox_cursor` only after the instruction and any durable reminder it creates are recorded.
 - Treat a `supersede` message tied to the current result as a new instruction that replaces the pending review; consume it, checkpoint back to `working`, and publish a fresh result when done.
 - Use `handoffctl emit` for checkpoints, questions, results, and errors. Checkpoints durably update `status.json` and `progress.md`.
-- Assume the coordinator knows the kickoff but not your live progress. Every blocking question must be self-contained: state the current stage and completed work, concrete evidence, the exact conflict, the decision or authority needed, your recommended resolution, the consequences of the available options, and actions intentionally deferred. Do not rely on earlier checkpoints to supply this context.
+- Assume the orchestrator knows the kickoff but not your live progress. Every blocking question must be self-contained: state the current stage and completed work, concrete evidence, the exact conflict, the decision or authority needed, your recommended resolution, the consequences of the available options, and actions intentionally deferred. Do not rely on earlier checkpoints to supply this context.
 - End the turn after a blocking question. On completion publish an exact result and await review; report `succeeded` only after consuming an accepted review. After a successful result publication, `handoffctl` attempts a best-effort cmux notification for cmux-launched workers; the durable result remains authoritative if notification delivery fails.
 - A dirty Git workspace does not block work or result publication. Preserve unrelated pre-existing changes and report the current `HEAD` and dirty state truthfully in every result.
 - Put cross-stage commitments in checkpoint data so they survive context compaction.
@@ -684,7 +684,7 @@ Run directory: available as `HANDOFF_RUN_DIR`. Worker credential: available only
 
 def initialize(
     *, workspace: Path, kickoff: Path, harness: str, model: str, transport: str,
-    recovery_token_file: Path, coordinator_token_file: Path, worker_token_file: Path,
+    recovery_token_file: Path, orchestrator_token_file: Path, worker_token_file: Path,
     effort: str | None = None, inputs: list[Path | str] | None = None,
     state_root: Path | None = None, run_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -725,7 +725,7 @@ def initialize(
     os.chmod(final.parent, 0o700)
 
     credential_paths = [Path(value).resolve(strict=False) for value in (
-        recovery_token_file, coordinator_token_file, worker_token_file
+        recovery_token_file, orchestrator_token_file, worker_token_file
     )]
     if len(set(credential_paths)) != 3:
         _fail("credential file paths must be distinct")
@@ -741,7 +741,7 @@ def initialize(
     temp = final.parent / f".{run_id}.init-{uuid.uuid4()}"
     try:
         recovery = _new_token_file(credential_paths[0]); created_credentials.append(credential_paths[0])
-        coordinator = _new_token_file(credential_paths[1]); created_credentials.append(credential_paths[1])
+        orchestrator = _new_token_file(credential_paths[1]); created_credentials.append(credential_paths[1])
         worker_token = _new_token_file(credential_paths[2]); created_credentials.append(credential_paths[2])
         temp.mkdir(mode=0o700)
         os.chmod(temp, 0o700)
@@ -773,7 +773,7 @@ def initialize(
         status_value = _initial_status(run_id, created)
         control_value = {
             "protocol_version": 1, "run_id": run_id, "revision": 1,
-            "coordinator_epoch": 1, "coordinator_token_sha256": _token_hash(coordinator),
+            "coordinator_epoch": 1, "coordinator_token_sha256": _token_hash(orchestrator),
             "recovery_token_sha256": _token_hash(recovery), "coordinator_lease_expires_at": lease,
             "worker_epoch": 1, "worker_token_sha256": _token_hash(worker_token),
             "desired_state": "run", "review_state": "pending", "review_result_id": None,
@@ -806,7 +806,7 @@ def initialize(
         raise
     return {
         "run_dir": str(final),
-        "credential_files": {"recovery": str(credential_paths[0]), "coordinator": str(credential_paths[1]), "worker": str(credential_paths[2])},
+        "credential_files": {"recovery": str(credential_paths[0]), "orchestrator": str(credential_paths[1]), "worker": str(credential_paths[2])},
         "run": run, "status": status_value, "control": control_value,
     }
 
@@ -1101,7 +1101,7 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
             new_state = "succeeded"
         elif target == "stopped":
             if control["desired_state"] != "stop" or not any(item["type"] == "stop" for item in prefix):
-                _fail("stopped requires a consumed coordinator stop", 4)
+                _fail("stopped requires a consumed orchestrator stop", 4)
             new_state = "stopped"; blocked_on = []
     elif kind == "question":
         activity = data["current_activity"]
@@ -1113,7 +1113,7 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
         if old_state not in {"starting", "working", "blocked"} or unresolved:
             _fail("result is not valid in the current state", 4)
         new_state = "awaiting_review"; blocked_on = []
-        activity = "Awaiting coordinator review"
+        activity = "Awaiting orchestrator review"
     elif kind == "error" and data["fatal"]:
         if old_state == "succeeded":
             _fail("succeeded epoch cannot fail", 4)
@@ -1174,8 +1174,8 @@ def emit(
     message_id = message_id or str(uuid.uuid4()); _uuid4(message_id, "message_id")
     if reply_to is not None: _uuid4(reply_to, "reply_to")
     _validate_type_data("outbox", type, body, reply_to, data)
-    # Always acquire roles in coordinator-then-worker order. Coordinator sends
-    # may consult outbox while holding the coordinator lock; the inverse order
+    # Always acquire roles in orchestrator-then-worker order. Orchestrator sends
+    # may consult outbox while holding the orchestrator lock; the inverse order
     # here would deadlock two simultaneous role operations.
     with _lock(run_dir, "coordinator", shared=True), _lock(run_dir, "worker"):
         control = _load_json(run_dir / "control.json", _validate_control)
@@ -1325,7 +1325,7 @@ def control_takeover(
             _fail("invalid recovery credential", 3)
         now = _now()
         if not force and _parse_time(control["coordinator_lease_expires_at"]) > now:
-            _fail("coordinator lease is still active", 4)
+            _fail("orchestrator lease is still active", 4)
         token = _new_token_file(new_path); created = True
         try:
             inbox = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
@@ -1333,7 +1333,7 @@ def control_takeover(
             data = {"previous_epoch": previous, "new_epoch": next_epoch, "reason": reason, "forced": force}
             message = _system_send(
                 run_dir, control, inbox, kind="coordinator-takeover",
-                body=f"Coordinator ownership transferred: {reason}", data=data,
+                body=f"Orchestrator ownership transferred: {reason}", data=data,
                 reply_to=None, epoch=next_epoch,
             )
             control["coordinator_token_sha256"] = _token_hash(token)
@@ -1460,11 +1460,11 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
         if control["last_command_seq"] < len(inbox): issues.append(_issue("projection-lag", run_dir / "control.json", "control projection trails inbox"))
         if control["last_command_seq"] == len(inbox):
             expected_desired = "stop" if any(message["type"] == "stop" for message in inbox) else "run"
-            expected_coordinator_epoch = 1
+            expected_orchestrator_epoch = 1
             expected_worker_epoch = 1
             expected_integration = {"state": "pending", "commit": None, "reason": None}
             for message in inbox:
-                if message["type"] == "coordinator-takeover": expected_coordinator_epoch = message["data"]["new_epoch"]
+                if message["type"] == "coordinator-takeover": expected_orchestrator_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "worker-relaunched": expected_worker_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "integration": expected_integration = dict(message["data"])
             consumed_results = [message for message in outbox[:control["outbox_cursor"]] if message["type"] == "result"]
@@ -1482,7 +1482,7 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
                         else latest["data"]["disposition"]
                     )
             semantic = {
-                "desired_state": expected_desired, "coordinator_epoch": expected_coordinator_epoch,
+                "desired_state": expected_desired, "coordinator_epoch": expected_orchestrator_epoch,
                 "worker_epoch": expected_worker_epoch, "review_state": expected_review,
                 "review_result_id": expected_result, "integration": expected_integration,
             }
@@ -1639,7 +1639,7 @@ def repair_control(
             _apply_inbox(control, message)
             if message["type"] == "coordinator-takeover":
                 if new_token is None:
-                    _fail("repairing an appended takeover requires its new coordinator token file", 3)
+                    _fail("repairing an appended takeover requires its new orchestrator token file", 3)
                 control["coordinator_token_sha256"] = _token_hash(new_token)
             if message["type"] == "worker-relaunched":
                 if new_worker_token is None:

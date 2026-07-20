@@ -12,8 +12,8 @@ from agents.orchestration import handoff_watcher
 from agents.orchestration import handoffctl
 
 
-def coordinator_state(tmp_path, *, transport="tmux", target=None):
-    state_path = tmp_path / "coordinator" / "watcher.json"
+def orchestrator_state(tmp_path, *, transport="tmux", target=None):
+    state_path = tmp_path / "orchestrator" / "watcher.json"
     value = handoff_watcher.initialize(
         state_path,
         transport=transport,
@@ -23,9 +23,9 @@ def coordinator_state(tmp_path, *, transport="tmux", target=None):
     return state_path, value
 
 
-def test_retarget_preserves_a_stopped_coordinator_identity_and_runs(tmp_path):
+def test_retarget_preserves_a_stopped_orchestrator_identity_and_runs(tmp_path):
     surface = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
-    state_path, original = coordinator_state(
+    state_path, original = orchestrator_state(
         tmp_path,
         transport="cmux",
         target={"workspace": "workspace:2", "surface": surface},
@@ -44,7 +44,7 @@ def test_retarget_preserves_a_stopped_coordinator_identity_and_runs(tmp_path):
     assert updated["target"] == {"workspace": "workspace:9", "surface": surface}
 
 
-def registered_run(tmp_path, registry, *, name, coordinator_id):
+def registered_run(tmp_path, registry, *, name, orchestrator_id):
     workspace = tmp_path / f"workspace-{name}"
     workspace.mkdir()
     kickoff = tmp_path / f"kickoff-{name}.md"
@@ -59,7 +59,7 @@ def registered_run(tmp_path, registry, *, name, coordinator_id):
         transport="tmux",
         run_dir=tmp_path / "runs" / name,
         recovery_token_file=private / "recovery.token",
-        coordinator_token_file=private / "coordinator.token",
+        orchestrator_token_file=private / "coordinator.token",
         worker_token_file=private / "worker.token",
     )
     handoff_registry.register(
@@ -77,12 +77,12 @@ def registered_run(tmp_path, registry, *, name, coordinator_id):
         model="gpt-test",
         effort="high",
         credential_dir=str(private),
-        coordinator_id=coordinator_id,
+        orchestrator_id=orchestrator_id,
     )
     return {
         **initialized,
         "worker": (private / "worker.token").read_bytes(),
-        "coordinator": (private / "coordinator.token").read_bytes(),
+        "orchestrator": (private / "coordinator.token").read_bytes(),
     }
 
 
@@ -116,14 +116,14 @@ def blocked(run, question="Which option should I take?"):
         data={
             "blocking": True,
             "stage": "implementation",
-            "current_activity": "Awaiting coordinator direction",
+            "current_activity": "Awaiting orchestrator direction",
             "inbox_cursor": 0,
             "commitments": [],
         },
     )
 
 
-def awaiting_review(run, body="Ready for coordinator review"):
+def awaiting_review(run, body="Ready for orchestrator review"):
     return handoff.emit(
         Path(run["run_dir"]),
         run["worker"],
@@ -156,9 +156,9 @@ def nonfatal_error(run, body="Recoverable worker error"):
     )
 
 
-def test_watcher_is_singleton_and_isolates_coordinators(tmp_path):
+def test_watcher_is_singleton_and_isolates_orchestrators(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     other_path = tmp_path / "other" / "watcher.json"
     other = handoff_watcher.initialize(
         other_path,
@@ -167,10 +167,10 @@ def test_watcher_is_singleton_and_isolates_coordinators(tmp_path):
         owner_pid=os.getpid(),
     )
     owned = registered_run(
-        tmp_path, registry, name="owned", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="owned", orchestrator_id=owner["coordinator_id"],
     )
     foreign = registered_run(
-        tmp_path, registry, name="foreign", coordinator_id=other["coordinator_id"],
+        tmp_path, registry, name="foreign", orchestrator_id=other["coordinator_id"],
     )
     awaiting_review(owned, "owned body must stay on disk")
     awaiting_review(foreign, "foreign body must never surface")
@@ -196,11 +196,11 @@ def test_watcher_is_singleton_and_isolates_coordinators(tmp_path):
 
 def test_watcher_discovers_new_worker_without_restart(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     calls = []
     with handoff_watcher.instance_lock(state_path):
         first = registered_run(
-            tmp_path, registry, name="first", coordinator_id=owner["coordinator_id"],
+            tmp_path, registry, name="first", orchestrator_id=owner["coordinator_id"],
         )
         awaiting_review(first, "first")
         handoff_watcher.poll(
@@ -209,7 +209,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
             notifier=lambda value, coverage: calls.append(dict(coverage)),
         )
         second = registered_run(
-            tmp_path, registry, name="second", coordinator_id=owner["coordinator_id"],
+            tmp_path, registry, name="second", orchestrator_id=owner["coordinator_id"],
         )
         awaiting_review(second, "second")
         handoff_watcher.poll(
@@ -225,7 +225,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
 
 
 def test_watch_exits_when_owner_process_is_dead(tmp_path, monkeypatch):
-    state_path, _ = coordinator_state(tmp_path)
+    state_path, _ = orchestrator_state(tmp_path)
     polls = []
     monkeypatch.setattr(
         handoff_watcher,
@@ -245,7 +245,7 @@ def test_watch_exits_when_owner_process_is_dead(tmp_path, monkeypatch):
 
 
 def test_watch_suppresses_work_while_owner_liveness_is_unknown(tmp_path, monkeypatch):
-    state_path, _ = coordinator_state(tmp_path)
+    state_path, _ = orchestrator_state(tmp_path)
     statuses = iter(("unknown", "alive", "dead"))
     polls = []
     monkeypatch.setattr(handoff_watcher.time, "sleep", lambda interval: None)
@@ -266,7 +266,7 @@ def test_watch_suppresses_work_while_owner_liveness_is_unknown(tmp_path, monkeyp
 
 
 def test_watch_reports_each_live_poll_to_on_poll(tmp_path, monkeypatch):
-    state_path, _ = coordinator_state(tmp_path)
+    state_path, _ = orchestrator_state(tmp_path)
     statuses = iter(("alive", "unknown", "dead"))
     reported = []
     monkeypatch.setattr(handoff_watcher.time, "sleep", lambda interval: None)
@@ -288,7 +288,7 @@ def test_watch_reports_each_live_poll_to_on_poll(tmp_path, monkeypatch):
 
 
 def test_owner_process_status_rejects_pid_reuse(tmp_path, monkeypatch):
-    _, value = coordinator_state(tmp_path)
+    _, value = orchestrator_state(tmp_path)
     owner = value["owner_process"]
     monkeypatch.setattr(handoff_watcher.os, "kill", lambda pid, signal: None)
     monkeypatch.setattr(
@@ -302,12 +302,12 @@ def test_owner_process_status_rejects_pid_reuse(tmp_path, monkeypatch):
 
 def test_watcher_coalesces_and_never_advances_protocol_cursor(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     first = registered_run(
-        tmp_path, registry, name="first", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="first", orchestrator_id=owner["coordinator_id"],
     )
     second = registered_run(
-        tmp_path, registry, name="second", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="second", orchestrator_id=owner["coordinator_id"],
     )
     awaiting_review(first, "secret first body")
     awaiting_review(second, "secret second body")
@@ -348,9 +348,9 @@ def test_watcher_recovers_both_notification_crash_windows(
     tmp_path, delivered_before_crash,
 ):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     awaiting_review(run, "durable event")
     delivered = []
@@ -383,9 +383,9 @@ def test_watcher_recovers_both_notification_crash_windows(
 
 def test_partial_consumption_redoorbells_remainder_and_full_consumption_clears(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     checkpoint(run, "one")
     checkpoint(run, "two")
@@ -396,13 +396,13 @@ def test_partial_consumption_redoorbells_remainder_and_full_consumption_clears(t
         registry_path=registry,
         notifier=lambda value, coverage: calls.append(dict(coverage)),
     )
-    handoff.control_consume(Path(run["run_dir"]), run["coordinator"], through=1)
+    handoff.control_consume(Path(run["run_dir"]), run["orchestrator"], through=1)
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
         notifier=lambda value, coverage: calls.append(dict(coverage)),
     )
-    handoff.control_consume(Path(run["run_dir"]), run["coordinator"], through=3)
+    handoff.control_consume(Path(run["run_dir"]), run["orchestrator"], through=3)
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
@@ -418,8 +418,8 @@ def test_partial_consumption_redoorbells_remainder_and_full_consumption_clears(t
     assert state["doorbell_pending"] is False
 
 
-def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
-    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+def test_orchestrator_doorbell_routes_exact_opaque_target(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
     class Tmux:
@@ -451,20 +451,20 @@ def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
         lambda thread_id, body: calls.append(("native_app", thread_id, body)),
     )
 
-    tmux_method = handoffctl._notify_coordinator({
-        "coordinator_id": coordinator_id,
+    tmux_method = handoffctl._notify_orchestrator({
+        "coordinator_id": orchestrator_id,
         "transport": "tmux",
         "target": {"handle": "session:3.7"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
-    cmux_method = handoffctl._notify_coordinator({
-        "coordinator_id": coordinator_id,
+    cmux_method = handoffctl._notify_orchestrator({
+        "coordinator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
-    native_method = handoffctl._notify_coordinator({
-        "coordinator_id": coordinator_id,
+    native_method = handoffctl._notify_orchestrator({
+        "coordinator_id": orchestrator_id,
         "transport": "native_app",
         "target": {"thread_id": "thread-exact"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -473,17 +473,17 @@ def test_coordinator_doorbell_routes_exact_opaque_target(monkeypatch):
     assert tmux_method == "terminal_input"
     assert cmux_method == "cmux_input+cmux_notify"
     assert native_method == "native_app"
-    assert calls[0] == ("tmux", "session:3.7", coordinator_id)
-    assert calls[1] == ("cmux_input", "workspace:9", "surface-uuid", coordinator_id)
-    assert calls[2] == ("cmux", "workspace:9", "surface-uuid", coordinator_id)
+    assert calls[0] == ("tmux", "session:3.7", orchestrator_id)
+    assert calls[1] == ("cmux_input", "workspace:9", "surface-uuid", orchestrator_id)
+    assert calls[2] == ("cmux", "workspace:9", "surface-uuid", orchestrator_id)
     assert calls[3][0:2] == ("native_app", "thread-exact")
-    assert coordinator_id in calls[3][2]
+    assert orchestrator_id in calls[3][2]
     assert "run-secret" not in calls[3][2]
     assert "seq 9" not in calls[3][2]
 
 
-def test_coordinator_cmux_falls_back_to_workspace_notification(monkeypatch):
-    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+def test_orchestrator_cmux_falls_back_to_workspace_notification(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
     class Cmux:
@@ -507,8 +507,8 @@ def test_coordinator_cmux_falls_back_to_workspace_notification(monkeypatch):
         lambda owner: "alive",
     )
 
-    method = handoffctl._notify_coordinator({
-        "coordinator_id": coordinator_id,
+    method = handoffctl._notify_orchestrator({
+        "coordinator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -516,13 +516,13 @@ def test_coordinator_cmux_falls_back_to_workspace_notification(monkeypatch):
 
     assert method == "cmux_notify_workspace"
     assert calls == [(
-        "workspace:9", None, "Handoff coordinator pending",
-        "Worker updates are ready for coordinator review.",
+        "workspace:9", None, "Handoff orchestrator pending",
+        "Worker updates are ready for orchestrator review.",
     )]
 
 
-def test_coordinator_cmux_uses_macos_notification_when_cmux_notifications_fail(monkeypatch):
-    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+def test_orchestrator_cmux_uses_macos_notification_when_cmux_notifications_fail(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
     class Cmux:
@@ -551,8 +551,8 @@ def test_coordinator_cmux_uses_macos_notification_when_cmux_notifications_fail(m
         lambda title, body: calls.append((title, body)),
     )
 
-    method = handoffctl._notify_coordinator({
-        "coordinator_id": coordinator_id,
+    method = handoffctl._notify_orchestrator({
+        "coordinator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -560,13 +560,13 @@ def test_coordinator_cmux_uses_macos_notification_when_cmux_notifications_fail(m
 
     assert method == "macos_notification"
     assert calls == [(
-        "Handoff coordinator pending",
-        "Worker updates are ready for coordinator review.",
+        "Handoff orchestrator pending",
+        "Worker updates are ready for orchestrator review.",
     )]
 
 
-def test_coordinator_cmux_reports_combined_error_when_every_channel_fails(monkeypatch):
-    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+def test_orchestrator_cmux_reports_combined_error_when_every_channel_fails(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
 
     class Cmux:
         def __init__(self, binary):
@@ -595,8 +595,8 @@ def test_coordinator_cmux_reports_combined_error_when_every_channel_fails(monkey
     monkeypatch.setattr(handoffctl, "_notify_macos", fail_macos)
 
     with pytest.raises(handoff_launcher.AdapterError) as captured:
-        handoffctl._notify_coordinator({
-            "coordinator_id": coordinator_id,
+        handoffctl._notify_orchestrator({
+            "coordinator_id": orchestrator_id,
             "transport": "cmux",
             "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
             "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -609,8 +609,8 @@ def test_coordinator_cmux_reports_combined_error_when_every_channel_fails(monkey
     assert "osascript unavailable" in message
 
 
-def test_coordinator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch):
-    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+def test_orchestrator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
 
     class Cmux:
         def __init__(self, binary):
@@ -631,8 +631,8 @@ def test_coordinator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch)
         lambda owner: "alive",
     )
 
-    method = handoffctl._notify_coordinator({
-        "coordinator_id": coordinator_id,
+    method = handoffctl._notify_orchestrator({
+        "coordinator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -641,8 +641,8 @@ def test_coordinator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch)
     assert method == "cmux_notify"
 
 
-def test_coordinator_cmux_confirmed_input_survives_notification_failure(monkeypatch):
-    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+def test_orchestrator_cmux_confirmed_input_survives_notification_failure(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
 
     class Cmux:
         def __init__(self, binary):
@@ -670,8 +670,8 @@ def test_coordinator_cmux_confirmed_input_survives_notification_failure(monkeypa
         lambda title, body: pytest.fail("macOS fallback must not fire after agent push"),
     )
 
-    method = handoffctl._notify_coordinator({
-        "coordinator_id": coordinator_id,
+    method = handoffctl._notify_orchestrator({
+        "coordinator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -682,9 +682,9 @@ def test_coordinator_cmux_confirmed_input_survives_notification_failure(monkeypa
 
 def test_watcher_records_doorbell_channel_and_clears_it_on_failure(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     awaiting_review(run, "secret body")
     now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
@@ -714,7 +714,7 @@ def test_watcher_records_doorbell_channel_and_clears_it_on_failure(tmp_path):
 
 
 def test_run_state_from_an_older_snapshot_without_doorbell_method(tmp_path):
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     value = handoff_watcher.read(state_path)
     legacy = handoff_watcher._empty_run_state()  # noqa: SLF001 - state fixture
     del legacy["last_doorbell_method"]
@@ -729,9 +729,9 @@ def test_pending_uses_hot_path_and_full_context_only_for_recovery(
 ):
     registry = tmp_path / "registry.json"
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     first = checkpoint(run, "first")
     second = awaiting_review(run, "second")
@@ -742,9 +742,9 @@ def test_pending_uses_hot_path_and_full_context_only_for_recovery(
             handoff.HandoffError("push unavailable", 6)
         ),
     )
-    handoff.control_consume(Path(run["run_dir"]), run["coordinator"], through=1)
+    handoff.control_consume(Path(run["run_dir"]), run["orchestrator"], through=1)
 
-    hot = handoffctl._coordinator_pending(state_path, full_context=False)
+    hot = handoffctl._orchestrator_pending(state_path, full_context=False)
     assert hot["mode"] == "hot"
     assert hot["pending"][0]["notification"]["last_doorbell_error"] == "push unavailable"
     assert "kickoff" not in hot["pending"][0]["detail"]
@@ -755,7 +755,7 @@ def test_pending_uses_hot_path_and_full_context_only_for_recovery(
         event["message_id"] for event in hot["pending"][0]["detail"]["unread_outbox"]
     }
 
-    recovery = handoffctl._coordinator_pending(state_path, full_context=True)
+    recovery = handoffctl._orchestrator_pending(state_path, full_context=True)
     assert recovery["mode"] == "recovery"
     assert "task for worker" in recovery["pending"][0]["detail"]["kickoff"]
     assert recovery["pending"][0]["detail"]["unread_outbox"][0]["seq"] == 2
@@ -763,8 +763,8 @@ def test_pending_uses_hot_path_and_full_context_only_for_recovery(
 
 def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
-    run = registered_run(tmp_path, registry, name="worker", coordinator_id=None)
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(tmp_path, registry, name="worker", orchestrator_id=None)
     awaiting_review(run, "unowned")
     calls = []
 
@@ -788,9 +788,9 @@ def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
 def test_awaiting_review_result_rings_once_then_acknowledge_stops_reringing(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     awaiting_review(run, "result body")
     calls = []
@@ -805,7 +805,7 @@ def test_awaiting_review_result_rings_once_then_acknowledge_stops_reringing(tmp_
     assert calls == [{run["run"]["run_id"]: 1}]
 
     # Loading the run's events records an acknowledgment cursor.
-    handoffctl._coordinator_pending(state_path, full_context=False)
+    handoffctl._orchestrator_pending(state_path, full_context=False)
     acked = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
     assert acked["acknowledged_through"] == 1
 
@@ -826,9 +826,9 @@ def test_awaiting_review_result_rings_once_then_acknowledge_stops_reringing(tmp_
 def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     awaiting_review(run, "first")
     calls = []
@@ -840,7 +840,7 @@ def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
         notifier=lambda value, coverage: calls.append(dict(coverage)),
         now=now,
     )
-    handoffctl._coordinator_pending(state_path, full_context=False)
+    handoffctl._orchestrator_pending(state_path, full_context=False)
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
@@ -863,12 +863,12 @@ def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
 def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     first = registered_run(
-        tmp_path, registry, name="first", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="first", orchestrator_id=owner["coordinator_id"],
     )
     second = registered_run(
-        tmp_path, registry, name="second", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="second", orchestrator_id=owner["coordinator_id"],
     )
     awaiting_review(first, "first body")
     awaiting_review(second, "second body")
@@ -884,7 +884,7 @@ def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
     assert calls == [{first["run"]["run_id"]: 1, second["run"]["run_id"]: 1}]
 
     # One pending call acknowledges every surfaced worker at its own cursor.
-    handoffctl._coordinator_pending(state_path, full_context=False)
+    handoffctl._orchestrator_pending(state_path, full_context=False)
     runs = handoff_watcher.read(state_path)["runs"]
     assert runs[first["run"]["run_id"]]["acknowledged_through"] == 1
     assert runs[second["run"]["run_id"]]["acknowledged_through"] == 1
@@ -904,7 +904,7 @@ def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
 
 
 def test_acknowledge_is_monotonic_and_ignores_unknown_runs(tmp_path):
-    state_path, _ = coordinator_state(tmp_path)
+    state_path, _ = orchestrator_state(tmp_path)
     value = handoff_watcher.read(state_path)
     value["runs"] = {"run-1": handoff_watcher._empty_run_state()}  # noqa: SLF001
     handoff_watcher._atomic_write(state_path, value)  # noqa: SLF001
@@ -920,7 +920,7 @@ def test_acknowledge_is_monotonic_and_ignores_unknown_runs(tmp_path):
 
 
 def test_run_state_from_a_snapshot_without_acknowledged_through(tmp_path):
-    state_path, _ = coordinator_state(tmp_path)
+    state_path, _ = orchestrator_state(tmp_path)
     value = handoff_watcher.read(state_path)
     legacy = handoff_watcher._empty_run_state()  # noqa: SLF001 - state fixture
     del legacy["acknowledged_through"]
@@ -941,9 +941,9 @@ def test_run_state_accepts_snapshots_with_and_without_dismissed_through():
 
 def test_working_checkpoint_does_not_ring(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     checkpoint(run, "ordinary progress")
     calls = []
@@ -960,9 +960,9 @@ def test_working_checkpoint_does_not_ring(tmp_path):
 
 def test_blocked_question_rerings_after_acknowledge_until_worker_resumes(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     question = blocked(run)
     calls = []
@@ -984,13 +984,13 @@ def test_blocked_question_rerings_after_acknowledge_until_worker_resumes(tmp_pat
 
     handoff.send(
         Path(run["run_dir"]),
-        run["coordinator"],
+        run["orchestrator"],
         type="answer",
         body="Use the recommended option.",
         reply_to=question["message"]["message_id"],
     )
     worker_checkpoint(
-        run, "resumed after coordinator answer", inbox_cursor=1,
+        run, "resumed after orchestrator answer", inbox_cursor=1,
     )
     handoff_watcher.poll(
         state_path,
@@ -1008,16 +1008,16 @@ def test_blocked_question_rerings_after_acknowledge_until_worker_resumes(tmp_pat
 @pytest.mark.parametrize("state", ["succeeded", "stopped"])
 def test_terminal_worker_state_does_not_ring(tmp_path, state):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     if state == "succeeded":
         result = awaiting_review(run)
-        handoff.control_consume(Path(run["run_dir"]), run["coordinator"], through=1)
+        handoff.control_consume(Path(run["run_dir"]), run["orchestrator"], through=1)
         handoff.send(
             Path(run["run_dir"]),
-            run["coordinator"],
+            run["orchestrator"],
             type="review",
             data={"disposition": "accepted"},
             reply_to=result["message"]["message_id"],
@@ -1025,7 +1025,7 @@ def test_terminal_worker_state_does_not_ring(tmp_path, state):
     else:
         handoff.send(
             Path(run["run_dir"]),
-            run["coordinator"],
+            run["orchestrator"],
             type="stop",
             body="Stop this worker.",
             data={"reason": "No longer needed"},
@@ -1046,9 +1046,9 @@ def test_terminal_worker_state_does_not_ring(tmp_path, state):
 
 def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", coordinator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
     )
     blocked(run)
     calls = []
@@ -1075,7 +1075,7 @@ def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
         data={
             "blocking": False,
             "stage": "implementation",
-            "current_activity": "Still awaiting coordinator direction",
+            "current_activity": "Still awaiting orchestrator direction",
             "inbox_cursor": 0,
             "commitments": [],
         },
@@ -1096,7 +1096,7 @@ def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
 
 def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
-    state_path, owner = coordinator_state(tmp_path)
+    state_path, owner = orchestrator_state(tmp_path)
     handoff_registry.register(
         path=registry,
         run_id="remote-run",
@@ -1112,7 +1112,7 @@ def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, m
         model="gpt-test",
         effort="high",
         credential_dir=None,
-        coordinator_id=owner["coordinator_id"],
+        orchestrator_id=owner["coordinator_id"],
     )
     commands = []
 

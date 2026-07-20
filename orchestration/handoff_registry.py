@@ -1,4 +1,4 @@
-"""Private coordinator-side registry for durable handoff runs."""
+"""Private orchestrator-side registry for durable handoff runs."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def _validate_record(record: Any) -> dict[str, Any]:
     }
     legacy_required = required - {"coordinator_id"}
     if set(record) == legacy_required:
-        # Registry v1 predated detached coordinator ownership.  Existing
+        # Registry v1 predated detached orchestrator ownership.  Existing
         # records remain deliberately unowned until an explicit adoption.
         record = {**record, "coordinator_id": None}
     if set(record) != required:
@@ -66,10 +66,10 @@ def _validate_record(record: Any) -> dict[str, Any]:
         try:
             parsed = uuid.UUID(record["coordinator_id"])
         except ValueError as exc:
-            raise handoff.HandoffError("registry coordinator_id must be a UUIDv4", 5) from exc
+            raise handoff.HandoffError("registry orchestrator_id must be a UUIDv4", 5) from exc
         if parsed.version != 4 or str(parsed) != record["coordinator_id"]:
             raise handoff.HandoffError(
-                "registry coordinator_id must be a lowercase canonical UUIDv4", 5,
+                "registry orchestrator_id must be a lowercase canonical UUIDv4", 5,
             )
     cursor = record["observed_outbox_cursor"]
     if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
@@ -139,7 +139,7 @@ def register(
     *, run_id: str, name: str, run_dir: str, run_uri: str, host: str | None,
     remote_python: str | None, transport: str, session_transport: str, handle: str,
     agent: str, model: str, effort: str | None, credential_dir: str | None,
-    coordinator_id: str | None = None,
+    orchestrator_id: str | None = None,
     path: Path | None = None,
 ) -> dict[str, Any]:
     registry_path = Path(path or default_path())
@@ -148,11 +148,11 @@ def register(
         previous = registry["runs"].get(run_id)
         if (
             previous is not None
-            and coordinator_id is not None
-            and coordinator_id != previous["coordinator_id"]
+            and orchestrator_id is not None
+            and orchestrator_id != previous["coordinator_id"]
         ):
             raise handoff.HandoffError(
-                "an existing registry record can change coordinator only through explicit adoption",
+                "an existing registry record can change orchestrator only through explicit adoption",
                 4,
             )
         record = _validate_record({
@@ -170,7 +170,7 @@ def register(
             "effort": effort,
             "credential_dir": credential_dir,
             "coordinator_id": (
-                previous["coordinator_id"] if previous else coordinator_id
+                previous["coordinator_id"] if previous else orchestrator_id
             ),
             "observed_outbox_cursor": previous["observed_outbox_cursor"] if previous else 0,
             "registered_at": previous["registered_at"] if previous else _timestamp(),
@@ -180,10 +180,10 @@ def register(
         return dict(record)
 
 
-def adopt(run_id: str, coordinator_id: str, *, path: Path | None = None) -> dict[str, Any]:
-    """Explicitly associate an unowned run with one coordinator session."""
-    if not isinstance(coordinator_id, str) or not coordinator_id:
-        raise handoff.HandoffError("coordinator_id must be a non-empty string", 2)
+def adopt(run_id: str, orchestrator_id: str, *, path: Path | None = None) -> dict[str, Any]:
+    """Explicitly associate an unowned run with one orchestrator session."""
+    if not isinstance(orchestrator_id, str) or not orchestrator_id:
+        raise handoff.HandoffError("orchestrator_id must be a non-empty string", 2)
     registry_path = Path(path or default_path())
     with _locked(registry_path, exclusive=True):
         registry = _read_unlocked(registry_path)
@@ -191,11 +191,11 @@ def adopt(run_id: str, coordinator_id: str, *, path: Path | None = None) -> dict
             raise handoff.HandoffError(f"unknown handoff run: {run_id}", 4)
         record = registry["runs"][run_id]
         owner = record["coordinator_id"]
-        if owner not in {None, coordinator_id}:
+        if owner not in {None, orchestrator_id}:
             raise handoff.HandoffError(
-                f"handoff run {run_id} belongs to another coordinator", 4,
+                f"handoff run {run_id} belongs to another orchestrator", 4,
             )
-        record["coordinator_id"] = coordinator_id
+        record["coordinator_id"] = orchestrator_id
         _write_unlocked(registry_path, registry)
         return dict(record)
 

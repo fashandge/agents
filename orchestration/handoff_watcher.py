@@ -1,4 +1,4 @@
-"""Credential-free detached watcher state for coordinator sessions."""
+"""Credential-free detached watcher state for orchestrator sessions."""
 
 from __future__ import annotations
 
@@ -34,37 +34,37 @@ OwnerProcessStatus = Literal["alive", "dead", "unknown"]
 OwnerProcessProbe = Callable[[dict[str, Any]], OwnerProcessStatus]
 
 
-def _coordinator_id(value: Any) -> str:
+def _orchestrator_id(value: Any) -> str:
     if not isinstance(value, str):
-        raise handoff.HandoffError("coordinator_id must be a UUIDv4 string", 5)
+        raise handoff.HandoffError("orchestrator_id must be a UUIDv4 string", 5)
     try:
         parsed = uuid.UUID(value)
     except (ValueError, AttributeError) as exc:
-        raise handoff.HandoffError("coordinator_id must be a UUIDv4 string", 5) from exc
+        raise handoff.HandoffError("orchestrator_id must be a UUIDv4 string", 5) from exc
     if parsed.version != 4 or str(parsed) != value:
-        raise handoff.HandoffError("coordinator_id must be a lowercase canonical UUIDv4", 5)
+        raise handoff.HandoffError("orchestrator_id must be a lowercase canonical UUIDv4", 5)
     return value
 
 
 def _target(transport: Any, target: Any) -> dict[str, str]:
     if not isinstance(target, dict):
-        raise handoff.HandoffError("coordinator target must be an object", 5)
+        raise handoff.HandoffError("orchestrator target must be an object", 5)
     fields = {
         "cmux": {"workspace", "surface"},
         "tmux": {"handle"},
         "native_app": {"thread_id"},
     }
     if transport not in fields or set(target) != fields[transport]:
-        raise handoff.HandoffError("coordinator target does not match its transport", 5)
+        raise handoff.HandoffError("orchestrator target does not match its transport", 5)
     if not all(isinstance(value, str) and value for value in target.values()):
-        raise handoff.HandoffError("coordinator target fields must be non-empty strings", 5)
+        raise handoff.HandoffError("orchestrator target fields must be non-empty strings", 5)
     if transport == "cmux":
         try:
             surface = uuid.UUID(target["surface"])
         except ValueError as exc:
-            raise handoff.HandoffError("cmux coordinator surface must be a UUID", 5) from exc
+            raise handoff.HandoffError("cmux orchestrator surface must be a UUID", 5) from exc
         if str(surface) != target["surface"]:
-            raise handoff.HandoffError("cmux coordinator surface must be canonical lowercase", 5)
+            raise handoff.HandoffError("cmux orchestrator surface must be canonical lowercase", 5)
     return dict(target)
 
 
@@ -93,19 +93,19 @@ def _process_start_time(pid: int) -> str:
 
 def _owner_process(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"pid", "started_at"}:
-        raise handoff.HandoffError("invalid coordinator owner process", 5)
+        raise handoff.HandoffError("invalid orchestrator owner process", 5)
     pid = value["pid"]
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
-        raise handoff.HandoffError("coordinator owner PID must be greater than one", 5)
+        raise handoff.HandoffError("orchestrator owner PID must be greater than one", 5)
     if not isinstance(value["started_at"], str) or not value["started_at"]:
-        raise handoff.HandoffError("coordinator owner start time must be non-empty", 5)
+        raise handoff.HandoffError("orchestrator owner start time must be non-empty", 5)
     return dict(value)
 
 
 def capture_owner_process(pid: int) -> dict[str, Any]:
     """Capture a PID plus start token so later PID reuse is detectable."""
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
-        raise handoff.HandoffError("coordinator owner PID must be greater than one", 2)
+        raise handoff.HandoffError("orchestrator owner PID must be greater than one", 2)
     return {"pid": pid, "started_at": _process_start_time(pid)}
 
 
@@ -141,20 +141,20 @@ def _run_state(value: Any) -> dict[str, Any]:
     # fields existed remain readable.
     optional = {"last_doorbell_method", "acknowledged_through", "dismissed_through"}
     if not isinstance(value, dict) or not required <= set(value) <= required | optional:
-        raise handoff.HandoffError("invalid coordinator run notification state", 5)
+        raise handoff.HandoffError("invalid orchestrator run notification state", 5)
     for field in (
         "observed_through", "doorbell_through", "control_through",
         "doorbell_after_cursor",
     ):
         counter = value[field]
         if isinstance(counter, bool) or not isinstance(counter, int) or counter < 0:
-            raise handoff.HandoffError(f"coordinator run {field} must be non-negative", 5)
+            raise handoff.HandoffError(f"orchestrator run {field} must be non-negative", 5)
     acknowledged = value.get("acknowledged_through", 0)
     if isinstance(acknowledged, bool) or not isinstance(acknowledged, int) or acknowledged < 0:
-        raise handoff.HandoffError("coordinator run acknowledged_through must be non-negative", 5)
+        raise handoff.HandoffError("orchestrator run acknowledged_through must be non-negative", 5)
     dismissed = value.get("dismissed_through", 0)
     if isinstance(dismissed, bool) or not isinstance(dismissed, int) or dismissed < 0:
-        raise handoff.HandoffError("coordinator run dismissed_through must be non-negative", 5)
+        raise handoff.HandoffError("orchestrator run dismissed_through must be non-negative", 5)
     if value["doorbell_through"] > value["observed_through"]:
         raise handoff.HandoffError("doorbell cursor exceeds observed cursor", 5)
     if not isinstance(value["doorbell_pending"], bool):
@@ -171,17 +171,17 @@ def _validate(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
         "version", "coordinator_id", "transport", "target", "owner_process", "runs",
     }:
-        raise handoff.HandoffError("invalid coordinator watcher snapshot", 5)
+        raise handoff.HandoffError("invalid orchestrator watcher snapshot", 5)
     if value["version"] != STATE_VERSION:
-        raise handoff.HandoffError("unsupported coordinator watcher state version", 5)
-    _coordinator_id(value["coordinator_id"])
+        raise handoff.HandoffError("unsupported orchestrator watcher state version", 5)
+    _orchestrator_id(value["coordinator_id"])
     _target(value["transport"], value["target"])
     _owner_process(value["owner_process"])
     if not isinstance(value["runs"], dict):
-        raise handoff.HandoffError("coordinator watcher runs must be an object", 5)
+        raise handoff.HandoffError("orchestrator watcher runs must be an object", 5)
     for run_id, run_state in value["runs"].items():
         if not isinstance(run_id, str) or not run_id:
-            raise handoff.HandoffError("coordinator watcher run IDs must be non-empty", 5)
+            raise handoff.HandoffError("orchestrator watcher run IDs must be non-empty", 5)
         _run_state(run_state)
     return value
 
@@ -189,7 +189,7 @@ def _validate(value: Any) -> dict[str, Any]:
 def _state_path(path: Path) -> Path:
     path = Path(path)
     if not path.is_absolute():
-        raise handoff.HandoffError("coordinator state path must be absolute", 2)
+        raise handoff.HandoffError("orchestrator state path must be absolute", 2)
     return path
 
 
@@ -213,7 +213,7 @@ def _write_new(path: Path, value: dict[str, Any]) -> None:
             os.link(temporary, path)
         except FileExistsError as exc:
             raise handoff.HandoffError(
-                f"coordinator state already exists: {path}", 4,
+                f"orchestrator state already exists: {path}", 4,
             ) from exc
         os.chmod(path, 0o600)
         Path(temporary).unlink()
@@ -247,13 +247,13 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
 
 def initialize(
     path: Path, *, transport: str, target: dict[str, str],
-    owner_pid: int, coordinator_id: str | None = None,
+    owner_pid: int, orchestrator_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create one private coordinator-session watcher snapshot."""
+    """Create one private orchestrator-session watcher snapshot."""
     path = _state_path(path)
     value = _validate({
         "version": STATE_VERSION,
-        "coordinator_id": coordinator_id or str(uuid.uuid4()),
+        "coordinator_id": orchestrator_id or str(uuid.uuid4()),
         "transport": transport,
         "target": target,
         "owner_process": capture_owner_process(owner_pid),
@@ -264,11 +264,11 @@ def initialize(
 
 
 def retarget(path: Path, target: dict[str, str]) -> dict[str, Any]:
-    """Replace a stopped coordinator's transport target without dropping runs."""
+    """Replace a stopped orchestrator's transport target without dropping runs."""
     path = _state_path(path)
     if is_running(path):
         raise handoff.HandoffError(
-            "cannot retarget a running coordinator watcher; stop it first", 4,
+            "cannot retarget a running orchestrator watcher; stop it first", 4,
         )
     value = read(path)
     value["target"] = _target(value["transport"], target)
@@ -281,7 +281,7 @@ def read(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise handoff.HandoffError(f"cannot read coordinator state {path}: {exc}", 6) from exc
+        raise handoff.HandoffError(f"cannot read orchestrator state {path}: {exc}", 6) from exc
     try:
         return _validate(handoff._decode_json(raw, path))  # noqa: SLF001
     except handoff.HandoffError:
@@ -290,7 +290,7 @@ def read(path: Path) -> dict[str, Any]:
 
 @contextlib.contextmanager
 def instance_lock(path: Path) -> Iterator[None]:
-    """Hold the coordinator state's singleton lock for one watcher lifetime."""
+    """Hold the orchestrator state's singleton lock for one watcher lifetime."""
     path = _state_path(path)
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -302,7 +302,7 @@ def instance_lock(path: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise handoff.HandoffError(
-                f"coordinator watcher is already running for {read(path)['coordinator_id']}", 4,
+                f"orchestrator watcher is already running for {read(path)['coordinator_id']}", 4,
             ) from exc
         yield
     finally:
@@ -364,9 +364,9 @@ def _empty_run_state() -> dict[str, Any]:
 
 
 def acknowledge(path: Path, acks: dict[str, int]) -> dict[str, Any]:
-    """Record that the coordinator has loaded each run's events through a seq.
+    """Record that the orchestrator has loaded each run's events through a seq.
 
-    ``coordinator pending`` calls this after surfacing a run's unread outbox so
+    ``orchestrator pending`` calls this after surfacing a run's unread outbox so
     the watcher stops re-ringing events the orchestrator has already seen.  The
     cursor only advances (monotonic ``max``); a strictly newer ``observed_through``
     still doorbells.
@@ -397,9 +397,9 @@ def acknowledge(path: Path, acks: dict[str, int]) -> dict[str, Any]:
 
 
 def dismiss(path: Path, dismissals: dict[str, int]) -> dict[str, Any]:
-    """Record that the coordinator has dismissed each run's events through a seq.
+    """Record that the orchestrator has dismissed each run's events through a seq.
 
-    ``coordinator dismiss`` calls this without consuming the protocol outbox so
+    ``orchestrator dismiss`` calls this without consuming the protocol outbox so
     the watcher stops ringing for the current worker state.  The cursor only
     advances (monotonic ``max``); a strictly newer ``observed_through`` still
     doorbells.
@@ -565,11 +565,11 @@ def poll(
             continue
         if not blocking and run_state["observed_through"] <= run_state.get("acknowledged_through", 0):
             # The orchestrator has already loaded every observed event via
-            # ``coordinator pending``.  Do not re-ring until a strictly newer
+            # ``orchestrator pending``.  Do not re-ring until a strictly newer
             # event arrives.  Without this gate an unconsumed-but-seen result
             # doorbells forever, because ``doorbell_pending`` stays true until
             # the protocol outbox cursor advances and ``_retry_due`` re-fires
-            # on every interval — even when the coordinator has no lease to
+            # on every interval — even when the orchestrator has no lease to
             # consume with and has already acted on the event.
             continue
         if blocking:

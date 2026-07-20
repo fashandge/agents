@@ -40,13 +40,13 @@ AGENT_DEFAULTS = {
     "codex": ("gpt-5.6-terra", "xhigh"),
     "kimi": ("kimi-code/k3", "max"),
 }
-ORCHESTRATOR_DOORBELL_TITLE = "Handoff coordinator pending"
+ORCHESTRATOR_DOORBELL_TITLE = "Handoff orchestrator pending"
 
 
-def orchestrator_doorbell_body(coordinator_id: str) -> str:
-    """Return the opaque snapshot-pointer text for a coordinator doorbell."""
+def orchestrator_doorbell_body(orchestrator_id: str) -> str:
+    """Return the opaque snapshot-pointer text for an orchestrator doorbell."""
     return (
-        f"Check handoff coordinator {coordinator_id}; "
+        f"Check handoff orchestrator {orchestrator_id}; "
         "pending worker outbox events are recorded."
     )
 
@@ -132,35 +132,35 @@ def _remote_host(value: str) -> str:
     return value
 
 
-def _validate_coordinator_id(value: str | None) -> str | None:
+def _validate_orchestrator_id(value: str | None) -> str | None:
     if value is None:
         return None
     try:
         parsed = uuid.UUID(value)
     except (TypeError, ValueError) as exc:
-        raise handoff.HandoffError("coordinator_id must be a UUIDv4 string", 2) from exc
+        raise handoff.HandoffError("orchestrator_id must be a UUIDv4 string", 2) from exc
     if parsed.version != 4 or str(parsed) != value:
         raise handoff.HandoffError(
-            "coordinator_id must be a lowercase canonical UUIDv4", 2,
+            "orchestrator_id must be a lowercase canonical UUIDv4", 2,
         )
     return value
 
 
-def _coordinator_id_from_state(path: Path | None) -> str | None:
+def _orchestrator_id_from_state(path: Path | None) -> str | None:
     if path is None:
         return None
     path = Path(path)
     if not path.is_absolute():
-        raise handoff.HandoffError("coordinator state path must be absolute", 2)
+        raise handoff.HandoffError("orchestrator state path must be absolute", 2)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        coordinator_id = value["coordinator_id"]
+        orchestrator_id = value["coordinator_id"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-        raise handoff.HandoffError(f"invalid coordinator state {path}: {exc}", 5) from exc
+        raise handoff.HandoffError(f"invalid orchestrator state {path}: {exc}", 5) from exc
     try:
-        return _validate_coordinator_id(coordinator_id)
+        return _validate_orchestrator_id(orchestrator_id)
     except handoff.HandoffError as exc:
-        raise handoff.HandoffError("coordinator state has an invalid coordinator_id", 5) from exc
+        raise handoff.HandoffError("orchestrator state has an invalid orchestrator_id", 5) from exc
 
 
 def _run_ssh(
@@ -246,8 +246,8 @@ class TmuxAdapter:
     def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
         self._type_tui(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
 
-    def orchestrator_doorbell(self, handle: str, coordinator_id: str) -> None:
-        self._type_tui(handle, orchestrator_doorbell_body(coordinator_id))
+    def orchestrator_doorbell(self, handle: str, orchestrator_id: str) -> None:
+        self._type_tui(handle, orchestrator_doorbell_body(orchestrator_id))
 
     def send_literal(self, handle: str, text: str) -> bool:
         previous_count = _kimi_instruction_count(self.capture(handle), text)
@@ -281,7 +281,7 @@ class CmuxAdapter:
     def launch(self, name: str, cwd: Path, terminal_command: str, workspace: str | None = None) -> str:
         if not workspace:
             # ``current-workspace`` follows cmux's globally selected workspace,
-            # which can differ from the workspace that owns this coordinator's
+            # which can differ from the workspace that owns this orchestrator's
             # terminal.  The inherited ID is scoped to that exact terminal, so
             # prefer it for worker placement.
             workspace = os.environ.get("CMUX_WORKSPACE_ID")
@@ -349,24 +349,24 @@ class CmuxAdapter:
     def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
         self._type_tui(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
 
-    def orchestrator_doorbell(self, handle: str, coordinator_id: str) -> None:
+    def orchestrator_doorbell(self, handle: str, orchestrator_id: str) -> None:
         """Raise the surface's native visible alert rather than typing input.
 
         A zero exit from ``cmux send`` only proves the socket accepted the
         write; code-mode and desktop-backed agent surfaces never echo that
         input, so a typed doorbell is silently lost while looking
         successful.  ``cmux notify`` raises a user-visible alert on any
-        surface type.  Interactive terminal coordinators reachable through
+        surface type.  Interactive terminal orchestrators reachable through
         tmux keep the raw-input path on :class:`TmuxAdapter`.
         """
         self.notify(
             handle,
             title=ORCHESTRATOR_DOORBELL_TITLE,
-            body=orchestrator_doorbell_body(coordinator_id),
+            body=orchestrator_doorbell_body(orchestrator_id),
         )
 
-    def orchestrator_doorbell_input(self, handle: str, coordinator_id: str) -> bool:
-        """Type the doorbell into the coordinator surface and confirm the echo.
+    def orchestrator_doorbell_input(self, handle: str, orchestrator_id: str) -> bool:
+        """Type the doorbell into the orchestrator surface and confirm the echo.
 
         A visible alert never pushes a surface-hosted agent to act; typed
         input into an interactive agent TUI does — the text lands in the
@@ -375,7 +375,7 @@ class CmuxAdapter:
         with a zero exit and silently drop it, so the send counts as delivered
         only when the doorbell text is visible on the surface afterward.
         """
-        body = orchestrator_doorbell_body(coordinator_id)
+        body = orchestrator_doorbell_body(orchestrator_id)
         self._type_tui(handle, body)
         return _compact_terminal_text(body) in _compact_terminal_text(self.capture(handle))
 
@@ -585,12 +585,12 @@ def launch(
     workspace: str | None = None, inputs: list[str] | None = None,
     state_root: Path | None = None, run_dir: Path | None = None,
     readiness_timeout: float = 120.0, cmux_binary: str = CMUX_DEFAULT,
-    confirm_ready: bool = False, retain_coordinator: bool = False,
+    confirm_ready: bool = False, retain_orchestrator: bool = False,
     credential_dir: Path | None = None, recorded_transport: str | None = None,
-    coordinator_id: str | None = None,
+    orchestrator_id: str | None = None,
 ) -> dict[str, Any]:
     cwd = Path(cwd).resolve(strict=True); kickoff = Path(kickoff).resolve(strict=True)
-    coordinator_id = _validate_coordinator_id(coordinator_id)
+    orchestrator_id = _validate_orchestrator_id(orchestrator_id)
     if agent not in AGENT_DEFAULTS:
         raise handoff.HandoffError("agent must be claude, codex, or kimi", 2)
     default_model, default_effort = AGENT_DEFAULTS[agent]
@@ -615,7 +615,7 @@ def launch(
         workspace=cwd, kickoff=kickoff, harness=agent, model=recorded_model, effort=effort,
         transport=protocol_transport, inputs=inputs or [], state_root=state_root, run_dir=run_dir,
         recovery_token_file=private_dir / "recovery.token",
-        coordinator_token_file=private_dir / "coordinator.token",
+        orchestrator_token_file=private_dir / "coordinator.token",
         worker_token_file=private_dir / "worker.token",
     )
     actual_run_dir = Path(initialized["run_dir"])
@@ -660,11 +660,11 @@ def launch(
         ready = wait_ready(adapter, handle, agent, actual_run_dir, timeout=readiness_timeout)
         if not ready:
             rescue = adapter.rescue_command(handle)
-    coordinator_released = False
-    if not retain_coordinator:
-        coordinator_token = (private_dir / "coordinator.token").read_bytes()
-        handoff.control_release(actual_run_dir, coordinator_token)
-        coordinator_released = True
+    orchestrator_released = False
+    if not retain_orchestrator:
+        orchestrator_token = (private_dir / "coordinator.token").read_bytes()
+        handoff.control_release(actual_run_dir, orchestrator_token)
+        orchestrator_released = True
     result = {
         "run_id": initialized["run"]["run_id"],
         "run_dir": str(actual_run_dir), "transport": protocol_transport,
@@ -673,7 +673,7 @@ def launch(
         "worker_ready": ready,
         "kickoff_sent": bool(agent != "kimi" or kickoff_sent),
         "goal_sent": bool(agent != "kimi" and goal_file.is_file() and ready),
-        "coordinator_released": coordinator_released,
+        "orchestrator_released": orchestrator_released,
         "rescue_command": rescue,
     }
     try:
@@ -683,7 +683,7 @@ def launch(
             transport=protocol_transport, session_transport=backend, handle=handle,
             agent=agent, model=recorded_model, effort=effort,
             credential_dir=str(private_dir),
-            coordinator_id=coordinator_id,
+            orchestrator_id=orchestrator_id,
         )
         result["registry_recorded"] = True
     except (handoff.HandoffError, OSError) as exc:
@@ -737,7 +737,7 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
     for field in ("model", "effort"):
         if request[field] is not None and not isinstance(request[field], str):
             raise handoff.HandoffError(f"remote {field} must be a string or null", 2)
-    request["coordinator_id"] = _validate_coordinator_id(request["coordinator_id"])
+    request["coordinator_id"] = _validate_orchestrator_id(request["coordinator_id"])
     if not isinstance(request["pmode"], str) or not request["pmode"]:
         raise handoff.HandoffError("remote pmode must be a non-empty string", 2)
     if not isinstance(request["inputs"], list) or not all(isinstance(item, str) for item in request["inputs"]):
@@ -771,9 +771,9 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
             inputs=request["inputs"], state_root=state_root, run_dir=run_dir,
             readiness_timeout=float(request["readiness_timeout"]),
             confirm_ready=request["confirm_ready"],
-            retain_coordinator=request["retain_coordinator"],
+            retain_orchestrator=request["retain_coordinator"],
             credential_dir=credential_dir, recorded_transport="ssh_tmux",
-            coordinator_id=request["coordinator_id"],
+            orchestrator_id=request["coordinator_id"],
         )
     finally:
         shutil.rmtree(source_dir, ignore_errors=True)
@@ -789,16 +789,16 @@ def launch_remote(
     effort: str | None = None, pmode: str = "bypassPermissions",
     inputs: list[str] | None = None, state_root: Path | None = None,
     run_dir: Path | None = None, readiness_timeout: float = 120.0,
-    confirm_ready: bool = False, retain_coordinator: bool = False,
-    credential_dir: Path | None = None, coordinator_id: str | None = None,
+    confirm_ready: bool = False, retain_orchestrator: bool = False,
+    credential_dir: Path | None = None, orchestrator_id: str | None = None,
 ) -> dict[str, Any]:
     """Launch through an installed copy of this module on an SSH host."""
     host = _remote_host(host)
-    coordinator_id = _validate_coordinator_id(coordinator_id)
+    orchestrator_id = _validate_orchestrator_id(orchestrator_id)
     kickoff = Path(kickoff).resolve(strict=True)
     remote_cwd = _remote_path(str(remote_cwd), "cwd", required=True)
     credential_dir = _remote_path(str(credential_dir), "credential_dir") if credential_dir is not None else None
-    if retain_coordinator and credential_dir is None:
+    if retain_orchestrator and credential_dir is None:
         raise handoff.HandoffError(
             "managed remote launch requires HANDOFF_REMOTE_CREDENTIAL_DIR", 2,
         )
@@ -817,9 +817,9 @@ def launch_remote(
         "run_dir": str(run_dir) if run_dir is not None else None,
         "readiness_timeout": readiness_timeout,
         "confirm_ready": confirm_ready,
-        "retain_coordinator": retain_coordinator,
+        "retain_coordinator": retain_orchestrator,
         "credential_dir": str(credential_dir) if credential_dir is not None else None,
-        "coordinator_id": coordinator_id,
+        "coordinator_id": orchestrator_id,
     }
     remote_argv = [
         remote_python, "-m", "agents.orchestration.handoff_launcher",
@@ -864,7 +864,7 @@ def launch_remote(
             model=result.get("model") or model or AGENT_DEFAULTS[agent][0],
             effort=result.get("effort") or effort or AGENT_DEFAULTS[agent][1],
             credential_dir=None,
-            coordinator_id=coordinator_id,
+            orchestrator_id=orchestrator_id,
         )
         result["registry_recorded"] = True
     except (handoff.HandoffError, OSError) as exc:
@@ -920,13 +920,14 @@ def build_parser() -> argparse.ArgumentParser:
     destination.add_argument("--state-root", type=Path); destination.add_argument("--run-dir", type=Path)
     parser.add_argument("--readiness-timeout", type=float, default=120.0)
     parser.add_argument("--wait-ready", action="store_true", help="wait for the worker-ready checkpoint")
-    parser.add_argument("--retain-coordinator", action="store_true", help="retain the coordinator lease for active monitoring")
+    parser.add_argument("--retain-orchestrator", "--retain-coordinator", dest="retain_orchestrator", action="store_true", help="retain the orchestrator lease for active monitoring")
     parser.add_argument("--cmux-binary", default=CMUX_DEFAULT)
     parser.add_argument(
-        "--coordinator-state", type=Path,
+        "--orchestrator-state", "--coordinator-state", dest="orchestrator_state",
+        type=Path,
         default=Path(os.environ["HANDOFF_COORDINATOR_STATE"])
         if os.environ.get("HANDOFF_COORDINATOR_STATE") else None,
-        help="private coordinator watcher snapshot that owns this launched run",
+        help="private orchestrator watcher snapshot that owns this launched run",
     )
     return parser
 
@@ -944,7 +945,7 @@ def main(argv: list[str] | None = None) -> int:
             return exit_code
     try:
         args = build_parser().parse_args(actual_argv)
-        coordinator_id = _coordinator_id_from_state(args.coordinator_state)
+        orchestrator_id = _orchestrator_id_from_state(args.orchestrator_state)
         if args.remote_host:
             remote_cwd = args.remote_cwd or args.cwd
             if remote_cwd is None:
@@ -958,9 +959,9 @@ def main(argv: list[str] | None = None) -> int:
                 agent=args.agent, model=args.model, effort=args.effort, pmode=args.pmode,
                 inputs=args.input, state_root=args.state_root, run_dir=args.run_dir,
                 readiness_timeout=args.readiness_timeout, confirm_ready=args.wait_ready,
-                retain_coordinator=args.retain_coordinator,
+                retain_orchestrator=args.retain_orchestrator,
                 credential_dir=Path(configured_remote_private) if configured_remote_private else None,
-                coordinator_id=coordinator_id,
+                orchestrator_id=orchestrator_id,
             )
         else:
             result = launch(
@@ -969,8 +970,8 @@ def main(argv: list[str] | None = None) -> int:
                 workspace=args.workspace, inputs=args.input, state_root=args.state_root,
                 run_dir=args.run_dir, readiness_timeout=args.readiness_timeout,
                 cmux_binary=args.cmux_binary, confirm_ready=args.wait_ready,
-                retain_coordinator=args.retain_coordinator,
-                coordinator_id=coordinator_id,
+                retain_orchestrator=args.retain_orchestrator,
+                orchestrator_id=orchestrator_id,
             )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         if result["rescue_command"]:

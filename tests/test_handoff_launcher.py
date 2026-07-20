@@ -217,13 +217,13 @@ def test_cmux_workspace_notification_omits_an_unwritable_surface(monkeypatch):
 
     adapter.notify(
         None,
-        title="Handoff coordinator pending",
-        body="Worker updates are ready for coordinator review.",
+        title="Handoff orchestrator pending",
+        body="Worker updates are ready for orchestrator review.",
     )
 
     assert calls == [[
-        "cmux", "notify", "--title", "Handoff coordinator pending", "--body",
-        "Worker updates are ready for coordinator review.", "--workspace", "workspace:9",
+        "cmux", "notify", "--title", "Handoff orchestrator pending", "--body",
+        "Worker updates are ready for orchestrator review.", "--workspace", "workspace:9",
     ]]
 
 
@@ -243,9 +243,9 @@ def test_cmux_orchestrator_doorbell_uses_visible_notification_not_terminal_input
     )
 
     assert calls == [[
-        "cmux", "notify", "--title", "Handoff coordinator pending",
+        "cmux", "notify", "--title", "Handoff orchestrator pending",
         "--body",
-        "Check handoff coordinator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
+        "Check handoff orchestrator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
         "pending worker outbox events are recorded.",
         "--workspace", "workspace:9", "--surface", "surface-uuid",
     ]]
@@ -253,7 +253,7 @@ def test_cmux_orchestrator_doorbell_uses_visible_notification_not_terminal_input
 
 def test_cmux_orchestrator_doorbell_input_requires_visible_echo(monkeypatch):
     body = (
-        "Check handoff coordinator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
+        "Check handoff orchestrator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
         "pending worker outbox events are recorded."
     )
     filler = "\n".join(f"transcript line {index}" for index in range(12))
@@ -303,7 +303,7 @@ def test_tmux_orchestrator_doorbell_retains_terminal_input(monkeypatch):
     )
 
     body = (
-        "Check handoff coordinator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
+        "Check handoff orchestrator b071b964-8bc9-4af3-bbe7-46d6c36e27f9; "
         "pending worker outbox events are recorded."
     )
     assert calls == [
@@ -633,7 +633,7 @@ def test_kimi_launch_passes_full_startup_timeout(tmp_path, monkeypatch):
     assert result["rescue_command"] == "capture"
 
 
-def test_launch_only_returns_without_readiness_wait_and_releases_coordinator(tmp_path, monkeypatch):
+def test_launch_only_returns_without_readiness_wait_and_releases_orchestrator(tmp_path, monkeypatch):
     class Adapter:
         def launch(self, name, cwd, terminal_command, workspace):
             return "worker-handle"
@@ -654,20 +654,20 @@ def test_launch_only_returns_without_readiness_wait_and_releases_coordinator(tmp
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launch-only must not wait")),
     )
 
-    coordinator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     result = handoff_launcher.launch(
         name="fast", kickoff=kickoff, cwd=workspace, agent="codex", backend="tmux",
-        state_root=tmp_path / "state", coordinator_id=coordinator_id,
+        state_root=tmp_path / "state", orchestrator_id=orchestrator_id,
     )
 
     assert result["worker_ready"] is None
-    assert result["coordinator_released"] is True
+    assert result["orchestrator_released"] is True
     assert result["kickoff_sent"] is True
     assert result["registry_recorded"] is True
     registered = handoff_registry.resolve(result["run_id"])
     assert registered["credential_dir"] == str(private)
     assert registered["handle"] == "worker-handle"
-    assert registered["coordinator_id"] == coordinator_id
+    assert registered["coordinator_id"] == orchestrator_id
     assert (private / "coordinator.token").is_file()
     control = handoff_launcher.handoff.control_show(Path(result["run_dir"]))
     assert handoff_launcher.handoff._parse_time(control["coordinator_lease_expires_at"]) <= handoff_launcher.handoff._now()
@@ -688,10 +688,10 @@ def test_managed_launch_uses_exact_private_directory_and_retains_lease(tmp_path,
 
     result = handoff_launcher.launch(
         name="managed", kickoff=kickoff, cwd=workspace, agent="claude", backend="tmux",
-        state_root=tmp_path / "state", retain_coordinator=True,
+        state_root=tmp_path / "state", retain_orchestrator=True,
     )
 
-    assert result["coordinator_released"] is False
+    assert result["orchestrator_released"] is False
     assert {path.name for path in private.iterdir()} >= {
         "coordinator.token", "recovery.token", "worker.token", "launch_worker.py", "launch.json",
     }
@@ -808,7 +808,7 @@ def test_launch_remote_sends_json_over_stdin_and_returns_remote_uri(tmp_path, mo
             "session_transport": "tmux",
             "handle": "remote-worker",
             "agent": "claude",
-            "coordinator_released": True,
+            "orchestrator_released": True,
             "rescue_command": None,
         }) + "\n")
 
@@ -855,7 +855,7 @@ def test_managed_remote_launch_requires_known_remote_credential_directory(tmp_pa
     try:
         handoff_launcher.launch_remote(
             host="oci-box", remote_python="python3", name="worker",
-            kickoff=kickoff, remote_cwd=Path("/srv/repo"), retain_coordinator=True,
+            kickoff=kickoff, remote_cwd=Path("/srv/repo"), retain_orchestrator=True,
         )
     except handoff_launcher.handoff.HandoffError as exc:
         assert "HANDOFF_REMOTE_CREDENTIAL_DIR" in str(exc)

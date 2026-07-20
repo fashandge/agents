@@ -42,7 +42,7 @@ def registered_run(tmp_path, monkeypatch):
         transport="tmux",
         run_dir=tmp_path / "state" / "run-one",
         recovery_token_file=private / "recovery.token",
-        coordinator_token_file=private / "coordinator.token",
+        orchestrator_token_file=private / "coordinator.token",
         worker_token_file=private / "worker.token",
     )
     registry = tmp_path / "registry.json"
@@ -58,7 +58,7 @@ def registered_run(tmp_path, monkeypatch):
         **initialized,
         "private": private,
         "worker": (private / "worker.token").read_bytes(),
-        "coordinator": (private / "coordinator.token").read_bytes(),
+        "orchestrator": (private / "coordinator.token").read_bytes(),
     }
 
 
@@ -74,7 +74,7 @@ def test_cli_init_read_send_and_status(tmp_path):
         "--harness", "claude", "--model", "opus", "--transport", "tmux",
         "--run-dir", run_dir,
         "--recovery-token-file", private / "recovery",
-        "--coordinator-token-file", private / "coordinator",
+        "--orchestrator-token-file", private / "orchestrator",
         "--worker-token-file", private / "worker",
     )
     assert init.returncode == 0, init.stderr
@@ -83,7 +83,7 @@ def test_cli_init_read_send_and_status(tmp_path):
     body.write_text("literal ; $(touch NEVER)")
     sent = run_cli(
         "send", "--run-dir", run_dir, "--type", "steer",
-        "--token-file", private / "coordinator", "--body-file", body,
+        "--token-file", private / "orchestrator", "--body-file", body,
     )
     assert sent.returncode == 0, sent.stderr
     assert json.loads(sent.stdout)["message"]["body"] == body.read_text()
@@ -99,7 +99,7 @@ def test_cli_doctor_prints_report_and_exits_five_on_corruption(tmp_path):
     init = run_cli(
         "init", "--workspace", workspace, "--kickoff", kickoff,
         "--harness", "codex", "--model", "m", "--transport", "tmux", "--run-dir", run_dir,
-        "--recovery-token-file", private / "r", "--coordinator-token-file", private / "c",
+        "--recovery-token-file", private / "r", "--orchestrator-token-file", private / "c",
         "--worker-token-file", private / "w",
     )
     assert init.returncode == 0
@@ -120,7 +120,7 @@ def test_cli_ready_publishes_one_idempotent_startup_checkpoint(tmp_path):
     init = run_cli(
         "init", "--workspace", workspace, "--kickoff", kickoff,
         "--harness", "codex", "--model", "m", "--transport", "tmux", "--run-dir", run_dir,
-        "--recovery-token-file", private / "recovery", "--coordinator-token-file", private / "coordinator",
+        "--recovery-token-file", private / "recovery", "--orchestrator-token-file", private / "orchestrator",
         "--worker-token-file", private / "worker",
     )
     assert init.returncode == 0, init.stderr
@@ -194,7 +194,7 @@ def test_cmux_result_notification_targets_worker_surface(tmp_path, monkeypatch):
             [
                 "cmux", "notify", "--surface", "surface-uuid",
                 "--title", "Handoff result ready",
-                "--body", "Awaiting coordinator review",
+                "--body", "Awaiting orchestrator review",
             ],
             {
                 "check": False,
@@ -256,7 +256,7 @@ def test_fast_dispatch_supersedes_result_rings_doorbell_and_releases(tmp_path, m
             "verification": [], "commitments": [],
         },
     )
-    handoff.control_release(run_dir, run["coordinator"])
+    handoff.control_release(run_dir, run["orchestrator"])
     doorbells = []
 
     class Adapter:
@@ -270,11 +270,11 @@ def test_fast_dispatch_supersedes_result_rings_doorbell_and_releases(tmp_path, m
     assert dispatched["superseded_result"] == result["message"]["message_id"]
     assert dispatched["message"]["type"] == "supersede"
     assert dispatched["doorbell_sent"] is True
-    assert dispatched["coordinator_released"] is True
+    assert dispatched["orchestrator_released"] is True
     assert doorbells == [(
         "weather-worker", run["run"]["run_id"], dispatched["message"]["seq"],
     )]
-    assert not list(run["private"].glob("coordinator-dispatch-*.token"))
+    assert not list(run["private"].glob("orchestrator-dispatch-*.token"))
     resumed = handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="resumed",
         data={
@@ -302,7 +302,7 @@ def test_fast_dispatch_answers_blocking_question(tmp_path, monkeypatch):
             "inbox_cursor": 0, "commitments": [],
         },
     )
-    handoff.control_release(run_dir, run["coordinator"])
+    handoff.control_release(run_dir, run["orchestrator"])
     doorbells = []
 
     class Adapter:
@@ -318,11 +318,11 @@ def test_fast_dispatch_answers_blocking_question(tmp_path, monkeypatch):
     assert dispatched["message"]["reply_to"] == question["message"]["message_id"]
     assert dispatched["superseded_result"] is None
     assert dispatched["doorbell_sent"] is True
-    assert dispatched["coordinator_released"] is True
+    assert dispatched["orchestrator_released"] is True
     assert doorbells == [(
         "weather-worker", run["run"]["run_id"], dispatched["message"]["seq"],
     )]
-    assert not list(run["private"].glob("coordinator-dispatch-*.token"))
+    assert not list(run["private"].glob("orchestrator-dispatch-*.token"))
     resumed = handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="resumed",
         data={
@@ -334,7 +334,7 @@ def test_fast_dispatch_answers_blocking_question(tmp_path, monkeypatch):
     assert resumed["status"]["blocked_on"] == []
 
 
-def test_failed_dispatch_releases_ephemeral_coordinator(tmp_path, monkeypatch):
+def test_failed_dispatch_releases_ephemeral_orchestrator(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])
     result = handoff.emit(
@@ -344,9 +344,9 @@ def test_failed_dispatch_releases_ephemeral_coordinator(tmp_path, monkeypatch):
             "verification": [], "commitments": [],
         },
     )
-    handoff.control_consume(run_dir, run["coordinator"], through=1)
+    handoff.control_consume(run_dir, run["orchestrator"], through=1)
     review = handoff.send(
-        run_dir, run["coordinator"], type="review",
+        run_dir, run["orchestrator"], type="review",
         reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
     )
     handoff.emit(
@@ -356,14 +356,14 @@ def test_failed_dispatch_releases_ephemeral_coordinator(tmp_path, monkeypatch):
             "inbox_cursor": review["message"]["seq"], "commitments": [],
         },
     )
-    handoff.control_release(run_dir, run["coordinator"])
+    handoff.control_release(run_dir, run["orchestrator"])
 
     with pytest.raises(handoff.HandoffError, match="cannot accept a new instruction"):
         handoffctl._dispatch_registered("weather", "do something else")
 
     control = handoff.control_show(run_dir)
     assert handoff._parse_time(control["coordinator_lease_expires_at"]) <= handoff._now()
-    assert not list(run["private"].glob("coordinator-dispatch-*.token"))
+    assert not list(run["private"].glob("orchestrator-dispatch-*.token"))
 
 
 def _send_args(run_dir, token_file, body_file, *, no_doorbell=False):
@@ -430,7 +430,7 @@ def test_send_unregistered_run_skips_doorbell(tmp_path, monkeypatch):
         workspace=workspace, kickoff=kickoff, harness="claude", model="opus",
         effort="low", transport="tmux", run_dir=tmp_path / "state" / "run",
         recovery_token_file=private / "recovery.token",
-        coordinator_token_file=private / "coordinator.token",
+        orchestrator_token_file=private / "coordinator.token",
         worker_token_file=private / "worker.token",
     )
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
@@ -500,9 +500,9 @@ def test_remote_dispatch_uses_one_structured_ssh_request(tmp_path, monkeypatch):
 
 
 def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path):
-    state = tmp_path / "coordinator" / "watcher.json"
+    state = tmp_path / "orchestrator" / "watcher.json"
     registered = run_cli(
-        "coordinator", "register", "--state", state,
+        "orchestrator", "register", "--state", state,
         "--transport", "tmux", "--target", "orchestrator:0.4",
         "--owner-pid", os.getpid(),
     )
@@ -510,30 +510,53 @@ def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path):
     value = json.loads(registered.stdout)
     assert value["target"] == {"handle": "orchestrator:0.4"}
 
-    shown = run_cli("coordinator", "show", "--state", state)
+    shown = run_cli("orchestrator", "show", "--state", state)
     assert shown.returncode == 0, shown.stderr
     assert json.loads(shown.stdout) == value
 
     conflict = run_cli(
-        "watch", "--coordinator-state", state, "--once",
+        "watch", "--orchestrator-state", state, "--once",
     )
     assert conflict.returncode == 2
     assert "cannot be combined" in conflict.stderr
 
 
-def test_cli_coordinator_dismiss_resolves_registered_run_and_writes_cursor(
-    tmp_path, monkeypatch,
-):
-    run = registered_run(tmp_path, monkeypatch)
-    state = tmp_path / "coordinator" / "watcher.json"
+def test_cli_coordinator_alias_still_resolves(tmp_path):
+    state = tmp_path / "orchestrator" / "watcher.json"
     registered = run_cli(
         "coordinator", "register", "--state", state,
         "--transport", "tmux", "--target", "orchestrator:0.4",
         "--owner-pid", os.getpid(),
+        "--coordinator-id", "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
     )
     assert registered.returncode == 0, registered.stderr
-    coordinator_id = json.loads(registered.stdout)["coordinator_id"]
-    handoff_registry.adopt(run["run"]["run_id"], coordinator_id)
+    assert (
+        json.loads(registered.stdout)["coordinator_id"]
+        == "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    )
+
+    shown = run_cli("coordinator", "show", "--state", state)
+    assert shown.returncode == 0, shown.stderr
+    assert json.loads(shown.stdout) == json.loads(registered.stdout)
+
+    conflict = run_cli("watch", "--coordinator-state", state, "--once")
+    assert conflict.returncode == 2
+    assert "cannot be combined" in conflict.stderr
+
+
+def test_cli_orchestrator_dismiss_resolves_registered_run_and_writes_cursor(
+    tmp_path, monkeypatch,
+):
+    run = registered_run(tmp_path, monkeypatch)
+    state = tmp_path / "orchestrator" / "watcher.json"
+    registered = run_cli(
+        "orchestrator", "register", "--state", state,
+        "--transport", "tmux", "--target", "orchestrator:0.4",
+        "--owner-pid", os.getpid(),
+    )
+    assert registered.returncode == 0, registered.stderr
+    orchestrator_id = json.loads(registered.stdout)["coordinator_id"]
+    handoff_registry.adopt(run["run"]["run_id"], orchestrator_id)
     handoff.emit(
         Path(run["run_dir"]),
         run["worker"],
@@ -553,12 +576,12 @@ def test_cli_coordinator_dismiss_resolves_registered_run_and_writes_cursor(
     )
 
     dismissed = run_cli(
-        "coordinator", "dismiss", "--state", state, "--run", "weather",
+        "orchestrator", "dismiss", "--state", state, "--run", "weather",
     )
 
     assert dismissed.returncode == 0, dismissed.stderr
     assert json.loads(dismissed.stdout) == {
-        "coordinator_id": coordinator_id,
+        "coordinator_id": orchestrator_id,
         "dismissed": {
             "run_id": run["run"]["run_id"],
             "dismissed_through": 1,
@@ -571,7 +594,7 @@ def test_cli_coordinator_dismiss_resolves_registered_run_and_writes_cursor(
 
 def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monkeypatch):
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
-    state = tmp_path / "coordinator" / "watcher.json"
+    state = tmp_path / "orchestrator" / "watcher.json"
     owner = subprocess.Popen(
         [PYTHON, "-c", "import time; time.sleep(30)"],
         stdout=subprocess.DEVNULL,
@@ -579,14 +602,14 @@ def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monke
     )
     try:
         registered = run_cli(
-            "coordinator", "register", "--state", state,
+            "orchestrator", "register", "--state", state,
             "--transport", "tmux", "--target", "orchestrator:0.4",
             "--owner-pid", owner.pid,
         )
         assert registered.returncode == 0, registered.stderr
 
         started = run_cli(
-            "coordinator", "start", "--state", state, "--interval", 0.05,
+            "orchestrator", "start", "--state", state, "--interval", 0.05,
         )
         assert started.returncode == 0, started.stderr
         first = json.loads(started.stdout)
@@ -595,7 +618,7 @@ def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monke
         assert first["pid"] > 1
 
         reused = run_cli(
-            "coordinator", "start", "--state", state, "--interval", 0.05,
+            "orchestrator", "start", "--state", state, "--interval", 0.05,
         )
         assert reused.returncode == 0, reused.stderr
         second = json.loads(reused.stdout)
@@ -616,9 +639,9 @@ def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monke
             owner.wait(timeout=5)
 
 
-def test_cmux_coordinator_start_hosts_watcher_in_dedicated_surface(tmp_path, monkeypatch):
+def test_cmux_orchestrator_start_hosts_watcher_in_dedicated_surface(tmp_path, monkeypatch):
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
-    state = tmp_path / "coordinator" / "watcher.json"
+    state = tmp_path / "orchestrator" / "watcher.json"
     handle = "01923456-89ab-4cde-8f01-23456789abcd"
     launches = []
     watchers = []
@@ -663,10 +686,10 @@ def test_cmux_coordinator_start_hosts_watcher_in_dedicated_surface(tmp_path, mon
         monkeypatch.setattr(handoffctl, "_workspace_title", lambda binary, workspace: "agents")
         monkeypatch.setattr(
             handoffctl, "_watcher_tab_name",
-            lambda binary, workspace, title, coordinator_id: f"watcher: {title}",
+            lambda binary, workspace, title, orchestrator_id: f"watcher: {title}",
         )
 
-        first = handoffctl._start_coordinator_watcher(
+        first = handoffctl._start_orchestrator_watcher(
             state, 0.05, mode="auto", cmux_binary="/exact/cmux",
         )
         assert first["mode"] == "surface"
@@ -674,18 +697,18 @@ def test_cmux_coordinator_start_hosts_watcher_in_dedicated_surface(tmp_path, mon
         assert first["running"] is True
         assert first["surface"] == handle
         assert first["workspace"] == hosting
-        assert first["coordinator_workspace"] == "workspace:9"
+        assert first["orchestrator_workspace"] == "workspace:9"
         assert launches == [{
             "binary": "/exact/cmux",
             "name": "watcher: agents",
             "command": "exec " + shlex.join([
                 sys.executable, "-m", "agents.orchestration.handoffctl",
-                "watch", "--coordinator-state", str(state), "--interval", "0.05",
+                "watch", "--orchestrator-state", str(state), "--interval", "0.05",
             ]),
             "workspace": hosting,
         }]
 
-        reused = handoffctl._start_coordinator_watcher(
+        reused = handoffctl._start_orchestrator_watcher(
             state, 0.05, mode="auto", cmux_binary="/exact/cmux",
         )
         assert reused["started"] is False
@@ -708,7 +731,7 @@ def test_cmux_coordinator_start_hosts_watcher_in_dedicated_surface(tmp_path, mon
 
 
 def test_surface_watcher_start_timeout_reports_rescue_command(tmp_path, monkeypatch):
-    state = tmp_path / "coordinator" / "watcher.json"
+    state = tmp_path / "orchestrator" / "watcher.json"
     handoff_watcher.initialize(
         state,
         transport="cmux",
@@ -735,15 +758,15 @@ def test_surface_watcher_start_timeout_reports_rescue_command(tmp_path, monkeypa
     monkeypatch.setattr(handoffctl, "_workspace_title", lambda binary, workspace: None)
 
     with pytest.raises(handoff.HandoffError, match="read-screen 01923456"):
-        handoffctl._start_coordinator_watcher(state, 0.05)
+        handoffctl._start_orchestrator_watcher(state, 0.05)
 
 
 def test_watcher_workspace_reuses_or_creates_the_parked_bottom_workspace(monkeypatch):
     hosting = "11111111-2222-4333-8444-555555555555"
-    coordinator = "afa9c531-4d04-4f12-8e06-e97facc4fe2e"
+    orchestrator = "afa9c531-4d04-4f12-8e06-e97facc4fe2e"
     state = {"listing": (
         "  workspace:1 18AA46FA-7CC9-4676-AAC5-B190559B34C7  stock picker\n"
-        f"* workspace:9 {coordinator.upper()}  agents  [selected]\n"
+        f"* workspace:9 {orchestrator.upper()}  agents  [selected]\n"
     )}
     calls = []
 
@@ -765,7 +788,7 @@ def test_watcher_workspace_reuses_or_creates_the_parked_bottom_workspace(monkeyp
 
     monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
 
-    assert handoffctl._workspace_title("/exact/cmux", coordinator.upper()) == "agents"
+    assert handoffctl._workspace_title("/exact/cmux", orchestrator.upper()) == "agents"
 
     created = handoffctl._watcher_workspace("/exact/cmux")
     assert created == hosting
@@ -775,7 +798,7 @@ def test_watcher_workspace_reuses_or_creates_the_parked_bottom_workspace(monkeyp
     ] in calls
     assert [
         "/exact/cmux", "reorder-workspace", "--workspace", hosting,
-        "--after", coordinator,
+        "--after", orchestrator,
     ] in calls
 
     creations = len(calls)
@@ -783,8 +806,8 @@ def test_watcher_workspace_reuses_or_creates_the_parked_bottom_workspace(monkeyp
     assert [argv for argv in calls[creations:] if "new-workspace" in argv] == []
 
 
-def test_surface_watcher_mode_requires_cmux_coordinator(tmp_path):
-    state = tmp_path / "coordinator" / "watcher.json"
+def test_surface_watcher_mode_requires_cmux_orchestrator(tmp_path):
+    state = tmp_path / "orchestrator" / "watcher.json"
     handoff_watcher.initialize(
         state,
         transport="tmux",
@@ -792,14 +815,14 @@ def test_surface_watcher_mode_requires_cmux_coordinator(tmp_path):
         owner_pid=os.getpid(),
     )
 
-    result = run_cli("coordinator", "start", "--state", state, "--mode", "surface")
+    result = run_cli("orchestrator", "start", "--state", state, "--mode", "surface")
 
     assert result.returncode == 2
-    assert "requires a cmux coordinator" in result.stderr
+    assert "requires a cmux orchestrator" in result.stderr
 
 
 def test_watcher_tab_name_disambiguates_only_on_collision(monkeypatch):
-    coordinator_id = "de7f8206-f9c7-49c2-b1d1-a266c577cb61"
+    orchestrator_id = "de7f8206-f9c7-49c2-b1d1-a266c577cb61"
     surfaces = {"stdout": "  surface:1 UUID  other tab\n"}
 
     class Completed:
@@ -813,31 +836,31 @@ def test_watcher_tab_name_disambiguates_only_on_collision(monkeypatch):
     )
 
     assert handoffctl._watcher_tab_name(
-        "/exact/cmux", "workspace-uuid", "agents", coordinator_id,
+        "/exact/cmux", "workspace-uuid", "agents", orchestrator_id,
     ) == "watcher: agents"
 
     surfaces["stdout"] += "  surface:2 UUID  watcher: agents\n"
     assert handoffctl._watcher_tab_name(
-        "/exact/cmux", "workspace-uuid", "agents", coordinator_id,
+        "/exact/cmux", "workspace-uuid", "agents", orchestrator_id,
     ) == "watcher: agents (de7f8206)"
 
     assert handoffctl._watcher_tab_name(
-        "/exact/cmux", "workspace-uuid", None, coordinator_id,
-    ) == "watcher: coordinator de7f8206"
+        "/exact/cmux", "workspace-uuid", None, orchestrator_id,
+    ) == "watcher: orchestrator de7f8206"
 
 
-def test_coordinator_poll_printer_logs_only_doorbell_activity(capsys):
-    handoffctl._print_coordinator_poll(
+def test_orchestrator_poll_printer_logs_only_doorbell_activity(capsys):
+    handoffctl._print_orchestrator_poll(
         {"attempted": {}, "errors": [], "pending": {}},
     )
     assert capsys.readouterr().out == ""
 
     active = {"attempted": {"run-1": 3}, "errors": [], "pending": {"run-1": 3}}
-    handoffctl._print_coordinator_poll(active)
+    handoffctl._print_orchestrator_poll(active)
     assert json.loads(capsys.readouterr().out) == active
 
 
-def test_cmux_coordinator_registration_uses_the_orchestrator_environment(tmp_path, monkeypatch):
+def test_cmux_orchestrator_registration_uses_the_orchestrator_environment(tmp_path, monkeypatch):
     surface = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     monkeypatch.setenv("CMUX_SURFACE_ID", surface.upper())
     monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace:orchestrator")
@@ -846,7 +869,7 @@ def test_cmux_coordinator_registration_uses_the_orchestrator_environment(tmp_pat
         "_run",
         lambda *args, **kwargs: pytest.fail("cmux inventory should not be consulted"),
     )
-    state = tmp_path / "coordinator" / "watcher.json"
+    state = tmp_path / "orchestrator" / "watcher.json"
     args = Namespace(
         state=state,
         transport="cmux",
@@ -854,10 +877,10 @@ def test_cmux_coordinator_registration_uses_the_orchestrator_environment(tmp_pat
         surface=None,
         cmux_binary="/exact/cmux",
         owner_pid=os.getpid(),
-        coordinator_id=None,
+        orchestrator_id=None,
     )
 
-    value = handoffctl._register_coordinator(args)
+    value = handoffctl._register_orchestrator(args)
 
     assert value["target"] == {
         "workspace": "workspace:orchestrator",
@@ -865,7 +888,7 @@ def test_cmux_coordinator_registration_uses_the_orchestrator_environment(tmp_pat
     }
 
 
-def test_cmux_coordinator_registration_finds_an_explicit_surface_workspace(tmp_path, monkeypatch):
+def test_cmux_orchestrator_registration_finds_an_explicit_surface_workspace(tmp_path, monkeypatch):
     class Completed:
         def __init__(self, stdout="", returncode=0):
             self.stdout = stdout
@@ -889,7 +912,7 @@ def test_cmux_coordinator_registration_finds_an_explicit_surface_workspace(tmp_p
     monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
     monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
-    state = tmp_path / "coordinator" / "watcher.json"
+    state = tmp_path / "orchestrator" / "watcher.json"
     args = Namespace(
         state=state,
         transport="cmux",
@@ -897,26 +920,26 @@ def test_cmux_coordinator_registration_finds_an_explicit_surface_workspace(tmp_p
         surface=surface,
         cmux_binary="/exact/cmux",
         owner_pid=os.getpid(),
-        coordinator_id=None,
+        orchestrator_id=None,
     )
 
-    value = handoffctl._register_coordinator(args)
+    value = handoffctl._register_orchestrator(args)
 
     assert value["target"] == {"workspace": "workspace:9", "surface": surface}
 
 
 def test_cli_explicitly_adopts_unowned_registry_run(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
-    state = tmp_path / "coordinator" / "watcher.json"
+    state = tmp_path / "orchestrator" / "watcher.json"
     registered = run_cli(
-        "coordinator", "register", "--state", state,
+        "orchestrator", "register", "--state", state,
         "--transport", "tmux", "--target", "orchestrator:0.4",
         "--owner-pid", os.getpid(),
     )
     assert registered.returncode == 0, registered.stderr
 
     adopted = run_cli(
-        "runs", "adopt", "--run", "weather", "--coordinator-state", state,
+        "runs", "adopt", "--run", "weather", "--orchestrator-state", state,
     )
 
     assert adopted.returncode == 0, adopted.stderr

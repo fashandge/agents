@@ -28,14 +28,14 @@ def run(tmp_path):
         transport="tmux",
         run_dir=tmp_path / "external state" / str(uuid.uuid4()),
         recovery_token_file=credentials / "recovery",
-        coordinator_token_file=credentials / "coordinator",
+        orchestrator_token_file=credentials / "orchestrator",
         worker_token_file=credentials / "worker",
     )
     return {
         **result,
         "workspace": workspace,
         "recovery": (credentials / "recovery").read_bytes(),
-        "coordinator": (credentials / "coordinator").read_bytes(),
+        "orchestrator": (credentials / "orchestrator").read_bytes(),
         "worker": (credentials / "worker").read_bytes(),
     }
 
@@ -95,7 +95,7 @@ def git_run(tmp_path, *, dirty):
         transport="tmux",
         run_dir=tmp_path / "state" / str(uuid.uuid4()),
         recovery_token_file=credentials / "recovery",
-        coordinator_token_file=credentials / "coordinator",
+        orchestrator_token_file=credentials / "orchestrator",
         worker_token_file=credentials / "worker",
     )
     return {
@@ -120,9 +120,9 @@ def test_init_is_complete_private_and_external_to_workspace(run):
     assert "do not inspect helper source or help first" in (run_dir / "kickoff.md").read_text()
     assert "dirty Git workspace does not block work" in (run_dir / "kickoff.md").read_text()
     contract = (run_dir / "kickoff.md").read_text()
-    assert "delegated worker in a coordinator-managed run" in contract
+    assert "delegated worker in an orchestrator-managed run" in contract
     assert "Route scope changes, cross-worker coordination, final acceptance" in contract
-    assert "coordinator knows the kickoff but not your live progress" in contract
+    assert "orchestrator knows the kickoff but not your live progress" in contract
     assert "Every blocking question must be self-contained" in contract
     for required_context in (
         "current stage and completed work",
@@ -135,7 +135,7 @@ def test_init_is_complete_private_and_external_to_workspace(run):
     ):
         assert required_context in contract
     assert run["run"]["workspace"]["path"] == str(run["workspace"])
-    for kind in ("recovery", "coordinator", "worker"):
+    for kind in ("recovery", "orchestrator", "worker"):
         path = Path(run["credential_files"][kind])
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert path.read_text().strip() not in (run_dir / "control.json").read_text()
@@ -216,7 +216,7 @@ def test_git_result_rejects_stale_head_even_when_dirty_flag_is_truthful(tmp_path
 
 def test_steer_cannot_be_consumed_across_unanswered_blocking_question(run):
     run_dir = Path(run["run_dir"])
-    steer = handoff.send(run_dir, run["coordinator"], type="steer", body="Do A")
+    steer = handoff.send(run_dir, run["orchestrator"], type="steer", body="Do A")
     checkpoint(run, 0)
     question = handoff.emit(
         run_dir,
@@ -228,12 +228,12 @@ def test_steer_cannot_be_consumed_across_unanswered_blocking_question(run):
             "inbox_cursor": steer["message"]["seq"], "commitments": [],
         },
     )
-    handoff.send(run_dir, run["coordinator"], type="steer", body="Unrelated later steer")
+    handoff.send(run_dir, run["orchestrator"], type="steer", body="Unrelated later steer")
     with pytest.raises(handoff.HandoffError, match="unanswered blocking") as caught:
         checkpoint(run, 2)
     assert caught.value.exit_code == 4
     handoff.send(
-        run_dir, run["coordinator"], type="answer", body="Proceed",
+        run_dir, run["orchestrator"], type="answer", body="Proceed",
         reply_to=question["message"]["message_id"],
     )
     result = checkpoint(run, 3)
@@ -248,19 +248,19 @@ def test_result_acceptance_success_and_integration_are_distinct(run):
         run_dir, run["worker"], type="result", body="done",
         data={"head": None, "dirty": True, "stage": "done", "inbox_cursor": 0, "verification": [], "commitments": []},
     )
-    consumed = handoff.control_consume(run_dir, run["coordinator"], through=2)
+    consumed = handoff.control_consume(run_dir, run["orchestrator"], through=2)
     assert result["status"]["state"] == "awaiting_review"
     assert consumed["control"]["review_state"] == "pending"
     assert consumed["control"]["integration"]["state"] == "pending"
     review = handoff.send(
-        run_dir, run["coordinator"], type="review",
+        run_dir, run["orchestrator"], type="review",
         reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
     )
     succeeded = checkpoint(run, review["message"]["seq"], state="succeeded")
     assert succeeded["status"]["state"] == "succeeded"
     assert review["control"]["review_state"] == "accepted"
     assert review["control"]["integration"]["state"] == "pending"
-    integrated = handoff.control_integrate(run_dir, run["coordinator"], commit="integration-commit")
+    integrated = handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
     assert integrated["control"]["integration"]["state"] == "integrated"
 
 
@@ -274,10 +274,10 @@ def test_supersede_resumes_awaiting_review_and_binds_fresh_result(run):
             "verification": [], "commitments": [],
         },
     )
-    handoff.control_consume(run_dir, run["coordinator"], through=2)
+    handoff.control_consume(run_dir, run["orchestrator"], through=2)
 
     supersede = handoff.send(
-        run_dir, run["coordinator"], type="supersede",
+        run_dir, run["orchestrator"], type="supersede",
         reply_to=first["message"]["message_id"], body="refresh the lookup",
     )
     assert supersede["control"]["review_state"] == "superseded"
@@ -293,7 +293,7 @@ def test_supersede_resumes_awaiting_review_and_binds_fresh_result(run):
         },
     )
     consumed = handoff.control_consume(
-        run_dir, run["coordinator"], through=second["message"]["seq"],
+        run_dir, run["orchestrator"], through=second["message"]["seq"],
     )
     assert consumed["control"]["review_state"] == "pending"
     assert consumed["control"]["review_result_id"] == second["message"]["message_id"]
@@ -306,7 +306,7 @@ def test_supersede_requires_current_awaiting_review_result(run):
 
     with pytest.raises(handoff.HandoffError, match="current result"):
         handoff.send(
-            run_dir, run["coordinator"], type="supersede",
+            run_dir, run["orchestrator"], type="supersede",
             reply_to=str(uuid.uuid4()), body="invalid resume",
         )
 
@@ -318,13 +318,13 @@ def test_only_latest_review_disposition_authorizes_worker_transition(run):
         run_dir, run["worker"], type="result", body="candidate",
         data={"head": None, "dirty": True, "stage": "done", "inbox_cursor": 0, "verification": [], "commitments": []},
     )
-    handoff.control_consume(run_dir, run["coordinator"], through=2)
+    handoff.control_consume(run_dir, run["orchestrator"], through=2)
     handoff.send(
-        run_dir, run["coordinator"], type="review", reply_to=result["message"]["message_id"],
+        run_dir, run["orchestrator"], type="review", reply_to=result["message"]["message_id"],
         data={"disposition": "accepted"},
     )
     changed = handoff.send(
-        run_dir, run["coordinator"], type="review", body="one more fix",
+        run_dir, run["orchestrator"], type="review", body="one more fix",
         reply_to=result["message"]["message_id"], data={"disposition": "changes_requested"},
     )
     with pytest.raises(handoff.HandoffError, match="accepted review"):
@@ -347,14 +347,14 @@ def test_message_id_retry_repairs_projection_without_duplicate(run, monkeypatch)
 
     monkeypatch.setattr(handoff, "_atomic_json", crash_once)
     with pytest.raises(OSError, match="simulated crash"):
-        handoff.send(run_dir, run["coordinator"], type="steer", body="retry me", message_id=message_id)
+        handoff.send(run_dir, run["orchestrator"], type="steer", body="retry me", message_id=message_id)
     monkeypatch.setattr(handoff, "_atomic_json", original)
-    retried = handoff.send(run_dir, run["coordinator"], type="steer", body="retry me", message_id=message_id)
+    retried = handoff.send(run_dir, run["orchestrator"], type="steer", body="retry me", message_id=message_id)
     assert retried["message"]["seq"] == 1
     assert retried["control"]["last_command_seq"] == 1
     assert len(handoff.read(run_dir, "inbox")) == 1
     with pytest.raises(handoff.HandoffError, match="different content"):
-        handoff.send(run_dir, run["coordinator"], type="steer", body="different", message_id=message_id)
+        handoff.send(run_dir, run["orchestrator"], type="steer", body="different", message_id=message_id)
 
 
 def test_worker_retry_repairs_status_without_duplicate(run, monkeypatch):
@@ -379,7 +379,7 @@ def test_concurrent_same_role_sends_are_contiguous(run):
     run_dir = Path(run["run_dir"])
 
     def one(index):
-        return handoff.send(run_dir, run["coordinator"], type="steer", body=f"message {index}")["message"]["seq"]
+        return handoff.send(run_dir, run["orchestrator"], type="steer", body=f"message {index}")["message"]["seq"]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         sequences = list(pool.map(one, range(24)))
@@ -390,7 +390,7 @@ def test_concurrent_same_role_sends_are_contiguous(run):
 def test_simultaneous_roles_follow_one_lock_order_without_deadlock(run):
     run_dir = Path(run["run_dir"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        sent = pool.submit(handoff.send, run_dir, run["coordinator"], type="steer", body="parallel steer")
+        sent = pool.submit(handoff.send, run_dir, run["orchestrator"], type="steer", body="parallel steer")
         emitted = pool.submit(checkpoint, run, 0)
         assert sent.result(timeout=5)["message"]["seq"] == 1
         assert emitted.result(timeout=5)["message"]["seq"] == 1
@@ -401,7 +401,7 @@ def test_snapshot_readers_never_observe_partial_atomic_replace(run):
 
     def renew_many():
         for _ in range(50):
-            handoff.control_renew(run_dir, run["coordinator"])
+            handoff.control_renew(run_dir, run["orchestrator"])
 
     revisions = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -414,16 +414,16 @@ def test_snapshot_readers_never_observe_partial_atomic_replace(run):
     assert revisions[-1] == 51
 
 
-def test_takeover_fences_old_coordinator_token(run, tmp_path):
+def test_takeover_fences_old_orchestrator_token(run, tmp_path):
     run_dir = Path(run["run_dir"])
-    handoff.control_release(run_dir, run["coordinator"])
-    replacement = tmp_path / "replacement coordinator"
+    handoff.control_release(run_dir, run["orchestrator"])
+    replacement = tmp_path / "replacement orchestrator"
     takeover = handoff.control_takeover(
         run_dir, run["recovery"], new_token_file=replacement, reason="owner resumed",
     )
     assert takeover["control"]["coordinator_epoch"] == 2
     with pytest.raises(handoff.HandoffError) as caught:
-        handoff.send(run_dir, run["coordinator"], type="steer", body="stale writer")
+        handoff.send(run_dir, run["orchestrator"], type="steer", body="stale writer")
     assert caught.value.exit_code == 3
     fresh = handoff.send(run_dir, replacement.read_bytes(), type="steer", body="fresh writer")
     assert fresh["message"]["writer_epoch"] == 2
@@ -431,7 +431,7 @@ def test_takeover_fences_old_coordinator_token(run, tmp_path):
 
 def test_appended_takeover_can_be_explicitly_repaired(run, tmp_path, monkeypatch):
     run_dir = Path(run["run_dir"])
-    handoff.control_release(run_dir, run["coordinator"])
+    handoff.control_release(run_dir, run["orchestrator"])
     replacement = tmp_path / "replacement after crash"
     original = handoff._atomic_json
     monkeypatch.setattr(handoff, "_atomic_json", lambda path, value: (_ for _ in ()).throw(OSError("projection crash")))
@@ -456,12 +456,12 @@ def test_worker_rotation_crash_repairs_control_then_status(run, tmp_path, monkey
     monkeypatch.setattr(handoff, "_atomic_json", lambda path, value: (_ for _ in ()).throw(OSError("rotation crash")))
     with pytest.raises(OSError, match="rotation crash"):
         handoff.control_rotate_worker(
-            run_dir, run["coordinator"], new_token_file=replacement,
+            run_dir, run["orchestrator"], new_token_file=replacement,
             reason="worker process died", confirmed_dead=True,
         )
     monkeypatch.setattr(handoff, "_atomic_json", original)
     handoff.repair_control(
-        run_dir, run["coordinator"], new_worker_token=replacement.read_bytes(),
+        run_dir, run["orchestrator"], new_worker_token=replacement.read_bytes(),
     )
     report = handoff.repair_status(run_dir, replacement.read_bytes())
     assert report["repaired"]
@@ -471,14 +471,14 @@ def test_worker_rotation_crash_repairs_control_then_status(run, tmp_path, monkey
 
 def test_partial_tail_is_explicitly_repaired_and_midfile_corruption_is_not(run):
     run_dir = Path(run["run_dir"])
-    handoff.send(run_dir, run["coordinator"], type="steer", body="valid")
+    handoff.send(run_dir, run["orchestrator"], type="steer", body="valid")
     with (run_dir / "inbox.jsonl").open("ab") as stream:
         stream.write(b'{"protocol_version":1')
         stream.flush(); os.fsync(stream.fileno())
     report = handoff.doctor(run_dir)
     assert not report["ok"]
     assert any(issue["code"] == "partial-tail" for issue in report["issues"])
-    repaired = handoff.repair_tail(run_dir, "inbox", run["coordinator"])
+    repaired = handoff.repair_tail(run_dir, "inbox", run["orchestrator"])
     assert repaired["repaired"]
     assert len(handoff.read(run_dir, "inbox")) == 1
     assert list((run_dir / "repairs").glob("*-inbox-tail.bin"))
@@ -486,7 +486,7 @@ def test_partial_tail_is_explicitly_repaired_and_midfile_corruption_is_not(run):
     raw = (run_dir / "inbox.jsonl").read_bytes()
     (run_dir / "inbox.jsonl").write_bytes(b"not-json\n" + raw)
     with pytest.raises(handoff.HandoffError, match="before final") as caught:
-        handoff.repair_tail(run_dir, "inbox", run["coordinator"])
+        handoff.repair_tail(run_dir, "inbox", run["orchestrator"])
     assert caught.value.exit_code == 5
 
 
@@ -495,7 +495,7 @@ def test_attachment_snapshot_is_literal_private_and_detects_tampering(run):
     artifact = run["workspace"] / "result ; $HOME.txt"
     artifact.write_text("safe bytes", encoding="utf-8")
     sent = handoff.send(
-        run_dir, run["coordinator"], type="steer", body="inspect literal path",
+        run_dir, run["orchestrator"], type="steer", body="inspect literal path",
         attachments=[artifact.name], snapshot_attachments=True,
     )
     metadata = sent["message"]["attachments"][0]
@@ -503,7 +503,7 @@ def test_attachment_snapshot_is_literal_private_and_detects_tampering(run):
     assert snapshot.read_text() == "safe bytes"
     assert stat.S_IMODE(snapshot.stat().st_mode) == 0o600
     with pytest.raises(handoff.HandoffError):
-        handoff.send(run_dir, run["coordinator"], type="steer", body="escape", attachments=["../escape"])
+        handoff.send(run_dir, run["orchestrator"], type="steer", body="escape", attachments=["../escape"])
     snapshot.write_text("tampered", encoding="utf-8")
     assert any(issue["code"] == "attachment" for issue in handoff.doctor(run_dir)["issues"])
 
@@ -514,12 +514,12 @@ def test_snapshot_attachment_retry_does_not_recopy_or_execute_path(run):
     artifact.write_text("original")
     message_id = str(uuid.uuid4())
     first = handoff.send(
-        run_dir, run["coordinator"], type="steer", body="snapshot",
+        run_dir, run["orchestrator"], type="steer", body="snapshot",
         message_id=message_id, attachments=[artifact.name], snapshot_attachments=True,
     )
     artifact.write_text("later workspace contents")
     retried = handoff.send(
-        run_dir, run["coordinator"], type="steer", body="snapshot",
+        run_dir, run["orchestrator"], type="steer", body="snapshot",
         message_id=message_id, attachments=[artifact.name], snapshot_attachments=True,
     )
     assert retried["message"] == first["message"]

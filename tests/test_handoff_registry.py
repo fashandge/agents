@@ -80,10 +80,10 @@ def test_registry_ownership_changes_only_through_explicit_adoption(tmp_path):
             model="opus",
             effort="low",
             credential_dir="/private/run",
-            coordinator_id=first_id,
+            orchestrator_id=first_id,
         )
 
     adopted = handoff_registry.adopt("run-one", first_id, path=registry)
     assert adopted["coordinator_id"] == first_id
-    with pytest.raises(handoff.HandoffError, match="another coordinator"):
+    with pytest.raises(handoff.HandoffError, match="another orchestrator"):
         handoff_registry.adopt("run-one", second_id, path=registry)

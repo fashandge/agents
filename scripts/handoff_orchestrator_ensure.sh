@@ -1,12 +1,12 @@
 #!/bin/bash
-# handoff_coordinator_ensure.sh — idempotent session-watcher bootstrap for the
+# handoff_orchestrator_ensure.sh — idempotent session-watcher bootstrap for the
 # handoff-agent skill's monitored launch mode. Replaces the hand-executed
-# register+start sequence: creates one private coordinator state file (when
+# register+start sequence: creates one private orchestrator state file (when
 # needed), registers the exact orchestrator target plus owner PID, and starts
 # (or reuses) the singleton watcher.
 #
 # Usage:
-#   handoff_coordinator_ensure.sh --transport cmux|tmux --owner-pid <pid> \
+#   handoff_orchestrator_ensure.sh --transport cmux|tmux --owner-pid <pid> \
 #       [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
 #
 # Behavior:
@@ -14,9 +14,9 @@
 #     (a mode-700 parent is fine), then a private `mktemp -d .../session.XXXXXX`
 #     dir (chmod 700), and use <dir>/watcher.json as the state file.
 #   * --state given and the file already exists: skip registration and only run
-#     `coordinator start`, which returns started:false when the same session
+#     `orchestrator start`, which returns started:false when the same session
 #     watcher is already running — not an error.
-#   * Otherwise run `coordinator register`, then `coordinator start`.
+#   * Otherwise run `orchestrator register`, then `orchestrator start`.
 #
 # Final stdout is exactly one JSON line:
 #   {"state": "<path>", "registered": true|false, "started": true|false}
@@ -31,14 +31,14 @@
 #     in the environment; tmux registration requires --target with the exact
 #     orchestrator tmux handle.
 #   * Keep the printed state path private and reuse it only for the same
-#     orchestrator session; pass it as --coordinator-state to every monitored
+#     orchestrator session; pass it as --orchestrator-state to every monitored
 #     handoff_agent.sh launch.
 #   * This script never accepts or prints token/credential material.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: handoff_coordinator_ensure.sh --transport cmux|tmux --owner-pid <pid> [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
+Usage: handoff_orchestrator_ensure.sh --transport cmux|tmux --owner-pid <pid> [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
 
 Idempotent handoff session-watcher bootstrap: registers the orchestrator
 target once (unless --state already exists), then starts or reuses the
@@ -91,18 +91,18 @@ fi
 
 registered=false
 if [[ -f "$state" ]]; then
-  # Existing registration: skip register; `coordinator start` below reuses the
+  # Existing registration: skip register; `orchestrator start` below reuses the
   # singleton watcher and may report started:false — not an error.
   registered=false
 else
   mkdir -p "$(dirname "$state")"
-  register_args=(coordinator register --state "$state" --transport "$transport" --owner-pid "$owner_pid")
+  register_args=(orchestrator register --state "$state" --transport "$transport" --owner-pid "$owner_pid")
   [[ -z "$target" ]] || register_args+=(--target "$target")
   "${HELPER[@]}" "${register_args[@]}" >/dev/null
   registered=true
 fi
 
-start_out=$("${HELPER[@]}" coordinator start --state "$state" --interval "$interval")
+start_out=$("${HELPER[@]}" orchestrator start --state "$state" --interval "$interval")
 started=$("$PYTHON" -c 'import json,sys; print("true" if json.loads(sys.argv[1]).get("started") else "false")' "$start_out")
 
 "$PYTHON" -c 'import json,sys; print(json.dumps({"state": sys.argv[1], "registered": sys.argv[2] == "true", "started": sys.argv[3] == "true"}))' \
