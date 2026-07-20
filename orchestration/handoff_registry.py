@@ -18,6 +18,7 @@ from agents.orchestration import handoff
 REGISTRY_VERSION = 1
 REGISTRY_ENV = "HANDOFF_REGISTRY_FILE"
 PRIVATE_FIELDS = {"credential_dir"}
+TERMINAL_STATES = {"succeeded", "failed", "stopped"}
 
 
 def default_path() -> Path:
@@ -240,6 +241,218 @@ def update_observed(run_id: str, through: int, *, path: Path | None = None) -> d
         record["observed_outbox_cursor"] = max(record["observed_outbox_cursor"], through)
         _write_unlocked(registry_path, registry)
         return dict(record)
+
+
+def _assess_terminal(record: dict[str, Any]) -> tuple[bool, str | None]:
+    """Decide whether a registered run is known to be over.
+
+    Returns ``(terminal, note)``.  ``note`` explains an inferred verdict: why
+    a dangling pointer counts as terminal, or why liveness cannot be ruled
+    out.  Only a positively terminal status projection or a missing/unreadable
+    run directory counts as terminal; anything else is treated as possibly
+    live so a removal never silently orphans a running worker.
+    """
+    if record["host"] is not None:
+        return False, f"run is remote (host {record['host']!r}); liveness cannot be verified from this host"
+    run_dir = Path(record["run_dir"])
+    if not run_dir.is_dir():
+        return True, "run directory is missing or unreadable; record is a dangling pointer"
+    try:
+        state = handoff.status(run_dir)["state"]
+    except handoff.HandoffError as exc:
+        return False, f"run status is unreadable ({exc}); the run may still be live"
+    if state in TERMINAL_STATES:
+        return True, None
+    return False, f"worker state {state!r} is not terminal"
+
+
+def _read_lenient_unlocked(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """Read the registry, tolerating per-record corruption.
+
+    Returns the raw registry value and a mapping of registry key to validation
+    error for every invalid record.  Top-level corruption — an unreadable
+    file, a wrong shape, an unsupported version — remains fatal, exactly as
+    on the strict read path; only individual records are tolerated, so
+    ``runs forget`` stays usable as the escape hatch when one bad record
+    breaks every strict registry read.
+    """
+    if not path.exists():
+        return _empty(), {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise handoff.HandoffError(f"cannot read handoff registry {path}: {exc}", 5) from exc
+    if not isinstance(value, dict) or set(value) != {"version", "runs"}:
+        raise handoff.HandoffError("registry must contain version and runs", 5)
+    if value["version"] != REGISTRY_VERSION or not isinstance(value["runs"], dict):
+        raise handoff.HandoffError("unsupported or invalid registry", 5)
+    invalid: dict[str, str] = {}
+    for key, record in list(value["runs"].items()):
+        try:
+            normalized = _validate_record(record)
+            if key != normalized["run_id"]:
+                raise handoff.HandoffError("registry run key does not match record", 5)
+        except handoff.HandoffError as exc:
+            invalid[key] = str(exc)
+        else:
+            value["runs"][key] = normalized
+    return value, invalid
+
+
+def _resolve_lenient(
+    registry: dict[str, Any], invalid: dict[str, str], selector: str,
+) -> tuple[str, dict[str, Any] | Any, str | None]:
+    """Resolve one selector over a leniently read registry.
+
+    Valid records match exactly as :func:`resolve` does (run ID, name,
+    handle, URI, then run-ID prefix); invalid records match their registry
+    key or, when decipherable, their raw ``run_id``.  Returns the registry
+    key, the record (raw and possibly not a dict when invalid), and the
+    record's validation error or ``None``.
+    """
+    runs = registry["runs"]
+    valid = {key: record for key, record in runs.items() if key not in invalid}
+    exact = [
+        record["run_id"] for record in valid.values()
+        if selector in {record["run_id"], record["name"], record["handle"], record["run_uri"]}
+    ]
+    exact += [
+        key for key in invalid
+        if selector == key
+        or (isinstance(runs[key], dict) and selector == runs[key].get("run_id"))
+    ]
+    if not exact:
+        exact = [record["run_id"] for record in valid.values() if record["run_id"].startswith(selector)]
+        exact += [key for key in invalid if key.startswith(selector)]
+    if not exact:
+        raise handoff.HandoffError(f"unknown handoff run: {selector}", 4)
+    if len(exact) > 1:
+        raise handoff.HandoffError(f"ambiguous handoff run selector: {selector}", 4)
+    key = exact[0]
+    return key, runs[key], invalid.get(key)
+
+
+def forget(selector: str, *, path: Path | None = None, force: bool = False) -> dict[str, Any]:
+    """Remove one registry record; never touches the run itself.
+
+    The run directory, journals, and credential files stay exactly where they
+    are — the run remains fully inspectable by absolute ``--run-dir``.
+    Refuses a run that is not known to be terminal unless ``force`` is given:
+    dropping the registry record of a live run orphans a running worker.  The
+    registry is read leniently so a corrupt record — the reason this command
+    exists — can be found and removed while every strict read still fails.
+    """
+    if not isinstance(selector, str) or not selector:
+        raise handoff.HandoffError("run selector must be non-empty", 2)
+    registry_path = Path(path or default_path())
+    with _locked(registry_path, exclusive=True):
+        registry, invalid = _read_lenient_unlocked(registry_path)
+        key, record, error = _resolve_lenient(registry, invalid, selector)
+        if error is not None:
+            # A corrupt record gets the same conservative liveness check its
+            # raw fields allow; without a usable run_dir there is nothing a
+            # live worker could still be reached through.
+            run_dir = record.get("run_dir") if isinstance(record, dict) else None
+            if isinstance(run_dir, str) and run_dir:
+                host = record.get("host")
+                terminal, note = _assess_terminal({
+                    "host": host if isinstance(host, str) else None,
+                    "run_dir": run_dir,
+                })
+            else:
+                terminal, note = True, "the record has no usable run_dir"
+            note = f"record is invalid ({error}); {note}"
+        else:
+            terminal, note = _assess_terminal(record)
+        if not terminal and not force:
+            raise handoff.HandoffError(
+                f"refusing to forget handoff run {key}: {note}; "
+                "use --force to remove the record anyway",
+                4,
+            )
+        del registry["runs"][key]
+        _write_unlocked(registry_path, registry)
+    if not terminal:
+        note = f"removed with --force despite: {note}"
+    return {"removed": record, "note": note}
+
+
+def prune(
+    *, path: Path | None = None, older_than: float | None = None,
+    terminal_only: bool = True, host: str | None = None, dry_run: bool = False,
+) -> dict[str, Any]:
+    """Remove registry records for finished runs in bulk; registry-only.
+
+    Filters select candidates by ``registered_at`` age (``older_than`` days)
+    and ``host``.  A candidate that is not known to be terminal is skipped
+    with its reason reported; ``terminal_only=False`` overrides that refusal
+    the way ``forget --force`` does for one record.  Invalid records are
+    never bulk-removed: they are reported as skipped so they can be removed
+    deliberately with ``runs forget``.  ``dry_run`` computes the same plan
+    under a shared lock and changes nothing.
+    """
+    if older_than is not None and older_than < 0:
+        raise handoff.HandoffError("--older-than must be non-negative", 2)
+    registry_path = Path(path or default_path())
+    with _locked(registry_path, exclusive=not dry_run):
+        registry, invalid = _read_lenient_unlocked(registry_path)
+        cutoff = None
+        if older_than is not None:
+            cutoff = handoff._now() - datetime.timedelta(days=older_than)  # noqa: SLF001 - same-package timestamp parser
+        removed: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for key, error in invalid.items():
+            raw = registry["runs"][key]
+            skipped.append({
+                "run_id": key,
+                "name": raw.get("name") if isinstance(raw, dict) else None,
+                "reason": f"record is invalid ({error}); remove it deliberately with runs forget",
+            })
+        valid = [record for key, record in registry["runs"].items() if key not in invalid]
+        for record in sorted(valid, key=lambda item: item["registered_at"]):
+            if host is not None and record["host"] != host:
+                continue
+            if cutoff is not None and handoff._parse_time(record["registered_at"]) >= cutoff:  # noqa: SLF001
+                continue
+            terminal, note = _assess_terminal(record)
+            if not terminal and terminal_only:
+                skipped.append({
+                    "run_id": record["run_id"], "name": record["name"], "reason": note,
+                })
+                continue
+            if not terminal:
+                note = f"not known to be terminal ({note}); included by --no-terminal-only"
+            removed.append({"record": dict(record), "note": note})
+        if removed and not dry_run:
+            for entry in removed:
+                del registry["runs"][entry["record"]["run_id"]]
+            _write_unlocked(registry_path, registry)
+    return {"dry_run": dry_run, "removed": removed, "skipped": skipped}
+
+
+def validate_records(*, path: Path | None = None) -> dict[str, Any]:
+    """Report per-record validity instead of failing the whole read.
+
+    Strict validation on the normal read paths is unchanged; this is the
+    diagnostic view that names the records ``runs forget`` can then remove.
+    """
+    registry_path = Path(path or default_path())
+    with _locked(registry_path, exclusive=False):
+        registry, invalid = _read_lenient_unlocked(registry_path)
+    return {
+        "valid": sorted(key for key in registry["runs"] if key not in invalid),
+        "invalid": [
+            {
+                "key": key,
+                "run_id": (
+                    registry["runs"][key].get("run_id")
+                    if isinstance(registry["runs"][key], dict) else None
+                ),
+                "error": error,
+            }
+            for key, error in invalid.items()
+        ],
+    }
 
 
 def public(record: dict[str, Any]) -> dict[str, Any]:
