@@ -945,3 +945,120 @@ def test_cli_explicitly_adopts_unowned_registry_run(tmp_path, monkeypatch):
     assert adopted.returncode == 0, adopted.stderr
     assert json.loads(adopted.stdout)["orchestrator_id"] == json.loads(registered.stdout)["orchestrator_id"]
     assert handoff_registry.resolve(run["run"]["run_id"])["orchestrator_id"] == json.loads(registered.stdout)["orchestrator_id"]
+
+
+def fail_registered_run(run):
+    handoff.emit(
+        Path(run["run_dir"]), run["worker"], type="error", body="fatal test failure",
+        data={
+            "fatal": True, "category": "test", "stage": "lookup",
+            "inbox_cursor": 0, "commitments": [],
+        },
+    )
+    assert handoff.status(Path(run["run_dir"]))["state"] == "failed"
+
+
+def test_cli_runs_forget_removes_terminal_record_and_preserves_run(tmp_path, monkeypatch, capsys):
+    run = registered_run(tmp_path, monkeypatch)
+    fail_registered_run(run)
+
+    assert handoffctl.main(["runs", "forget", "--run", "weather"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["removed"]["run_id"] == run["run"]["run_id"]
+    assert "credential_dir" not in output["removed"]
+    assert output["note"] is None
+    assert handoff_registry.list_records() == []
+    # Registry-only: the run directory and credential files are untouched.
+    assert handoff.status(Path(run["run_dir"]))["state"] == "failed"
+    assert (run["private"] / "recovery.token").exists()
+    assert (run["private"] / "worker.token").exists()
+
+
+def test_cli_runs_forget_refuses_live_run_until_forced(tmp_path, monkeypatch, capsys):
+    run = registered_run(tmp_path, monkeypatch)
+
+    assert handoffctl.main(["runs", "forget", "--run", "weather"]) == 4
+    captured = capsys.readouterr()
+    assert "refusing to forget" in captured.err
+    assert handoff_registry.resolve("weather")["run_id"] == run["run"]["run_id"]
+
+    assert handoffctl.main(["runs", "forget", "--run", "weather", "--force"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert "force" in output["note"]
+    assert handoff_registry.list_records() == []
+    assert handoff.status(Path(run["run_dir"]))["state"] == "starting"
+
+
+def test_cli_runs_prune_requires_confirmation_and_dry_run_changes_nothing(
+    tmp_path, monkeypatch, capsys,
+):
+    run = registered_run(tmp_path, monkeypatch)
+    fail_registered_run(run)
+
+    assert handoffctl.main(["runs", "prune"]) == 2
+    assert "--yes" in capsys.readouterr().err
+    assert len(handoff_registry.list_records()) == 1
+
+    assert handoffctl.main(["runs", "prune", "--dry-run"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["dry_run"] is True
+    assert [entry["record"]["run_id"] for entry in plan["removed"]] == [run["run"]["run_id"]]
+    assert "credential_dir" not in plan["removed"][0]["record"]
+    assert plan["skipped"] == []
+    assert len(handoff_registry.list_records()) == 1
+
+    assert handoffctl.main(["runs", "prune", "--yes"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["dry_run"] is False
+    assert [entry["record"]["run_id"] for entry in result["removed"]] == [run["run"]["run_id"]]
+    assert handoff_registry.list_records() == []
+    assert handoff.status(Path(run["run_dir"]))["state"] == "failed"
+    assert (run["private"] / "recovery.token").exists()
+
+
+def test_cli_runs_prune_skips_live_records_with_reasons(tmp_path, monkeypatch, capsys):
+    run = registered_run(tmp_path, monkeypatch)
+
+    assert handoffctl.main(["runs", "prune", "--yes"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["removed"] == []
+    assert [skip["run_id"] for skip in result["skipped"]] == [run["run"]["run_id"]]
+    assert "starting" in result["skipped"][0]["reason"]
+    assert len(handoff_registry.list_records()) == 1
+
+
+def test_cli_runs_doctor_reports_invalid_records_individually(tmp_path, monkeypatch, capsys):
+    registered_run(tmp_path, monkeypatch)
+    registry = tmp_path / "registry.json"
+    value = json.loads(registry.read_text())
+    value["runs"]["run-broken"] = {"run_id": "run-broken", "name": "broken"}
+    registry.write_text(json.dumps(value), encoding="utf-8")
+
+    assert handoffctl.main(["runs", "doctor"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert len(report["valid"]) == 1
+    assert report["invalid"][0]["key"] == "run-broken"
+    assert "invalid fields" in report["invalid"][0]["error"]
+
+
+def test_cli_runs_forget_is_the_escape_hatch_for_a_corrupt_record(tmp_path, monkeypatch, capsys):
+    run = registered_run(tmp_path, monkeypatch)
+    registry = tmp_path / "registry.json"
+    value = json.loads(registry.read_text())
+    value["runs"]["run-broken"] = {"run_id": "run-broken", "name": "broken"}
+    registry.write_text(json.dumps(value), encoding="utf-8")
+
+    assert handoffctl.main(["runs", "list"]) == 5
+    assert "invalid fields" in capsys.readouterr().err
+
+    assert handoffctl.main(["runs", "forget", "--run", "run-broken"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["removed"]["run_id"] == "run-broken"
+    assert "invalid" in output["note"]
+
+    assert handoffctl.main(["runs", "list"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [item["run_id"] for item in listed] == [run["run"]["run_id"]]
