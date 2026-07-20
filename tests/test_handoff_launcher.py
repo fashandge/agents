@@ -833,6 +833,101 @@ def test_launch_remote_sends_json_over_stdin_and_returns_remote_uri(tmp_path, mo
     assert registered["credential_dir"] is None
 
 
+def test_remote_codex_automatically_rescues_exact_folder_trust_dialog(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff"
+    kickoff.write_text("task")
+    calls = []
+    trust_screen = """\
+> You are in /srv/repo
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue
+"""
+
+    def fake_ssh(host, remote_argv, *, stdin, timeout):
+        calls.append(remote_argv)
+        if remote_argv[-1] == "--receive-remote-request":
+            payload = json.loads(stdin)
+            assert payload["confirm_ready"] is True
+            assert payload["readiness_timeout"] == 30.0
+            return Completed(stdout=json.dumps({
+                "run_dir": "/remote/state/run-id",
+                "handle": "remote-codex",
+                "agent": "codex",
+                "worker_ready": False,
+                "rescue_command": "capture",
+            }) + "\n")
+        if remote_argv[:2] == ["sh", "-c"]:
+            return Completed(stdout="node /usr/local/bin/codex -m gpt-5.6-terra\n")
+        if remote_argv[:2] == ["tmux", "capture-pane"]:
+            if "-S" in remote_argv:
+                return Completed(stdout=trust_screen)
+            return Completed(stdout="Codex is reading the handoff kickoff.\n")
+        if remote_argv[:2] == ["tmux", "send-keys"]:
+            assert remote_argv[-1] == "C-m"
+            return Completed()
+        raise AssertionError(remote_argv)
+
+    monkeypatch.setattr(handoff_launcher, "_run_ssh", fake_ssh)
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+
+    result = handoff_launcher.launch_remote(
+        host="oci-box", remote_python="python3", name="remote-codex",
+        kickoff=kickoff, remote_cwd=Path("/srv/repo"), agent="codex",
+    )
+
+    assert result["folder_trust_rescued"] is True
+    assert "startup_unconfirmed" not in result
+    assert "rescue_command" not in result
+    assert ["tmux", "send-keys", "-t", "remote-codex", "C-m"] in calls
+
+
+def test_remote_codex_leaves_nonmatching_startup_unconfirmed(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff"
+    kickoff.write_text("task")
+    calls = []
+
+    def fake_ssh(host, remote_argv, *, stdin, timeout):
+        calls.append(remote_argv)
+        if remote_argv[-1] == "--receive-remote-request":
+            return Completed(stdout=json.dumps({
+                "run_dir": "/remote/state/run-id",
+                "handle": "remote-codex",
+                "agent": "codex",
+                "worker_ready": False,
+                "rescue_command": "capture",
+            }) + "\n")
+        if remote_argv[:2] == ["sh", "-c"]:
+            return Completed(stdout="node /usr/local/bin/codex -m gpt-5.6-terra\n")
+        if remote_argv[:2] == ["tmux", "capture-pane"]:
+            return Completed(stdout="""\
+> You are in /srv/other-repo
+Do you trust the contents of this directory?
+1. Yes, continue
+2. No, quit
+Press enter to continue
+""")
+        raise AssertionError(remote_argv)
+
+    monkeypatch.setattr(handoff_launcher, "_run_ssh", fake_ssh)
+
+    result = handoff_launcher.launch_remote(
+        host="oci-box", remote_python="python3", name="remote-codex",
+        kickoff=kickoff, remote_cwd=Path("/srv/repo"), agent="codex",
+    )
+
+    assert result["folder_trust_rescued"] is False
+    assert result["startup_unconfirmed"] is True
+    assert result["rescue_command"] == (
+        "ssh oci-box 'tmux capture-pane -p -t remote-codex -S -2000'"
+    )
+    assert not any(call[:2] == ["tmux", "send-keys"] for call in calls)
+
+
 def test_remote_host_rejects_ssh_option_injection(tmp_path):
     kickoff = tmp_path / "kickoff"
     kickoff.write_text("task")

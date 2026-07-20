@@ -34,6 +34,9 @@ CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 REMOTE_PYTHON_DEFAULT = "python3"
 KIMI_SUBMIT_SETTLE_SECONDS = 0.5
 TUI_SUBMIT_SETTLE_SECONDS = 0.7
+DEFAULT_READINESS_TIMEOUT = 120.0
+REMOTE_CODEX_STARTUP_TIMEOUT = 30.0
+REMOTE_FOLDER_TRUST_SCROLLBACK_LINES = 120
 REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
 AGENT_DEFAULTS = {
     "claude": ("opus", "high"),
@@ -787,12 +790,98 @@ def _ssh_display_command(host: str, remote_argv: list[str]) -> str:
     return shlex.join(["ssh", host, shlex.join(remote_argv)])
 
 
+def _remote_tmux_pane_command(host: str, handle: str) -> str:
+    """Return the exact tmux pane leader command with the handle as a shell arg."""
+    result = _run_ssh(
+        host,
+        [
+            "sh", "-c",
+            'pane_pid=$(tmux display-message -p -t "$1" "#{pane_pid}") || exit 1; '
+            'ps -o command= -p "$pane_pid"',
+            "handoff-folder-trust", handle,
+        ],
+        stdin="",
+        timeout=15.0,
+    )
+    return result.stdout
+
+
+def _remote_tmux_capture(host: str, handle: str, *, scrollback_lines: int | None = None) -> str:
+    """Capture one exact remote tmux pane; no worker state is mutated."""
+    remote_argv = ["tmux", "capture-pane", "-p", "-t", handle]
+    if scrollback_lines is not None:
+        remote_argv.extend(["-S", f"-{scrollback_lines}"])
+    return _run_ssh(host, remote_argv, stdin="", timeout=15.0).stdout
+
+
+def _is_remote_codex_folder_trust_prompt(
+    pane_command: str,
+    screen: str,
+    remote_cwd: Path,
+) -> bool:
+    """Recognize only Codex's exact trust dialog for the authorized checkout."""
+    return (
+        "codex" in pane_command.casefold()
+        and f"You are in {remote_cwd}" in screen
+        and "Do you trust the contents of this directory?" in screen
+        and "1. Yes, continue" in screen
+        and "2. No, quit" in screen
+        and "Press enter to continue" in screen
+    )
+
+
+def _rescue_remote_codex_folder_trust(
+    result: dict[str, Any],
+    *,
+    host: str,
+    handle: str,
+    remote_cwd: Path,
+) -> None:
+    """Advance one verified, pre-agent Codex folder-trust dialog at most once."""
+    result["folder_trust_rescued"] = False
+    if result.get("worker_ready") is not False:
+        return
+    try:
+        pane_command = _remote_tmux_pane_command(host, handle)
+        screen = _remote_tmux_capture(
+            host, handle, scrollback_lines=REMOTE_FOLDER_TRUST_SCROLLBACK_LINES,
+        )
+    except AdapterError:
+        result["startup_unconfirmed"] = True
+        return
+    if not _is_remote_codex_folder_trust_prompt(pane_command, screen, remote_cwd):
+        result["startup_unconfirmed"] = True
+        return
+
+    try:
+        _run_ssh(
+            host,
+            ["tmux", "send-keys", "-t", handle, "C-m"],
+            stdin="",
+            timeout=15.0,
+        )
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        pane_command = _remote_tmux_pane_command(host, handle)
+        screen = _remote_tmux_capture(host, handle)
+    except AdapterError:
+        result["startup_unconfirmed"] = True
+        return
+    if "codex" not in pane_command.casefold() or _is_remote_codex_folder_trust_prompt(
+        pane_command, screen, remote_cwd,
+    ):
+        result["startup_unconfirmed"] = True
+        return
+
+    result["folder_trust_rescued"] = True
+    result.pop("rescue_command", None)
+
+
 def launch_remote(
     *, host: str, remote_python: str, name: str, kickoff: Path,
     remote_cwd: Path, agent: str = "claude", model: str | None = None,
     effort: str | None = None, pmode: str = "bypassPermissions",
     inputs: list[str] | None = None, state_root: Path | None = None,
-    run_dir: Path | None = None, readiness_timeout: float = 120.0,
+    run_dir: Path | None = None, readiness_timeout: float | None = None,
     confirm_ready: bool = False, retain_orchestrator: bool = False,
     credential_dir: Path | None = None, orchestrator_id: str | None = None,
 ) -> dict[str, Any]:
@@ -806,6 +895,15 @@ def launch_remote(
         raise handoff.HandoffError(
             "managed remote launch requires HANDOFF_REMOTE_CREDENTIAL_DIR", 2,
         )
+    if readiness_timeout is not None:
+        effective_readiness_timeout = readiness_timeout
+    elif agent == "codex":
+        effective_readiness_timeout = REMOTE_CODEX_STARTUP_TIMEOUT
+    else:
+        effective_readiness_timeout = DEFAULT_READINESS_TIMEOUT
+    if effective_readiness_timeout <= 0:
+        raise handoff.HandoffError("readiness_timeout must be positive", 2)
+    confirm_ready = confirm_ready or agent == "codex"
     goal_file = Path(str(kickoff) + ".goal")
     payload = {
         "name": name,
@@ -819,7 +917,7 @@ def launch_remote(
         "inputs": inputs or [],
         "state_root": str(state_root) if state_root is not None else None,
         "run_dir": str(run_dir) if run_dir is not None else None,
-        "readiness_timeout": readiness_timeout,
+        "readiness_timeout": effective_readiness_timeout,
         "confirm_ready": confirm_ready,
         "retain_coordinator": retain_orchestrator,
         "credential_dir": str(credential_dir) if credential_dir is not None else None,
@@ -833,7 +931,7 @@ def launch_remote(
         host,
         remote_argv,
         stdin=json.dumps(payload, ensure_ascii=False),
-        timeout=max(30.0, readiness_timeout + 30.0),
+        timeout=max(30.0, effective_readiness_timeout + 30.0),
     )
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     if not lines:
@@ -859,6 +957,10 @@ def launch_remote(
         "handle": f"ssh://{host}/tmux/{remote_handle}",
         "remote_handle": remote_handle,
     })
+    if agent == "codex":
+        _rescue_remote_codex_folder_trust(
+            result, host=host, handle=remote_handle, remote_cwd=remote_cwd,
+        )
     try:
         handoff_registry.register(
             run_id=result["run_id"], name=name, run_dir=remote_run_dir,
@@ -874,7 +976,7 @@ def launch_remote(
     except (handoff.HandoffError, OSError) as exc:
         result["registry_recorded"] = False
         result["registry_error"] = str(exc)
-    if remote_result.get("rescue_command"):
+    if result.get("rescue_command"):
         result["rescue_command"] = _ssh_display_command(
             host,
             ["tmux", "capture-pane", "-p", "-t", remote_handle, "-S", "-2000"],
@@ -922,7 +1024,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace"); parser.add_argument("--input", action="append", default=[])
     destination = parser.add_mutually_exclusive_group()
     destination.add_argument("--state-root", type=Path); destination.add_argument("--run-dir", type=Path)
-    parser.add_argument("--readiness-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--readiness-timeout",
+        type=float,
+        default=None,
+        help=(
+            "startup ready-check timeout (default: 120s; remote Codex defaults to 30s "
+            "for automatic folder-trust rescue)"
+        ),
+    )
     parser.add_argument("--wait-ready", action="store_true", help="wait for the worker-ready checkpoint")
     parser.add_argument("--retain-orchestrator", "--retain-coordinator", dest="retain_orchestrator", action="store_true", help="retain the orchestrator lease for active monitoring")
     parser.add_argument("--cmux-binary", default=CMUX_DEFAULT)
@@ -972,7 +1082,11 @@ def main(argv: list[str] | None = None) -> int:
                 name=args.name, kickoff=args.prompt_file, cwd=args.cwd or Path.cwd(), agent=args.agent,
                 backend=args.backend, model=args.model, effort=args.effort, pmode=args.pmode,
                 workspace=args.workspace, inputs=args.input, state_root=args.state_root,
-                run_dir=args.run_dir, readiness_timeout=args.readiness_timeout,
+                run_dir=args.run_dir,
+                readiness_timeout=(
+                    args.readiness_timeout
+                    if args.readiness_timeout is not None else DEFAULT_READINESS_TIMEOUT
+                ),
                 cmux_binary=args.cmux_binary, confirm_ready=args.wait_ready,
                 retain_orchestrator=args.retain_orchestrator,
                 orchestrator_id=orchestrator_id,
