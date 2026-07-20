@@ -1,7 +1,10 @@
 # Handoff: rename "coordinator" → "orchestrator" across the handoff stack
 
 **Status:** not started — this doc is the spec for a delegated worker (Kimi via
-/delegate-first). Written 2026-07-19.
+/delegate-first). Written 2026-07-19; revised the same day after the
+handoff-agent skill restructure landed (agents `6e23c54`, skills `b21231c`):
+the skill is now a lean `SKILL.md` plus `references/`, and four helper scripts
+were added under `scripts/`.
 
 ## Decision and goal
 
@@ -79,28 +82,33 @@ Rename every "coordinator" that is *not* written to or read from durable state:
    repo `CLAUDE.md` (a.k.a. AGENTS.md). Prose only — do not "fix" historical
    command transcripts in plan docs if they record what was actually run; add a
    parenthetical instead.
-5. **Skill** (outside the repo): `~/skills/handoff-agent/` — since the
-   2026-07-19 restructure this is `SKILL.md` (lean core) plus
-   `references/remote-and-viewers.md`, `references/rescue-and-close.md`,
-   `references/codex-app-task.md`, and `references/launch-details.md`. Unify
-   all five on orchestrator, including the quoted CLI invocations — quote the
-   new `orchestrator` subcommand since the alias keeps old invocations working
-   anyway.
-6. **New scripts** (same restructure): `scripts/handoff_coordinator_ensure.sh`,
-   `scripts/handoff_doorbell.sh`, `scripts/cmux_close_surface_safe.sh` use
-   "coordinator" in names, flags, and headers. Rename the ensure script (and
-   its `coordinator register/start` invocations follow the CLI alias rules
-   above); keep old flag spellings working only where a doc quotes them.
+5. **Skill** (outside the repo, its own git repo with remote): the
+   `~/skills/handoff-agent/` skill is `SKILL.md` (lean core) plus four
+   reference docs. Combined `coordinator|orchestrator` match counts
+   (`grep -ci`): `SKILL.md` (44), `references/remote-and-viewers.md` (17),
+   `references/launch-details.md` (6), `references/rescue-and-close.md` (4),
+   `references/codex-app-task.md` (1). Unify all five on orchestrator,
+   including the quoted CLI invocations — quote the new `orchestrator`
+   subcommand since the alias keeps old invocations working anyway. Keep the
+   YAML frontmatter's wording changes minimal (it controls skill triggering)
+   — it currently contains neither word, so it likely needs no edit.
+6. **Helper scripts** (in this repo): only
+   `scripts/handoff_coordinator_ensure.sh` needs real work (18 matches:
+   filename, header, flags, and its `coordinator register/start` invocations —
+   follow the CLI alias rules above; update the SKILL.md/architecture.md/
+   CLAUDE.md references to the new filename in the same change).
+   `scripts/cmux_close_surface_safe.sh` has one prose mention to update;
+   `scripts/handoff_doorbell.sh` and `scripts/tmux_run_logged.sh` contain
+   neither word — leave them untouched.
 
 Explicitly **out of scope**: the `orchestration/` package name (names the
 domain, not the role — leave it), `scripts/handoff_agent.sh` and
 `scripts/cmux_ssh_tmux_quiet.sh` (zero matches), and anything on the remote
 worker host.
 
-Note: `git status` currently shows uncommitted local modifications to
-`orchestration/handoff.py`, `tests/test_handoff.py`, and
-`docs/2026-07-14_agent-handoff-communication-design.md`. Work on top of them —
-do not revert or stash them away.
+Both working trees (`~/projects/agents` and `~/skills`) are clean as of the
+restructure commits above. If `git status` shows local modifications when you
+start, they are the user's — work on top of them, do not revert or stash them.
 
 ## Phase 2 — persisted protocol state (GATED)
 
@@ -133,8 +141,8 @@ semantic change.
 1. Full suite: `/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python -m
    pytest tests/` — must pass after each phase.
 2. After Phase 1: `grep -rniE 'coordinator' orchestration/ tests/ docs/
-   CLAUDE.md ~/skills/handoff-agent/` returns only (a) deliberate compat
-   aliases/read-compat code, (b) historical transcripts in plan docs.
+   scripts/ CLAUDE.md ~/skills/handoff-agent/` returns only (a) deliberate
+   compat aliases/read-compat code, (b) historical transcripts in plan docs.
 3. Live-run smoke test after each phase, without steering the worker:
    `handoffctl runs list`, `handoffctl orchestrator show` (and via the
    `coordinator` alias), `handoffctl orchestrator pending`, and a
@@ -144,8 +152,8 @@ semantic change.
 
 ## Suggested commit split
 
-1. Phase 1 code + tests (repo).
-2. Phase 1 docs + CLAUDE.md (repo) — SKILL.md is outside the repo, edited but
-   not committed here.
-3. Phase 2 (compat-gated persisted-state rename) as its own commit, only if the
-   gate is satisfied.
+1. Phase 1 code + tests + `handoff_coordinator_ensure.sh` rename (this repo).
+2. Phase 1 docs + CLAUDE.md (this repo).
+3. Skill core + references (separate commit in the `~/skills` repo).
+4. Phase 2 (compat-gated persisted-state rename) as its own commit in this
+   repo, only if the gate is satisfied.
