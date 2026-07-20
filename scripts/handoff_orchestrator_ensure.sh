@@ -10,7 +10,7 @@
 #       [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
 #
 # Behavior:
-#   * --state omitted: create $HOME/.local/state/agents/handoff/coordinators
+#   * --state omitted: create $HOME/.local/state/agents/handoff/orchestrators
 #     (a mode-700 parent is fine), then a private `mktemp -d .../session.XXXXXX`
 #     dir (chmod 700), and use <dir>/watcher.json as the state file.
 #   * --state given and the file already exists: skip registration and only run
@@ -82,7 +82,7 @@ if [[ "$transport" == tmux && -z "$target" ]]; then
 fi
 
 if [[ -z "$state" ]]; then
-  base="$HOME/.local/state/agents/handoff/coordinators"
+  base="$HOME/.local/state/agents/handoff/orchestrators"
   mkdir -p "$base"
   session_root=$(mktemp -d "$base/session.XXXXXX")
   chmod 700 "$session_root"

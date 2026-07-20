@@ -169,12 +169,12 @@ def _run_state(value: Any) -> dict[str, Any]:
 
 def _validate(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
-        "version", "coordinator_id", "transport", "target", "owner_process", "runs",
+        "version", "orchestrator_id", "transport", "target", "owner_process", "runs",
     }:
         raise handoff.HandoffError("invalid orchestrator watcher snapshot", 5)
     if value["version"] != STATE_VERSION:
         raise handoff.HandoffError("unsupported orchestrator watcher state version", 5)
-    _orchestrator_id(value["coordinator_id"])
+    _orchestrator_id(value["orchestrator_id"])
     _target(value["transport"], value["target"])
     _owner_process(value["owner_process"])
     if not isinstance(value["runs"], dict):
@@ -253,7 +253,7 @@ def initialize(
     path = _state_path(path)
     value = _validate({
         "version": STATE_VERSION,
-        "coordinator_id": orchestrator_id or str(uuid.uuid4()),
+        "orchestrator_id": orchestrator_id or str(uuid.uuid4()),
         "transport": transport,
         "target": target,
         "owner_process": capture_owner_process(owner_pid),
@@ -302,7 +302,7 @@ def instance_lock(path: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise handoff.HandoffError(
-                f"orchestrator watcher is already running for {read(path)['coordinator_id']}", 4,
+                f"orchestrator watcher is already running for {read(path)['orchestrator_id']}", 4,
             ) from exc
         yield
     finally:
@@ -512,7 +512,7 @@ def poll(
     records = handoff_registry.list_records(path=registry_path, private=True)
     owned = [
         record for record in records
-        if record["coordinator_id"] == value["coordinator_id"]
+        if record["orchestrator_id"] == value["orchestrator_id"]
     ]
     owned_ids = {record["run_id"] for record in owned}
     for record in owned:
@@ -611,7 +611,7 @@ def poll(
         _atomic_write(path, value)
 
     return {
-        "coordinator_id": value["coordinator_id"],
+        "orchestrator_id": value["orchestrator_id"],
         "owned_runs": [record["run_id"] for record in owned],
         "attempted": coverage,
         "pending": {

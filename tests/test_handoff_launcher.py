@@ -667,10 +667,10 @@ def test_launch_only_returns_without_readiness_wait_and_releases_orchestrator(tm
     registered = handoff_registry.resolve(result["run_id"])
     assert registered["credential_dir"] == str(private)
     assert registered["handle"] == "worker-handle"
-    assert registered["coordinator_id"] == orchestrator_id
-    assert (private / "coordinator.token").is_file()
+    assert registered["orchestrator_id"] == orchestrator_id
+    assert (private / "orchestrator.token").is_file()
     control = handoff_launcher.handoff.control_show(Path(result["run_dir"]))
-    assert handoff_launcher.handoff._parse_time(control["coordinator_lease_expires_at"]) <= handoff_launcher.handoff._now()
+    assert handoff_launcher.handoff._parse_time(control["orchestrator_lease_expires_at"]) <= handoff_launcher.handoff._now()
 
 
 def test_managed_launch_uses_exact_private_directory_and_retains_lease(tmp_path, monkeypatch):
@@ -693,7 +693,7 @@ def test_managed_launch_uses_exact_private_directory_and_retains_lease(tmp_path,
 
     assert result["orchestrator_released"] is False
     assert {path.name for path in private.iterdir()} >= {
-        "coordinator.token", "recovery.token", "worker.token", "launch_worker.py", "launch.json",
+        "orchestrator.token", "recovery.token", "worker.token", "launch_worker.py", "launch.json",
     }
 
 

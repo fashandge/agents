@@ -43,9 +43,9 @@ MAX_ATTACHMENT = 32 * 1024 * 1024
 
 INBOX_TYPES = {
     "steer", "supersede", "answer", "review", "input-changed", "base-changed",
-    "integration", "coordinator-takeover", "worker-relaunched", "stop",
+    "integration", "orchestrator-takeover", "worker-relaunched", "stop",
 }
-SYSTEM_INBOX_TYPES = {"integration", "coordinator-takeover", "worker-relaunched"}
+SYSTEM_INBOX_TYPES = {"integration", "orchestrator-takeover", "worker-relaunched"}
 OUTBOX_TYPES = {"checkpoint", "question", "result", "error"}
 WORKER_STATES = {
     "starting", "working", "blocked", "awaiting_review", "succeeded",
@@ -65,9 +65,9 @@ STATUS_FIELDS = {
     "last_progress_at", "updated_at",
 }
 CONTROL_FIELDS = {
-    "protocol_version", "run_id", "revision", "coordinator_epoch",
-    "coordinator_token_sha256", "recovery_token_sha256",
-    "coordinator_lease_expires_at", "worker_epoch", "worker_token_sha256",
+    "protocol_version", "run_id", "revision", "orchestrator_epoch",
+    "orchestrator_token_sha256", "recovery_token_sha256",
+    "orchestrator_lease_expires_at", "worker_epoch", "worker_token_sha256",
     "desired_state", "review_state", "review_result_id", "last_command_seq",
     "outbox_cursor", "integration", "updated_at",
 }
@@ -303,7 +303,7 @@ def _authorize(control: dict[str, Any], token: bytes, role: str, *, lease: bool 
     field = f"{role}_token_sha256"
     if not secrets.compare_digest(_token_hash(token), control[field]):
         _fail(f"invalid or stale {role} credential", 3)
-    if lease and _parse_time(control["coordinator_lease_expires_at"]) <= _now():
+    if lease and _parse_time(control["orchestrator_lease_expires_at"]) <= _now():
         _fail("orchestrator credential lease has expired", 3)
 
 
@@ -389,12 +389,12 @@ def _validate_control(value: Any) -> None:
     if value["protocol_version"] != 1:
         _fail("unsupported protocol version")
     _uuid4(value["run_id"], "run_id")
-    for field in ("revision", "coordinator_epoch", "worker_epoch"):
+    for field in ("revision", "orchestrator_epoch", "worker_epoch"):
         _counter(value[field], field, positive=True)
-    for field in ("coordinator_token_sha256", "recovery_token_sha256", "worker_token_sha256"):
+    for field in ("orchestrator_token_sha256", "recovery_token_sha256", "worker_token_sha256"):
         if not isinstance(value[field], str) or not HEX_RE.fullmatch(value[field]):
             _fail(f"invalid {field}")
-    _parse_time(value["coordinator_lease_expires_at"])
+    _parse_time(value["orchestrator_lease_expires_at"])
     if value["desired_state"] not in {"run", "stop"}:
         _fail("invalid desired_state")
     if value["review_state"] not in {"pending", "changes_requested", "superseded", "accepted"}:
@@ -498,7 +498,7 @@ def _validate_type_data(direction: str, kind: str, body: str, reply_to: Any, dat
                 _string(data["reason"], "reason", nonempty=True)
             else:
                 _fail("invalid integration state")
-        elif kind == "coordinator-takeover":
+        elif kind == "orchestrator-takeover":
             _fields(data, {"previous_epoch", "new_epoch", "reason", "forced"}, "data")
             previous = _counter(data["previous_epoch"], "previous_epoch", positive=True)
             new = _counter(data["new_epoch"], "new_epoch", positive=True)
@@ -578,7 +578,7 @@ def _validate_message(value: Any, direction: str, *, expected_seq: int | None = 
 
 def _journal(run_dir: Path, direction: str) -> list[dict[str, Any]]:
     path = run_dir / f"{direction}.jsonl"
-    role = "coordinator" if direction == "inbox" else "worker"
+    role = "orchestrator" if direction == "inbox" else "worker"
     with _lock(run_dir, role, shared=True):
         return _journal_unlocked(path, direction)
 
@@ -773,8 +773,8 @@ def initialize(
         status_value = _initial_status(run_id, created)
         control_value = {
             "protocol_version": 1, "run_id": run_id, "revision": 1,
-            "coordinator_epoch": 1, "coordinator_token_sha256": _token_hash(orchestrator),
-            "recovery_token_sha256": _token_hash(recovery), "coordinator_lease_expires_at": lease,
+            "orchestrator_epoch": 1, "orchestrator_token_sha256": _token_hash(orchestrator),
+            "recovery_token_sha256": _token_hash(recovery), "orchestrator_lease_expires_at": lease,
             "worker_epoch": 1, "worker_token_sha256": _token_hash(worker_token),
             "desired_state": "run", "review_state": "pending", "review_result_id": None,
             "last_command_seq": 0, "outbox_cursor": 0,
@@ -790,7 +790,7 @@ def initialize(
         _write_new(temp / "inbox.jsonl", b"")
         _write_new(temp / "outbox.jsonl", b"")
         _write_new(temp / "progress.md", f"# Handoff run {run_id}\n\nRun ID: `{run_id}`\n".encode())
-        _write_new(temp / "coordinator.lock", b"")
+        _write_new(temp / "orchestrator.lock", b"")
         _write_new(temp / "worker.lock", b"")
         for name in ("attachments", "repairs"):
             (temp / name).mkdir(mode=0o700)
@@ -926,7 +926,7 @@ def _resolve_reply(records: list[dict[str, Any]], message_id: str | None, kind: 
 
 def _renewed(control: dict[str, Any], now: datetime.datetime | None = None) -> None:
     now = now or _now()
-    control["coordinator_lease_expires_at"] = _timestamp(now + datetime.timedelta(seconds=LEASE_SECONDS))
+    control["orchestrator_lease_expires_at"] = _timestamp(now + datetime.timedelta(seconds=LEASE_SECONDS))
     control["updated_at"] = _timestamp(now)
     control["revision"] += 1
 
@@ -943,8 +943,8 @@ def _apply_inbox(control: dict[str, Any], message: dict[str, Any]) -> None:
         control["desired_state"] = "stop"
     elif kind == "integration":
         control["integration"] = dict(message["data"])
-    elif kind == "coordinator-takeover":
-        control["coordinator_epoch"] = message["data"]["new_epoch"]
+    elif kind == "orchestrator-takeover":
+        control["orchestrator_epoch"] = message["data"]["new_epoch"]
     elif kind == "worker-relaunched":
         control["worker_epoch"] = message["data"]["new_epoch"]
     control["last_command_seq"] = message["seq"]
@@ -963,9 +963,9 @@ def send(
     message_id = message_id or str(uuid.uuid4()); _uuid4(message_id, "message_id")
     if reply_to is not None: _uuid4(reply_to, "reply_to")
     _validate_type_data("inbox", type, body, reply_to, data)
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         control = _load_json(run_dir / "control.json", _validate_control)
-        _authorize(control, token, "coordinator", lease=True)
+        _authorize(control, token, "orchestrator", lease=True)
         inbox = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
         outbox = _journal(run_dir, "outbox")
         if control["integration"]["state"] != "pending" and type != "stop":
@@ -1017,7 +1017,7 @@ def send(
             return {"message": existing, "control": control}
         if control["last_command_seq"] != len(inbox):
             _fail("control projection trails inbox; retry the prior message or repair control", 4)
-        message = _new_message(len(inbox)+1, message_id, control["coordinator_epoch"], type, reply_to, body, data, metadata)
+        message = _new_message(len(inbox)+1, message_id, control["orchestrator_epoch"], type, reply_to, body, data, metadata)
         _validate_message(message, "inbox", expected_seq=len(inbox)+1)
         _append(run_dir / "inbox.jsonl", message)
         _apply_inbox(control, message); _renewed(control)
@@ -1177,7 +1177,7 @@ def emit(
     # Always acquire roles in orchestrator-then-worker order. Orchestrator sends
     # may consult outbox while holding the orchestrator lock; the inverse order
     # here would deadlock two simultaneous role operations.
-    with _lock(run_dir, "coordinator", shared=True), _lock(run_dir, "worker"):
+    with _lock(run_dir, "orchestrator", shared=True), _lock(run_dir, "worker"):
         control = _load_json(run_dir / "control.json", _validate_control)
         _authorize(control, token, "worker")
         status_value = _load_json(run_dir / "status.json", _validate_status)
@@ -1229,9 +1229,9 @@ def emit(
 
 def control_consume(run_dir: Path, token: bytes, *, through: int) -> dict[str, Any]:
     run_dir = _run_dir(run_dir); through = _counter(through, "through")
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         control = _load_json(run_dir / "control.json", _validate_control)
-        _authorize(control, token, "coordinator", lease=True)
+        _authorize(control, token, "orchestrator", lease=True)
         outbox = _journal(run_dir, "outbox")
         if through > len(outbox): _fail("through exceeds outbox tail", 4)
         if through > control["outbox_cursor"]:
@@ -1248,19 +1248,19 @@ def control_consume(run_dir: Path, token: bytes, *, through: int) -> dict[str, A
 
 def control_renew(run_dir: Path, token: bytes) -> dict[str, Any]:
     run_dir = _run_dir(run_dir)
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         control = _load_json(run_dir / "control.json", _validate_control)
-        _authorize(control, token, "coordinator", lease=True)
+        _authorize(control, token, "orchestrator", lease=True)
         _renewed(control); _atomic_json(run_dir / "control.json", control)
         return {"control": control}
 
 
 def control_release(run_dir: Path, token: bytes) -> dict[str, Any]:
     run_dir = _run_dir(run_dir)
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         control = _load_json(run_dir / "control.json", _validate_control)
-        _authorize(control, token, "coordinator", lease=True)
-        now = _now(); control["coordinator_lease_expires_at"] = _timestamp(now)
+        _authorize(control, token, "orchestrator", lease=True)
+        now = _now(); control["orchestrator_lease_expires_at"] = _timestamp(now)
         control["updated_at"] = _timestamp(now); control["revision"] += 1
         _atomic_json(run_dir / "control.json", control)
         return {"control": control}
@@ -1272,7 +1272,7 @@ def _system_send(
     epoch: int | None = None,
 ) -> dict[str, Any]:
     message = _new_message(
-        len(inbox)+1, str(uuid.uuid4()), epoch or control["coordinator_epoch"],
+        len(inbox)+1, str(uuid.uuid4()), epoch or control["orchestrator_epoch"],
         kind, reply_to, body, data, [],
     )
     _validate_message(message, "inbox", expected_seq=len(inbox)+1)
@@ -1293,9 +1293,9 @@ def _control_decision(run_dir: Path, token: bytes, *, state: str, commit: str | 
     run_dir = _run_dir(run_dir)
     if state == "integrated": _string(commit, "commit", nonempty=True)
     else: _string(reason, "reason", nonempty=True)
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         control = _load_json(run_dir / "control.json", _validate_control)
-        _authorize(control, token, "coordinator", lease=True)
+        _authorize(control, token, "orchestrator", lease=True)
         if control["integration"]["state"] != "pending": _fail("integration decision is terminal", 4)
         if control["review_result_id"] is None: _fail("no worker result is available", 4)
         if state == "integrated" and control["review_state"] != "accepted":
@@ -1319,32 +1319,32 @@ def control_takeover(
     except ValueError: pass
     else: _fail("new credential file must be outside run directory")
     created = False
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         control = _load_json(run_dir / "control.json", _validate_control)
         if not secrets.compare_digest(_token_hash(recovery_token), control["recovery_token_sha256"]):
             _fail("invalid recovery credential", 3)
         now = _now()
-        if not force and _parse_time(control["coordinator_lease_expires_at"]) > now:
+        if not force and _parse_time(control["orchestrator_lease_expires_at"]) > now:
             _fail("orchestrator lease is still active", 4)
         token = _new_token_file(new_path); created = True
         try:
             inbox = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
-            previous = control["coordinator_epoch"]; next_epoch = previous + 1
+            previous = control["orchestrator_epoch"]; next_epoch = previous + 1
             data = {"previous_epoch": previous, "new_epoch": next_epoch, "reason": reason, "forced": force}
             message = _system_send(
-                run_dir, control, inbox, kind="coordinator-takeover",
+                run_dir, control, inbox, kind="orchestrator-takeover",
                 body=f"Orchestrator ownership transferred: {reason}", data=data,
                 reply_to=None, epoch=next_epoch,
             )
-            control["coordinator_token_sha256"] = _token_hash(token)
-            control["coordinator_epoch"] = next_epoch
-            control["coordinator_lease_expires_at"] = _timestamp(now + datetime.timedelta(seconds=LEASE_SECONDS))
+            control["orchestrator_token_sha256"] = _token_hash(token)
+            control["orchestrator_epoch"] = next_epoch
+            control["orchestrator_lease_expires_at"] = _timestamp(now + datetime.timedelta(seconds=LEASE_SECONDS))
             control["updated_at"] = _timestamp(now); control["revision"] += 1
             _atomic_json(run_dir / "control.json", control)
         except BaseException:
             # Once the journal append exists the token is required for explicit repair.
             tail = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
-            appended = bool(tail and tail[-1]["type"] == "coordinator-takeover" and tail[-1]["data"].get("new_epoch") == locals().get("next_epoch"))
+            appended = bool(tail and tail[-1]["type"] == "orchestrator-takeover" and tail[-1]["data"].get("new_epoch") == locals().get("next_epoch"))
             if created and not appended:
                 with contextlib.suppress(OSError): new_path.unlink()
             raise
@@ -1361,10 +1361,10 @@ def control_rotate_worker(
     try: new_path.relative_to(run_dir)
     except ValueError: pass
     else: _fail("new credential file must be outside run directory")
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         with _lock(run_dir, "worker"):
             control = _load_json(run_dir / "control.json", _validate_control)
-            _authorize(control, token, "coordinator", lease=True)
+            _authorize(control, token, "orchestrator", lease=True)
             if control["integration"]["state"] != "pending":
                 _fail("worker rotation is not allowed after a terminal integration decision", 4)
             status_value = _load_json(run_dir / "status.json", _validate_status)
@@ -1404,7 +1404,7 @@ def _issue(code: str, path: Path | str, detail: str) -> dict[str, str]:
 
 def _doctor_report(run_dir: Path) -> dict[str, Any]:
     issues: list[dict[str, str]] = []
-    required_files = ["run.json", "kickoff.md", "control.json", "status.json", "inbox.jsonl", "outbox.jsonl", "progress.md", "coordinator.lock", "worker.lock"]
+    required_files = ["run.json", "kickoff.md", "control.json", "status.json", "inbox.jsonl", "outbox.jsonl", "progress.md", "orchestrator.lock", "worker.lock"]
     try:
         if stat.S_IMODE(run_dir.stat().st_mode) != 0o700:
             issues.append(_issue("mode", run_dir, "run directory mode must be 0700"))
@@ -1464,7 +1464,7 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
             expected_worker_epoch = 1
             expected_integration = {"state": "pending", "commit": None, "reason": None}
             for message in inbox:
-                if message["type"] == "coordinator-takeover": expected_orchestrator_epoch = message["data"]["new_epoch"]
+                if message["type"] == "orchestrator-takeover": expected_orchestrator_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "worker-relaunched": expected_worker_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "integration": expected_integration = dict(message["data"])
             consumed_results = [message for message in outbox[:control["outbox_cursor"]] if message["type"] == "result"]
@@ -1482,7 +1482,7 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
                         else latest["data"]["disposition"]
                     )
             semantic = {
-                "desired_state": expected_desired, "coordinator_epoch": expected_orchestrator_epoch,
+                "desired_state": expected_desired, "orchestrator_epoch": expected_orchestrator_epoch,
                 "worker_epoch": expected_worker_epoch, "review_state": expected_review,
                 "review_result_id": expected_result, "integration": expected_integration,
             }
@@ -1540,10 +1540,10 @@ def _write_repair_report(run_dir: Path, report: dict[str, Any], name: str) -> di
 def repair_tail(run_dir: Path, journal: str, token: bytes) -> dict[str, Any]:
     run_dir = _run_dir(run_dir)
     if journal not in {"inbox", "outbox"}: _fail("journal must be inbox or outbox")
-    role = "coordinator" if journal == "inbox" else "worker"
+    role = "orchestrator" if journal == "inbox" else "worker"
     with _lock(run_dir, role):
         control = _load_json(run_dir / "control.json", _validate_control)
-        _authorize(control, token, role, lease=(role == "coordinator"))
+        _authorize(control, token, role, lease=(role == "orchestrator"))
         path = run_dir / f"{journal}.jsonl"; raw = path.read_bytes()
         try:
             _journal_unlocked(path, journal)
@@ -1592,7 +1592,7 @@ def repair_tail(run_dir: Path, journal: str, token: bytes) -> dict[str, Any]:
 
 def repair_status(run_dir: Path, token: bytes) -> dict[str, Any]:
     run_dir = _run_dir(run_dir)
-    with _lock(run_dir, "coordinator", shared=True), _lock(run_dir, "worker"):
+    with _lock(run_dir, "orchestrator", shared=True), _lock(run_dir, "worker"):
         control = _load_json(run_dir / "control.json", _validate_control); _authorize(control, token, "worker")
         current = _load_json(run_dir / "status.json", _validate_status)
         outbox = _journal_unlocked(run_dir / "outbox.jsonl", "outbox"); inbox = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
@@ -1626,28 +1626,28 @@ def repair_control(
     new_token: bytes | None = None, new_worker_token: bytes | None = None,
 ) -> dict[str, Any]:
     run_dir = _run_dir(run_dir)
-    with _lock(run_dir, "coordinator"):
+    with _lock(run_dir, "orchestrator"):
         control = _load_json(run_dir / "control.json", _validate_control)
         inbox = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
         pending = inbox[control["last_command_seq"]:]
-        lagging_takeover = bool(pending and pending[0]["type"] == "coordinator-takeover")
+        lagging_takeover = bool(pending and pending[0]["type"] == "orchestrator-takeover")
         if recovery:
             if not lagging_takeover or not secrets.compare_digest(_token_hash(token), control["recovery_token_sha256"]): _fail("recovery credential is not valid for this repair", 3)
-        else: _authorize(control, token, "coordinator", lease=True)
+        else: _authorize(control, token, "orchestrator", lease=True)
         actions: list[dict[str, str]] = []
         for message in pending:
             _apply_inbox(control, message)
-            if message["type"] == "coordinator-takeover":
+            if message["type"] == "orchestrator-takeover":
                 if new_token is None:
                     _fail("repairing an appended takeover requires its new orchestrator token file", 3)
-                control["coordinator_token_sha256"] = _token_hash(new_token)
+                control["orchestrator_token_sha256"] = _token_hash(new_token)
             if message["type"] == "worker-relaunched":
                 if new_worker_token is None:
                     _fail("repairing an appended worker rotation requires its new worker token file", 3)
                 control["worker_token_sha256"] = _token_hash(new_worker_token)
         if control["last_command_seq"] < len(inbox): _fail("control replay did not reach inbox tail", 5)
         if lagging_takeover and recovery:
-            control["coordinator_lease_expires_at"] = _timestamp(_now() + datetime.timedelta(seconds=LEASE_SECONDS))
+            control["orchestrator_lease_expires_at"] = _timestamp(_now() + datetime.timedelta(seconds=LEASE_SECONDS))
         control["revision"] += 1; control["updated_at"] = _timestamp()
         _atomic_json(run_dir / "control.json", control)
         actions.append(_issue("control-replayed", run_dir / "control.json", f"replayed through inbox seq {control['last_command_seq']}"))

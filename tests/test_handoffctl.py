@@ -42,7 +42,7 @@ def registered_run(tmp_path, monkeypatch):
         transport="tmux",
         run_dir=tmp_path / "state" / "run-one",
         recovery_token_file=private / "recovery.token",
-        orchestrator_token_file=private / "coordinator.token",
+        orchestrator_token_file=private / "orchestrator.token",
         worker_token_file=private / "worker.token",
     )
     registry = tmp_path / "registry.json"
@@ -58,7 +58,7 @@ def registered_run(tmp_path, monkeypatch):
         **initialized,
         "private": private,
         "worker": (private / "worker.token").read_bytes(),
-        "orchestrator": (private / "coordinator.token").read_bytes(),
+        "orchestrator": (private / "orchestrator.token").read_bytes(),
     }
 
 
@@ -362,7 +362,7 @@ def test_failed_dispatch_releases_ephemeral_orchestrator(tmp_path, monkeypatch):
         handoffctl._dispatch_registered("weather", "do something else")
 
     control = handoff.control_show(run_dir)
-    assert handoff._parse_time(control["coordinator_lease_expires_at"]) <= handoff._now()
+    assert handoff._parse_time(control["orchestrator_lease_expires_at"]) <= handoff._now()
     assert not list(run["private"].glob("orchestrator-dispatch-*.token"))
 
 
@@ -394,7 +394,7 @@ def test_send_rings_doorbell_for_registered_run(tmp_path, monkeypatch):
 
     body = tmp_path / "body.txt"
     body.write_text("steer body", encoding="utf-8")
-    sent = handoffctl.dispatch(_send_args(run["run_dir"], run["private"] / "coordinator.token", body))
+    sent = handoffctl.dispatch(_send_args(run["run_dir"], run["private"] / "orchestrator.token", body))
 
     assert sent["doorbell_sent"] is True
     assert sent["doorbell_error"] is None
@@ -413,7 +413,7 @@ def test_send_no_doorbell_skips_ring(tmp_path, monkeypatch):
     body = tmp_path / "body.txt"
     body.write_text("steer body", encoding="utf-8")
     sent = handoffctl.dispatch(_send_args(
-        run["run_dir"], run["private"] / "coordinator.token", body, no_doorbell=True,
+        run["run_dir"], run["private"] / "orchestrator.token", body, no_doorbell=True,
     ))
 
     assert sent["doorbell_sent"] is False
@@ -430,14 +430,14 @@ def test_send_unregistered_run_skips_doorbell(tmp_path, monkeypatch):
         workspace=workspace, kickoff=kickoff, harness="claude", model="opus",
         effort="low", transport="tmux", run_dir=tmp_path / "state" / "run",
         recovery_token_file=private / "recovery.token",
-        orchestrator_token_file=private / "coordinator.token",
+        orchestrator_token_file=private / "orchestrator.token",
         worker_token_file=private / "worker.token",
     )
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
 
     body = tmp_path / "body.txt"
     body.write_text("steer body", encoding="utf-8")
-    sent = handoffctl.dispatch(_send_args(initialized["run_dir"], private / "coordinator.token", body))
+    sent = handoffctl.dispatch(_send_args(initialized["run_dir"], private / "orchestrator.token", body))
 
     assert sent["message"]["type"] == "steer"
     assert sent["doorbell_sent"] is False
@@ -531,7 +531,7 @@ def test_cli_coordinator_alias_still_resolves(tmp_path):
     )
     assert registered.returncode == 0, registered.stderr
     assert (
-        json.loads(registered.stdout)["coordinator_id"]
+        json.loads(registered.stdout)["orchestrator_id"]
         == "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     )
 
@@ -555,7 +555,7 @@ def test_cli_orchestrator_dismiss_resolves_registered_run_and_writes_cursor(
         "--owner-pid", os.getpid(),
     )
     assert registered.returncode == 0, registered.stderr
-    orchestrator_id = json.loads(registered.stdout)["coordinator_id"]
+    orchestrator_id = json.loads(registered.stdout)["orchestrator_id"]
     handoff_registry.adopt(run["run"]["run_id"], orchestrator_id)
     handoff.emit(
         Path(run["run_dir"]),
@@ -581,7 +581,7 @@ def test_cli_orchestrator_dismiss_resolves_registered_run_and_writes_cursor(
 
     assert dismissed.returncode == 0, dismissed.stderr
     assert json.loads(dismissed.stdout) == {
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "dismissed": {
             "run_id": run["run"]["run_id"],
             "dismissed_through": 1,
@@ -943,5 +943,5 @@ def test_cli_explicitly_adopts_unowned_registry_run(tmp_path, monkeypatch):
     )
 
     assert adopted.returncode == 0, adopted.stderr
-    assert json.loads(adopted.stdout)["coordinator_id"] == json.loads(registered.stdout)["coordinator_id"]
-    assert handoff_registry.resolve(run["run"]["run_id"])["coordinator_id"] == json.loads(registered.stdout)["coordinator_id"]
+    assert json.loads(adopted.stdout)["orchestrator_id"] == json.loads(registered.stdout)["orchestrator_id"]
+    assert handoff_registry.resolve(run["run"]["run_id"])["orchestrator_id"] == json.loads(registered.stdout)["orchestrator_id"]

@@ -44,13 +44,13 @@ def _validate_record(record: Any) -> dict[str, Any]:
     required = {
         "run_id", "name", "run_dir", "run_uri", "host", "remote_python",
         "transport", "session_transport", "handle", "agent", "model", "effort",
-        "credential_dir", "coordinator_id", "observed_outbox_cursor", "registered_at",
+        "credential_dir", "orchestrator_id", "observed_outbox_cursor", "registered_at",
     }
-    legacy_required = required - {"coordinator_id"}
+    legacy_required = required - {"orchestrator_id"}
     if set(record) == legacy_required:
         # Registry v1 predated detached orchestrator ownership.  Existing
         # records remain deliberately unowned until an explicit adoption.
-        record = {**record, "coordinator_id": None}
+        record = {**record, "orchestrator_id": None}
     if set(record) != required:
         raise handoff.HandoffError("registry record has invalid fields", 5)
     for field in (
@@ -59,15 +59,15 @@ def _validate_record(record: Any) -> dict[str, Any]:
     ):
         if not isinstance(record[field], str) or not record[field]:
             raise handoff.HandoffError(f"registry {field} must be a non-empty string", 5)
-    for field in ("host", "remote_python", "effort", "credential_dir", "coordinator_id"):
+    for field in ("host", "remote_python", "effort", "credential_dir", "orchestrator_id"):
         if record[field] is not None and (not isinstance(record[field], str) or not record[field]):
             raise handoff.HandoffError(f"registry {field} must be null or a non-empty string", 5)
-    if record["coordinator_id"] is not None:
+    if record["orchestrator_id"] is not None:
         try:
-            parsed = uuid.UUID(record["coordinator_id"])
+            parsed = uuid.UUID(record["orchestrator_id"])
         except ValueError as exc:
             raise handoff.HandoffError("registry orchestrator_id must be a UUIDv4", 5) from exc
-        if parsed.version != 4 or str(parsed) != record["coordinator_id"]:
+        if parsed.version != 4 or str(parsed) != record["orchestrator_id"]:
             raise handoff.HandoffError(
                 "registry orchestrator_id must be a lowercase canonical UUIDv4", 5,
             )
@@ -149,7 +149,7 @@ def register(
         if (
             previous is not None
             and orchestrator_id is not None
-            and orchestrator_id != previous["coordinator_id"]
+            and orchestrator_id != previous["orchestrator_id"]
         ):
             raise handoff.HandoffError(
                 "an existing registry record can change orchestrator only through explicit adoption",
@@ -169,8 +169,8 @@ def register(
             "model": model,
             "effort": effort,
             "credential_dir": credential_dir,
-            "coordinator_id": (
-                previous["coordinator_id"] if previous else orchestrator_id
+            "orchestrator_id": (
+                previous["orchestrator_id"] if previous else orchestrator_id
             ),
             "observed_outbox_cursor": previous["observed_outbox_cursor"] if previous else 0,
             "registered_at": previous["registered_at"] if previous else _timestamp(),
@@ -190,12 +190,12 @@ def adopt(run_id: str, orchestrator_id: str, *, path: Path | None = None) -> dic
         if run_id not in registry["runs"]:
             raise handoff.HandoffError(f"unknown handoff run: {run_id}", 4)
         record = registry["runs"][run_id]
-        owner = record["coordinator_id"]
+        owner = record["orchestrator_id"]
         if owner not in {None, orchestrator_id}:
             raise handoff.HandoffError(
                 f"handoff run {run_id} belongs to another orchestrator", 4,
             )
-        record["coordinator_id"] = orchestrator_id
+        record["orchestrator_id"] = orchestrator_id
         _write_unlocked(registry_path, registry)
         return dict(record)
 

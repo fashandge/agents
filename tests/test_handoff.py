@@ -421,7 +421,7 @@ def test_takeover_fences_old_orchestrator_token(run, tmp_path):
     takeover = handoff.control_takeover(
         run_dir, run["recovery"], new_token_file=replacement, reason="owner resumed",
     )
-    assert takeover["control"]["coordinator_epoch"] == 2
+    assert takeover["control"]["orchestrator_epoch"] == 2
     with pytest.raises(handoff.HandoffError) as caught:
         handoff.send(run_dir, run["orchestrator"], type="steer", body="stale writer")
     assert caught.value.exit_code == 3
@@ -439,12 +439,12 @@ def test_appended_takeover_can_be_explicitly_repaired(run, tmp_path, monkeypatch
         handoff.control_takeover(run_dir, run["recovery"], new_token_file=replacement, reason="recover crash")
     monkeypatch.setattr(handoff, "_atomic_json", original)
     assert replacement.exists()
-    assert handoff.control_show(run_dir)["coordinator_epoch"] == 1
+    assert handoff.control_show(run_dir)["orchestrator_epoch"] == 1
     report = handoff.repair_control(
         run_dir, run["recovery"], recovery=True, new_token=replacement.read_bytes(),
     )
     assert report["repaired"]
-    assert handoff.control_show(run_dir)["coordinator_epoch"] == 2
+    assert handoff.control_show(run_dir)["orchestrator_epoch"] == 2
     handoff.send(run_dir, replacement.read_bytes(), type="steer", body="new owner works")
 
 

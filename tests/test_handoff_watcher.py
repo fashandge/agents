@@ -39,7 +39,7 @@ def test_retarget_preserves_a_stopped_orchestrator_identity_and_runs(tmp_path):
         {"workspace": "workspace:9", "surface": surface},
     )
 
-    assert updated["coordinator_id"] == original["coordinator_id"]
+    assert updated["orchestrator_id"] == original["orchestrator_id"]
     assert updated["runs"] == {"run-1": handoff_watcher._empty_run_state()}  # noqa: SLF001
     assert updated["target"] == {"workspace": "workspace:9", "surface": surface}
 
@@ -59,7 +59,7 @@ def registered_run(tmp_path, registry, *, name, orchestrator_id):
         transport="tmux",
         run_dir=tmp_path / "runs" / name,
         recovery_token_file=private / "recovery.token",
-        orchestrator_token_file=private / "coordinator.token",
+        orchestrator_token_file=private / "orchestrator.token",
         worker_token_file=private / "worker.token",
     )
     handoff_registry.register(
@@ -82,7 +82,7 @@ def registered_run(tmp_path, registry, *, name, orchestrator_id):
     return {
         **initialized,
         "worker": (private / "worker.token").read_bytes(),
-        "orchestrator": (private / "coordinator.token").read_bytes(),
+        "orchestrator": (private / "orchestrator.token").read_bytes(),
     }
 
 
@@ -167,10 +167,10 @@ def test_watcher_is_singleton_and_isolates_orchestrators(tmp_path):
         owner_pid=os.getpid(),
     )
     owned = registered_run(
-        tmp_path, registry, name="owned", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="owned", orchestrator_id=owner["orchestrator_id"],
     )
     foreign = registered_run(
-        tmp_path, registry, name="foreign", orchestrator_id=other["coordinator_id"],
+        tmp_path, registry, name="foreign", orchestrator_id=other["orchestrator_id"],
     )
     awaiting_review(owned, "owned body must stay on disk")
     awaiting_review(foreign, "foreign body must never surface")
@@ -200,7 +200,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
     calls = []
     with handoff_watcher.instance_lock(state_path):
         first = registered_run(
-            tmp_path, registry, name="first", orchestrator_id=owner["coordinator_id"],
+            tmp_path, registry, name="first", orchestrator_id=owner["orchestrator_id"],
         )
         awaiting_review(first, "first")
         handoff_watcher.poll(
@@ -209,7 +209,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
             notifier=lambda value, coverage: calls.append(dict(coverage)),
         )
         second = registered_run(
-            tmp_path, registry, name="second", orchestrator_id=owner["coordinator_id"],
+            tmp_path, registry, name="second", orchestrator_id=owner["orchestrator_id"],
         )
         awaiting_review(second, "second")
         handoff_watcher.poll(
@@ -304,10 +304,10 @@ def test_watcher_coalesces_and_never_advances_protocol_cursor(tmp_path):
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     first = registered_run(
-        tmp_path, registry, name="first", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="first", orchestrator_id=owner["orchestrator_id"],
     )
     second = registered_run(
-        tmp_path, registry, name="second", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="second", orchestrator_id=owner["orchestrator_id"],
     )
     awaiting_review(first, "secret first body")
     awaiting_review(second, "secret second body")
@@ -350,7 +350,7 @@ def test_watcher_recovers_both_notification_crash_windows(
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     awaiting_review(run, "durable event")
     delivered = []
@@ -385,7 +385,7 @@ def test_partial_consumption_redoorbells_remainder_and_full_consumption_clears(t
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     checkpoint(run, "one")
     checkpoint(run, "two")
@@ -452,19 +452,19 @@ def test_orchestrator_doorbell_routes_exact_opaque_target(monkeypatch):
     )
 
     tmux_method = handoffctl._notify_orchestrator({
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "transport": "tmux",
         "target": {"handle": "session:3.7"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
     cmux_method = handoffctl._notify_orchestrator({
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
     }, {"run-secret": 9})
     native_method = handoffctl._notify_orchestrator({
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "transport": "native_app",
         "target": {"thread_id": "thread-exact"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -508,7 +508,7 @@ def test_orchestrator_cmux_falls_back_to_workspace_notification(monkeypatch):
     )
 
     method = handoffctl._notify_orchestrator({
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -552,7 +552,7 @@ def test_orchestrator_cmux_uses_macos_notification_when_cmux_notifications_fail(
     )
 
     method = handoffctl._notify_orchestrator({
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -596,7 +596,7 @@ def test_orchestrator_cmux_reports_combined_error_when_every_channel_fails(monke
 
     with pytest.raises(handoff_launcher.AdapterError) as captured:
         handoffctl._notify_orchestrator({
-            "coordinator_id": orchestrator_id,
+            "orchestrator_id": orchestrator_id,
             "transport": "cmux",
             "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
             "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -632,7 +632,7 @@ def test_orchestrator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch
     )
 
     method = handoffctl._notify_orchestrator({
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -671,7 +671,7 @@ def test_orchestrator_cmux_confirmed_input_survives_notification_failure(monkeyp
     )
 
     method = handoffctl._notify_orchestrator({
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
@@ -684,7 +684,7 @@ def test_watcher_records_doorbell_channel_and_clears_it_on_failure(tmp_path):
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     awaiting_review(run, "secret body")
     now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
@@ -731,7 +731,7 @@ def test_pending_uses_hot_path_and_full_context_only_for_recovery(
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     first = checkpoint(run, "first")
     second = awaiting_review(run, "second")
@@ -775,7 +775,7 @@ def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
     )
     assert calls == []
     handoff_registry.adopt(
-        run["run"]["run_id"], owner["coordinator_id"], path=registry,
+        run["run"]["run_id"], owner["orchestrator_id"], path=registry,
     )
     handoff_watcher.poll(
         state_path,
@@ -790,7 +790,7 @@ def test_awaiting_review_result_rings_once_then_acknowledge_stops_reringing(tmp_
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     awaiting_review(run, "result body")
     calls = []
@@ -828,7 +828,7 @@ def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     awaiting_review(run, "first")
     calls = []
@@ -865,10 +865,10 @@ def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
     state_path, owner = orchestrator_state(tmp_path)
     first = registered_run(
-        tmp_path, registry, name="first", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="first", orchestrator_id=owner["orchestrator_id"],
     )
     second = registered_run(
-        tmp_path, registry, name="second", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="second", orchestrator_id=owner["orchestrator_id"],
     )
     awaiting_review(first, "first body")
     awaiting_review(second, "second body")
@@ -943,7 +943,7 @@ def test_working_checkpoint_does_not_ring(tmp_path):
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     checkpoint(run, "ordinary progress")
     calls = []
@@ -962,7 +962,7 @@ def test_blocked_question_rerings_after_acknowledge_until_worker_resumes(tmp_pat
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     question = blocked(run)
     calls = []
@@ -1010,7 +1010,7 @@ def test_terminal_worker_state_does_not_ring(tmp_path, state):
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     if state == "succeeded":
         result = awaiting_review(run)
@@ -1048,7 +1048,7 @@ def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)
     run = registered_run(
-        tmp_path, registry, name="worker", orchestrator_id=owner["coordinator_id"],
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
     )
     blocked(run)
     calls = []
@@ -1112,7 +1112,7 @@ def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, m
         model="gpt-test",
         effort="high",
         credential_dir=None,
-        orchestrator_id=owner["coordinator_id"],
+        orchestrator_id=owner["orchestrator_id"],
     )
     commands = []
 

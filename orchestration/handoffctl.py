@@ -177,7 +177,7 @@ def _ring_doorbell(record: dict[str, Any], run_id: str, inbox_seq: int) -> tuple
 
 
 def _send_with_doorbell(args: argparse.Namespace) -> dict[str, Any]:
-    result = handoff.send(args.run_dir, _token(args, "coordinator"), **_mutation_inputs(args))
+    result = handoff.send(args.run_dir, _token(args, "orchestrator"), **_mutation_inputs(args))
     doorbell_sent = False
     doorbell_error: str | None = None
     if not args.no_doorbell:
@@ -208,7 +208,7 @@ def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
         raise handoff.HandoffError("registered recovery credential is unavailable", 3) from exc
 
     control = handoff.control_show(run_dir)
-    if handoff._parse_time(control["coordinator_lease_expires_at"]) > handoff._now():  # noqa: SLF001
+    if handoff._parse_time(control["orchestrator_lease_expires_at"]) > handoff._now():  # noqa: SLF001
         raise handoff.HandoffError(
             "orchestrator lease is active; use the current managed orchestrator", 4,
         )
@@ -396,7 +396,7 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str
             "orchestrator process ownership cannot be verified; doorbell suppressed", 6,
         )
     del coverage  # The canonical snapshot-pointer doorbell is intentionally opaque.
-    orchestrator_id = value["coordinator_id"]
+    orchestrator_id = value["orchestrator_id"]
     target = value["target"]
     if value["transport"] == "tmux":
         handoff_launcher.TmuxAdapter().orchestrator_doorbell(
@@ -670,7 +670,7 @@ def _start_surface_watcher(
     handle = adapter.launch(
         _watcher_tab_name(
             cmux_binary, hosting_workspace, orchestrator_title,
-            value["coordinator_id"],
+            value["orchestrator_id"],
         ),
         path.parent,
         _surface_watcher_command(path, interval),
@@ -683,7 +683,7 @@ def _start_surface_watcher(
     while time.monotonic() < deadline:
         if handoff_watcher.is_running(path):
             return {
-                "coordinator_id": value["coordinator_id"],
+                "orchestrator_id": value["orchestrator_id"],
                 "mode": "surface",
                 "pid": None,
                 "surface": handle,
@@ -723,7 +723,7 @@ def _start_orchestrator_watcher(
             except OSError:
                 surface = None
             return {
-                "coordinator_id": value["coordinator_id"],
+                "orchestrator_id": value["orchestrator_id"],
                 "mode": "surface" if surface else "detached",
                 "pid": pid,
                 "surface": surface,
@@ -764,7 +764,7 @@ def _start_orchestrator_watcher(
         while time.monotonic() < deadline:
             if handoff_watcher.is_running(path):
                 return {
-                    "coordinator_id": value["coordinator_id"],
+                    "orchestrator_id": value["orchestrator_id"],
                     "mode": "detached",
                     "pid": process["pid"],
                     "surface": None,
@@ -787,7 +787,7 @@ def _orchestrator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
     records = {
         record["run_id"]: record
         for record in handoff_registry.list_records(private=True)
-        if record["coordinator_id"] == value["coordinator_id"]
+        if record["orchestrator_id"] == value["orchestrator_id"]
     }
     pending: list[dict[str, Any]] = []
     acks: dict[str, int] = {}
@@ -837,7 +837,7 @@ def _orchestrator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
     # stops re-ringing them; a strictly newer worker event still doorbells.
     handoff_watcher.acknowledge(path, acks)
     return {
-        "coordinator_id": value["coordinator_id"],
+        "orchestrator_id": value["orchestrator_id"],
         "mode": "recovery" if full_context else "hot",
         "pending": pending,
     }
@@ -855,7 +855,7 @@ def _orchestrator_dismiss(path: Path, selector: str) -> dict[str, Any]:
         path, {run_id: notification["observed_through"]},
     )
     return {
-        "coordinator_id": value["coordinator_id"],
+        "orchestrator_id": value["orchestrator_id"],
         "dismissed": {
             "run_id": run_id,
             "dismissed_through": updated["runs"][run_id].get("dismissed_through", 0),
@@ -1088,7 +1088,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
             record = handoff_registry.resolve(args.run, private=True)
             orchestrator = handoff_watcher.read(args.orchestrator_state)
             return handoff_registry.public(handoff_registry.adopt(
-                record["run_id"], orchestrator["coordinator_id"],
+                record["run_id"], orchestrator["orchestrator_id"],
             ))
     if args.command in {"orchestrator", "coordinator"}:  # "coordinator" is the hidden compat alias.
         if args.orchestrator_command == "register": return _register_orchestrator(args)
@@ -1118,19 +1118,19 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
     if args.command == "control":
         action = args.control_command
         if action == "show": return handoff.control_show(args.run_dir)
-        if action == "consume": return handoff.control_consume(args.run_dir, _token(args, "coordinator"), through=args.through)
-        if action == "renew": return handoff.control_renew(args.run_dir, _token(args, "coordinator"))
-        if action == "release": return handoff.control_release(args.run_dir, _token(args, "coordinator"))
-        if action == "integrate": return handoff.control_integrate(args.run_dir, _token(args, "coordinator"), commit=args.commit)
-        if action == "abandon": return handoff.control_abandon(args.run_dir, _token(args, "coordinator"), reason=_read_text(args.reason_file), commit=args.commit)
+        if action == "consume": return handoff.control_consume(args.run_dir, _token(args, "orchestrator"), through=args.through)
+        if action == "renew": return handoff.control_renew(args.run_dir, _token(args, "orchestrator"))
+        if action == "release": return handoff.control_release(args.run_dir, _token(args, "orchestrator"))
+        if action == "integrate": return handoff.control_integrate(args.run_dir, _token(args, "orchestrator"), commit=args.commit)
+        if action == "abandon": return handoff.control_abandon(args.run_dir, _token(args, "orchestrator"), reason=_read_text(args.reason_file), commit=args.commit)
         if action == "takeover":
             recovery = args.recovery_token_file.read_bytes()
             return handoff.control_takeover(args.run_dir, recovery, new_token_file=args.new_token_file, reason=_read_text(args.reason_file), force=args.force)
         if action == "rotate-worker":
-            return handoff.control_rotate_worker(args.run_dir, _token(args, "coordinator"), new_token_file=args.new_token_file, reason=_read_text(args.reason_file), confirmed_dead=args.confirmed_dead)
+            return handoff.control_rotate_worker(args.run_dir, _token(args, "orchestrator"), new_token_file=args.new_token_file, reason=_read_text(args.reason_file), confirmed_dead=args.confirmed_dead)
     if args.command == "doctor":
         if args.repair_tail:
-            role = "coordinator" if args.repair_tail == "inbox" else "worker"
+            role = "orchestrator" if args.repair_tail == "inbox" else "worker"
             return handoff.repair_tail(args.run_dir, args.repair_tail, _token(args, role))
         if args.repair_status: return handoff.repair_status(args.run_dir, _token(args, "worker"))
         if args.repair_progress: return handoff.repair_progress(args.run_dir, _token(args, "worker"))
@@ -1143,7 +1143,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
                     new_token=new_token, new_worker_token=new_worker_token,
                 )
             return handoff.repair_control(
-                args.run_dir, _token(args, "coordinator"),
+                args.run_dir, _token(args, "orchestrator"),
                 new_token=new_token, new_worker_token=new_worker_token,
             )
         return handoff.doctor(args.run_dir)

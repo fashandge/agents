@@ -154,7 +154,7 @@ def _orchestrator_id_from_state(path: Path | None) -> str | None:
         raise handoff.HandoffError("orchestrator state path must be absolute", 2)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        orchestrator_id = value["coordinator_id"]
+        orchestrator_id = value["orchestrator_id"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise handoff.HandoffError(f"invalid orchestrator state {path}: {exc}", 5) from exc
     try:
@@ -615,7 +615,7 @@ def launch(
         workspace=cwd, kickoff=kickoff, harness=agent, model=recorded_model, effort=effort,
         transport=protocol_transport, inputs=inputs or [], state_root=state_root, run_dir=run_dir,
         recovery_token_file=private_dir / "recovery.token",
-        orchestrator_token_file=private_dir / "coordinator.token",
+        orchestrator_token_file=private_dir / "orchestrator.token",
         worker_token_file=private_dir / "worker.token",
     )
     actual_run_dir = Path(initialized["run_dir"])
@@ -645,7 +645,7 @@ def launch(
             # Kimi process startup and semantic readiness have separate waits.
             # Refresh ownership between them so a slow startup cannot make the
             # eventual launch-only release fail on an expired lease.
-            handoff.control_renew(actual_run_dir, (private_dir / "coordinator.token").read_bytes())
+            handoff.control_renew(actual_run_dir, (private_dir / "orchestrator.token").read_bytes())
             ready = wait_ready(adapter, handle, agent, actual_run_dir, timeout=readiness_timeout)
             if not ready:
                 rescue = adapter.rescue_command(handle)
@@ -662,7 +662,7 @@ def launch(
             rescue = adapter.rescue_command(handle)
     orchestrator_released = False
     if not retain_orchestrator:
-        orchestrator_token = (private_dir / "coordinator.token").read_bytes()
+        orchestrator_token = (private_dir / "orchestrator.token").read_bytes()
         handoff.control_release(actual_run_dir, orchestrator_token)
         orchestrator_released = True
     result = {
@@ -692,6 +692,10 @@ def launch(
     return result
 
 
+# The SSH wire keys below stay spelled "coordinator" on purpose: remote hosts
+# run the old installed package and validate this exact field set, so renaming
+# them here would break every remote launch.  Rename only in step with the
+# remote package (remaining Phase 2 follow-up).
 REMOTE_REQUEST_FIELDS = {
     "name", "kickoff_b64", "goal_b64", "cwd", "agent", "model", "effort",
     "pmode", "inputs", "state_root", "run_dir", "readiness_timeout",
@@ -925,8 +929,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--orchestrator-state", "--coordinator-state", dest="orchestrator_state",
         type=Path,
-        default=Path(os.environ["HANDOFF_COORDINATOR_STATE"])
-        if os.environ.get("HANDOFF_COORDINATOR_STATE") else None,
+        default=Path(os.environ["HANDOFF_ORCHESTRATOR_STATE"])
+        if os.environ.get("HANDOFF_ORCHESTRATOR_STATE") else None,
         help="private orchestrator watcher snapshot that owns this launched run",
     )
     return parser
