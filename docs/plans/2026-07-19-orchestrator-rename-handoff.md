@@ -335,14 +335,16 @@ pristine backup, so they are historical artifacts, not migration damage.
 
 ### Deliberately still "coordinator" after Phase 2
 
-- **Remote wire keys** `retain_coordinator` and `coordinator_id` in the SSH
-  JSON payload (`REMOTE_REQUEST_FIELDS` and friends in
-  `handoff_launcher.py`, marked with a comment): the remote host (`oci-box`)
-  still runs the pre-rename package and validates that exact field set.
-  **Remaining work:** rename these only in step with updating the remote
-  installed package. For the same reason the remote-side credential file and
-  env var stay `coordinator.token` / `HANDOFF_COORDINATOR_TOKEN_FILE` on the
-  remote host until then (noted in the skill's `remote-and-viewers.md`).
+- ~~**Remote wire keys**~~ — **unfrozen 2026-07-20.** `oci-box` was updated to
+  the post-rename package (its state tree migrated: 35 files, backup
+  `handoff.pre-orchestrator-migration-20260720T190249Z`), so
+  `REMOTE_REQUEST_FIELDS` now carries `retain_orchestrator` /
+  `orchestrator_id`. The receiver additionally normalizes the two pre-rename
+  spellings via `REMOTE_LEGACY_REQUEST_KEYS`: unlike on-disk state, the two
+  ends of an SSH launch are updated independently, so a launcher from a
+  not-yet-updated checkout would otherwise fail with an opaque "invalid remote
+  launch request". That tolerance is receive-side only — senders always emit
+  the new names — and it can be dropped once no stale checkouts remain.
 - The **CLI aliases** kept from Phase 1 (`coordinator` subcommand alias,
   `--coordinator-id` / `--coordinator-state` / `--coordinator-token-file` /
   `--retain-coordinator` flags).

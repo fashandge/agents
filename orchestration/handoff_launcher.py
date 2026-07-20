@@ -697,14 +697,19 @@ def launch(
     return result
 
 
-# The SSH wire keys below stay spelled "coordinator" on purpose: remote hosts
-# run the old installed package and validate this exact field set, so renaming
-# them here would break every remote launch.  Rename only in step with the
-# remote package (remaining Phase 2 follow-up).
 REMOTE_REQUEST_FIELDS = {
     "name", "kickoff_b64", "goal_b64", "cwd", "agent", "model", "effort",
     "pmode", "inputs", "state_root", "run_dir", "readiness_timeout",
-    "confirm_ready", "retain_coordinator", "credential_dir", "coordinator_id",
+    "confirm_ready", "retain_orchestrator", "credential_dir", "orchestrator_id",
+}
+
+# Senders always emit the names above.  The receiver additionally accepts the
+# pre-rename spellings because the two ends of an SSH launch are updated
+# independently: a launcher from a not-yet-updated checkout would otherwise
+# fail with an opaque "invalid remote launch request".
+REMOTE_LEGACY_REQUEST_KEYS = {
+    "retain_coordinator": "retain_orchestrator",
+    "coordinator_id": "orchestrator_id",
 }
 
 
@@ -735,8 +740,10 @@ def _decode_remote_file(value: Any, field: str, *, required: bool = False) -> by
 
 def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
     """Validate a JSON-over-stdin request and launch it on this SSH host."""
-    if isinstance(request, dict) and set(request) == REMOTE_REQUEST_FIELDS - {"coordinator_id"}:
-        request = {**request, "coordinator_id": None}
+    if isinstance(request, dict):
+        request = {REMOTE_LEGACY_REQUEST_KEYS.get(key, key): value for key, value in request.items()}
+    if isinstance(request, dict) and set(request) == REMOTE_REQUEST_FIELDS - {"orchestrator_id"}:
+        request = {**request, "orchestrator_id": None}
     if not isinstance(request, dict) or set(request) != REMOTE_REQUEST_FIELDS:
         raise handoff.HandoffError("invalid remote launch request", 2)
     if not isinstance(request["name"], str) or not request["name"]:
@@ -746,14 +753,14 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
     for field in ("model", "effort"):
         if request[field] is not None and not isinstance(request[field], str):
             raise handoff.HandoffError(f"remote {field} must be a string or null", 2)
-    request["coordinator_id"] = _validate_orchestrator_id(request["coordinator_id"])
+    request["orchestrator_id"] = _validate_orchestrator_id(request["orchestrator_id"])
     if not isinstance(request["pmode"], str) or not request["pmode"]:
         raise handoff.HandoffError("remote pmode must be a non-empty string", 2)
     if not isinstance(request["inputs"], list) or not all(isinstance(item, str) for item in request["inputs"]):
         raise handoff.HandoffError("remote inputs must be a list of paths", 2)
     if not isinstance(request["readiness_timeout"], (int, float)) or request["readiness_timeout"] <= 0:
         raise handoff.HandoffError("remote readiness_timeout must be positive", 2)
-    for field in ("confirm_ready", "retain_coordinator"):
+    for field in ("confirm_ready", "retain_orchestrator"):
         if not isinstance(request[field], bool):
             raise handoff.HandoffError(f"remote {field} must be boolean", 2)
 
@@ -761,7 +768,7 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
     state_root = _remote_path(request["state_root"], "state_root")
     run_dir = _remote_path(request["run_dir"], "run_dir")
     credential_dir = _remote_path(request["credential_dir"], "credential_dir")
-    if request["retain_coordinator"] and credential_dir is None:
+    if request["retain_orchestrator"] and credential_dir is None:
         raise handoff.HandoffError("managed remote launch requires credential_dir", 2)
     kickoff_bytes = _decode_remote_file(request["kickoff_b64"], "kickoff", required=True)
     goal_bytes = _decode_remote_file(request["goal_b64"], "goal")
@@ -780,9 +787,9 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
             inputs=request["inputs"], state_root=state_root, run_dir=run_dir,
             readiness_timeout=float(request["readiness_timeout"]),
             confirm_ready=request["confirm_ready"],
-            retain_orchestrator=request["retain_coordinator"],
+            retain_orchestrator=request["retain_orchestrator"],
             credential_dir=credential_dir, recorded_transport="ssh_tmux",
-            orchestrator_id=request["coordinator_id"],
+            orchestrator_id=request["orchestrator_id"],
         )
     finally:
         shutil.rmtree(source_dir, ignore_errors=True)
@@ -921,9 +928,9 @@ def launch_remote(
         "run_dir": str(run_dir) if run_dir is not None else None,
         "readiness_timeout": effective_readiness_timeout,
         "confirm_ready": confirm_ready,
-        "retain_coordinator": retain_orchestrator,
+        "retain_orchestrator": retain_orchestrator,
         "credential_dir": str(credential_dir) if credential_dir is not None else None,
-        "coordinator_id": orchestrator_id,
+        "orchestrator_id": orchestrator_id,
     }
     remote_argv = [
         remote_python, "-m", "agents.orchestration.handoff_launcher",

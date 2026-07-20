@@ -781,6 +781,8 @@ def test_receive_remote_request_materializes_private_kickoff_and_uses_ssh_tmux(t
         "run_dir": None,
         "readiness_timeout": 90,
         "confirm_ready": False,
+        # Pre-rename spelling: a launcher from a not-yet-updated checkout must
+        # still be accepted by an updated receiver.
         "retain_coordinator": True,
         "credential_dir": str(tmp_path / "credentials"),
     }
@@ -793,6 +795,42 @@ def test_receive_remote_request_materializes_private_kickoff_and_uses_ssh_tmux(t
     assert captured["credential_dir"] == tmp_path / "credentials"
     assert captured["kickoff_text"] == "literal $(touch NOPE)"
     assert captured["goal_text"] == "/goal finish the task"
+    assert captured["retain_orchestrator"] is True
+
+
+def test_receive_remote_request_accepts_the_current_wire_spelling(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+        return {"run_dir": "/remote/state/run", "handle": "worker", "transport": "ssh_tmux"}
+
+    monkeypatch.setattr(handoff_launcher, "launch", fake_launch)
+    orchestrator_id = "c7f1a3b7-4ddf-43e7-a0e3-bc1cf811bf4d"
+    request = {
+        "name": "remote-worker",
+        "kickoff_b64": handoff_launcher.base64.b64encode(b"do the thing").decode(),
+        "goal_b64": None,
+        "cwd": str(tmp_path),
+        "agent": "claude",
+        "model": None,
+        "effort": None,
+        "pmode": "bypassPermissions",
+        "inputs": [],
+        "state_root": str(tmp_path / "state"),
+        "run_dir": None,
+        "readiness_timeout": 90,
+        "confirm_ready": False,
+        "retain_orchestrator": True,
+        "credential_dir": str(tmp_path / "credentials"),
+        "orchestrator_id": orchestrator_id,
+    }
+
+    result = handoff_launcher.receive_remote_request(request)
+
+    assert result["handle"] == "worker"
+    assert captured["retain_orchestrator"] is True
+    assert captured["orchestrator_id"] == orchestrator_id
 
 
 def test_launch_remote_sends_json_over_stdin_and_returns_remote_uri(tmp_path, monkeypatch):
