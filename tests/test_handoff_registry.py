@@ -333,6 +333,66 @@ def test_forget_valid_record_while_another_record_is_corrupt(tmp_path):
     assert set(remaining) == {"run-broken"}
 
 
+def pre_rename_record(registry, key="run-old"):
+    """A record invalid only because it predates the orchestrator rename."""
+    value = json.loads(registry.read_text())
+    stale = dict(value["runs"][next(iter(value["runs"]))])
+    stale["run_id"] = key
+    stale["coordinator_id"] = stale.pop("orchestrator_id", None)
+    value["runs"][key] = stale
+    registry.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_forget_refuses_pre_rename_record_and_points_at_the_migration(tmp_path):
+    registry = tmp_path / "registry.json"
+    record(registry, run_id="run-one")
+    pre_rename_record(registry)
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoff_registry.forget("run-old", path=registry)
+
+    assert excinfo.value.exit_code == handoff.PRE_ORCHESTRATOR_RENAME_EXIT_CODE
+    assert "predates the orchestrator rename" in str(excinfo.value)
+    assert "migrate_handoff_state_orchestrator.py" in str(excinfo.value)
+    # The record survives: migration restores it, deletion would not.
+    assert "run-old" in json.loads(registry.read_text())["runs"]
+
+
+def test_forget_force_still_removes_a_pre_rename_record(tmp_path):
+    registry = tmp_path / "registry.json"
+    record(registry, run_id="run-one")
+    pre_rename_record(registry)
+
+    result = handoff_registry.forget("run-old", path=registry, force=True)
+
+    assert result["removed"]["run_id"] == "run-old"
+    assert set(json.loads(registry.read_text())["runs"]) == {"run-one"}
+
+
+def test_forget_still_reports_generic_corruption_normally(tmp_path):
+    """The migration guidance must not swallow unrelated corruption."""
+    registry = tmp_path / "registry.json"
+    record(registry, run_id="run-one")
+    corrupt_record(registry)
+
+    result = handoff_registry.forget("run-broken", path=registry)
+
+    assert "predates the orchestrator rename" not in (result["note"] or "")
+    assert "invalid" in result["note"]
+
+
+def test_prune_points_pre_rename_records_at_the_migration(tmp_path):
+    registry = tmp_path / "registry.json"
+    record(registry, run_id="run-one")
+    pre_rename_record(registry)
+
+    report = handoff_registry.prune(path=registry, dry_run=True)
+
+    reason = next(item["reason"] for item in report["skipped"] if item["run_id"] == "run-old")
+    assert "predates the orchestrator rename" in reason
+    assert "runs forget" not in reason
+
+
 def test_forget_refuses_invalid_record_pointing_at_a_live_run_without_force(tmp_path):
     registry = tmp_path / "registry.json"
     run = live_run(tmp_path, registry)

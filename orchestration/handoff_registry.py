@@ -39,6 +39,19 @@ def _empty() -> dict[str, Any]:
     return {"version": REGISTRY_VERSION, "runs": {}}
 
 
+def _is_pre_rename_record(record: Any) -> bool:
+    """Whether a record is invalid only because it predates the rename.
+
+    Such a record is recoverable in full by the migration, so removing it
+    would destroy state the migration would have preserved.
+    """
+    return (
+        isinstance(record, dict)
+        and "coordinator_id" in record
+        and "orchestrator_id" not in record
+    )
+
+
 def _validate_record(record: Any, *, path: Path | None = None) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise handoff.HandoffError("registry record must be an object", 5)
@@ -348,6 +361,10 @@ def forget(selector: str, *, path: Path | None = None, force: bool = False) -> d
     with _locked(registry_path, exclusive=True):
         registry, invalid = _read_lenient_unlocked(registry_path)
         key, record, error = _resolve_lenient(registry, invalid, selector)
+        if error is not None and not force and _is_pre_rename_record(record):
+            # Migration restores this record intact, so send the operator there
+            # rather than letting the escape hatch delete recoverable state.
+            handoff._pre_orchestrator_rename("coordinator_id", registry_path)  # noqa: SLF001
         if error is not None:
             # A corrupt record gets the same conservative liveness check its
             # raw fields allow; without a usable run_dir there is nothing a
@@ -403,10 +420,18 @@ def prune(
         skipped: list[dict[str, Any]] = []
         for key, error in invalid.items():
             raw = registry["runs"][key]
+            if _is_pre_rename_record(raw):
+                reason = (
+                    "record predates the orchestrator rename; run "
+                    "scripts/migrate_handoff_state_orchestrator.py to restore it "
+                    "instead of removing it"
+                )
+            else:
+                reason = f"record is invalid ({error}); remove it deliberately with runs forget"
             skipped.append({
                 "run_id": key,
                 "name": raw.get("name") if isinstance(raw, dict) else None,
-                "reason": f"record is invalid ({error}); remove it deliberately with runs forget",
+                "reason": reason,
             })
         valid = [record for key, record in registry["runs"].items() if key not in invalid]
         for record in sorted(valid, key=lambda item: item["registered_at"]):
