@@ -1,22 +1,30 @@
 #!/bin/bash
-# tmux_run_logged.sh — run a batch command in a detached tmux session whose
-# pane stays live AND whose output is captured to a logfile.
+# tmux_run_logged.sh — run a batch command decoupled from tmux, with a live
+# disposable tmux view of its log.
 #
-# Why: an ad-hoc tmux session running a batch command (a rebuild, a sweep, a
-# bulk download) with output redirected to a log file displays a blank pane
-# that reads as "dead" — a viewer cannot tell progress from failure. Agent
-# workers (Claude/Codex/Kimi) render their own TUI and need nothing extra;
-# use this wrapper for any non-TUI tmux session the user may view.
+# Why two requirements at once:
+#   1. VISIBLE: an ad-hoc tmux session running a batch command with output
+#      redirected to a log file displays a blank pane that reads as "dead" —
+#      a viewer cannot tell progress from failure.
+#   2. DECOUPLED: a command run AS the tmux pane command dies with the pane.
+#      cmux's remote-tmux mirror makes this a live hazard — the control-mode
+#      mapping is bidirectional, so accidentally closing the mirror
+#      workspace kills the remote tmux session, SIGHUPs the pane's process
+#      group, and destroys hours of batch work (this happened 2026-07-20).
+#
+# So: the real command runs under `setsid nohup`, immune to tmux/SSH/viewer
+# death; the tmux session only runs `tail -F <logfile>` and is disposable —
+# closing it (directly or via a mirror workspace) kills only the tail.
 #
 # Usage:
 #   tmux_run_logged.sh <session-name> <logfile> -- <command...>
 #
-# Behavior: creates a detached tmux session running
-#   <command...> 2>&1 | tee <logfile>; echo EXIT:${PIPESTATUS[0]} | tee -a <logfile>
-# so output goes to both the pane and the logfile. The exit marker uses
-# PIPESTATUS[0] — plain $? after a pipe would report tee's status, not the
-# command's. The inner pipeline runs under bash so PIPESTATUS is available
-# regardless of the tmux default shell.
+# The logfile gets the command's combined output plus a final EXIT:<code>
+# line. Put any completion chain (notifications, timer re-arms) INSIDE the
+# command you pass, or watch for the EXIT: marker — never in the tmux
+# session. Agent workers (Claude/Codex/Kimi) render their own TUI and need
+# nothing extra; use this wrapper for any non-TUI batch job the user may
+# want to view.
 #
 # If a tool is genuinely silent for long stretches, prefer a variant that
 # emits periodic progress (verbose/progress flags) so the pane visibly
@@ -27,9 +35,10 @@ usage() {
   cat <<'EOF'
 Usage: tmux_run_logged.sh <session-name> <logfile> -- <command...>
 
-Create a detached tmux session running <command...> with output tee'd to both
-the pane and <logfile>, appending EXIT:<code> (from PIPESTATUS[0]) to both
-when the command completes.
+Run <command...> under setsid nohup with output to <logfile> (plus a final
+EXIT:<code> line), and create a detached, disposable tmux session named
+<session-name> running `tail -F <logfile>` as a live view. Closing the view
+session never affects the command.
 EOF
 }
 
@@ -54,8 +63,14 @@ if tmux has-session -t "$session" 2>/dev/null; then
   die "tmux session already exists: $session"
 fi
 
+: > "$logfile"
+
 printf -v cmd_quoted '%q ' "$@"
-inner="${cmd_quoted}2>&1 | tee $(printf '%q' "$logfile"); st=\${PIPESTATUS[0]}; echo \"EXIT:\$st\" | tee -a $(printf '%q' "$logfile")"
-tmux new-session -d -s "$session" "bash -c $(printf '%q' "$inner")"
-echo "session $session running detached; log: $logfile"
+runner="${cmd_quoted}>> $(printf '%q' "$logfile") 2>&1; echo \"EXIT:\$?\" >> $(printf '%q' "$logfile")"
+setsid nohup bash -c "$runner" >/dev/null 2>&1 < /dev/null &
+runner_pid=$!
+
+tmux new-session -d -s "$session" "tail -F $(printf '%q' "$logfile")"
+echo "command running decoupled (setsid pgid $runner_pid); log: $logfile"
+echo "view session: $session (disposable; closing it never affects the command)"
 echo "attach with: tmux attach -t $session"
