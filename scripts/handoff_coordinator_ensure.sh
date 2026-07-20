@@ -1,0 +1,109 @@
+#!/bin/bash
+# handoff_coordinator_ensure.sh — idempotent session-watcher bootstrap for the
+# handoff-agent skill's monitored launch mode. Replaces the hand-executed
+# register+start sequence: creates one private coordinator state file (when
+# needed), registers the exact orchestrator target plus owner PID, and starts
+# (or reuses) the singleton watcher.
+#
+# Usage:
+#   handoff_coordinator_ensure.sh --transport cmux|tmux --owner-pid <pid> \
+#       [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
+#
+# Behavior:
+#   * --state omitted: create $HOME/.local/state/agents/handoff/coordinators
+#     (a mode-700 parent is fine), then a private `mktemp -d .../session.XXXXXX`
+#     dir (chmod 700), and use <dir>/watcher.json as the state file.
+#   * --state given and the file already exists: skip registration and only run
+#     `coordinator start`, which returns started:false when the same session
+#     watcher is already running — not an error.
+#   * Otherwise run `coordinator register`, then `coordinator start`.
+#
+# Final stdout is exactly one JSON line:
+#   {"state": "<path>", "registered": true|false, "started": true|false}
+# `registered` is true only when THIS invocation performed registration.
+#
+# Invariants:
+#   * --owner-pid must be the PID of the long-lived Claude/Codex orchestrator
+#     process — never a transient tool shell's $$ or $PPID. Registration
+#     captures both PID and process-start identity so PID reuse cannot
+#     preserve an orphaned watcher.
+#   * cmux registration resolves the orchestrator surface from CMUX_SURFACE_ID
+#     in the environment; tmux registration requires --target with the exact
+#     orchestrator tmux handle.
+#   * Keep the printed state path private and reuse it only for the same
+#     orchestrator session; pass it as --coordinator-state to every monitored
+#     handoff_agent.sh launch.
+#   * This script never accepts or prints token/credential material.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: handoff_coordinator_ensure.sh --transport cmux|tmux --owner-pid <pid> [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
+
+Idempotent handoff session-watcher bootstrap: registers the orchestrator
+target once (unless --state already exists), then starts or reuses the
+singleton watcher. Prints one JSON line:
+  {"state": "<path>", "registered": true|false, "started": true|false}
+EOF
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+PYTHON=/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python
+HELPER=("$PYTHON" -m agents.orchestration.handoffctl)
+
+transport=""
+owner_pid=""
+target=""
+state=""
+interval="5"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --transport) transport=${2:?'missing value for --transport'}; shift 2 ;;
+    --owner-pid) owner_pid=${2:?'missing value for --owner-pid'}; shift 2 ;;
+    --target)    target=${2:?'missing value for --target'}; shift 2 ;;
+    --state)     state=${2:?'missing value for --state'}; shift 2 ;;
+    --interval)  interval=${2:?'missing value for --interval'}; shift 2 ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           usage >&2; die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "$transport" ]] || { usage >&2; die "--transport is required"; }
+[[ -n "$owner_pid" ]] || { usage >&2; die "--owner-pid is required"; }
+case "$transport" in
+  cmux|tmux) ;;
+  *) die "--transport must be cmux or tmux" ;;
+esac
+[[ "$owner_pid" =~ ^[0-9]+$ ]] || die "--owner-pid must be the numeric PID of the long-lived orchestrator process, never a transient tool shell's \$\$ or \$PPID"
+if [[ "$transport" == tmux && -z "$target" ]]; then
+  die "--target <exact-tmux-handle> is required for --transport tmux"
+fi
+
+if [[ -z "$state" ]]; then
+  base="$HOME/.local/state/agents/handoff/coordinators"
+  mkdir -p "$base"
+  session_root=$(mktemp -d "$base/session.XXXXXX")
+  chmod 700 "$session_root"
+  state="$session_root/watcher.json"
+fi
+
+registered=false
+if [[ -f "$state" ]]; then
+  # Existing registration: skip register; `coordinator start` below reuses the
+  # singleton watcher and may report started:false — not an error.
+  registered=false
+else
+  mkdir -p "$(dirname "$state")"
+  register_args=(coordinator register --state "$state" --transport "$transport" --owner-pid "$owner_pid")
+  [[ -z "$target" ]] || register_args+=(--target "$target")
+  "${HELPER[@]}" "${register_args[@]}" >/dev/null
+  registered=true
+fi
+
+start_out=$("${HELPER[@]}" coordinator start --state "$state" --interval "$interval")
+started=$("$PYTHON" -c 'import json,sys; print("true" if json.loads(sys.argv[1]).get("started") else "false")' "$start_out")
+
+"$PYTHON" -c 'import json,sys; print(json.dumps({"state": sys.argv[1], "registered": sys.argv[2] == "true", "started": sys.argv[3] == "true"}))' \
+  "$state" "$registered" "$started"
