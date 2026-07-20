@@ -1,5 +1,11 @@
 # Progress: durable cmux coordinator doorbells (surface-hosted watcher)
 
+*(Historical record: commands, identifiers, and file paths below are quoted
+exactly as run or written at the time. The `coordinator` CLI subcommand and its
+flags are now spelled `orchestrator` (the old spelling remains a hidden
+alias); internal identifiers were renamed likewise — see
+`docs/plans/2026-07-19-orchestrator-rename-handoff.md`.)*
+
 Goal: implement the durable cmux coordinator-doorbell mechanism per
 `/tmp/handoff-cmux-detached-watcher.CWXzpm/handoff.md` (default: option a,
 the surface-hosted watcher), with focused tests and the full suite passing;

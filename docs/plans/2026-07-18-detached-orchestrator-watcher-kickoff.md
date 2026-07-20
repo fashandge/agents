@@ -1,5 +1,9 @@
 # Detached orchestrator watcher implementation kickoff
 
+*(Historical record: this kickoff predates the coordinator→orchestrator
+rename; "coordinator" below names the role now spelled "orchestrator" — see
+`docs/plans/2026-07-19-orchestrator-rename-handoff.md`.)*
+
 Implement the detached orchestrator watcher specified in `docs/2026-07-14_agent-handoff-communication-design.md`, especially section 4.6.1 and its acceptance tests. Read that design document fully first and treat it as authoritative.
 
 Work in the existing `/Users/jianfuchen/projects/agents` checkout. It is intentionally dirty with related handoff protocol, registry, launcher, documentation, and test changes already in progress. Preserve and build on all pre-existing changes; do not stash, revert, overwrite, or commit unrelated user work. Do not commit or push.

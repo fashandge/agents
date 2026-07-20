@@ -207,7 +207,7 @@ Rules:
 Worker states are `starting`, `working`, `blocked`, `awaiting_review`, `succeeded`,
 `failed`, and `stopped`. `succeeded` means the worker has durably consumed an accepted
 review for its current result; the authoritative acceptance and integration decisions
-still live in coordinator-owned state.
+still live in orchestrator-owned state.
 
 `control.json` is orchestrator-owned:
 
@@ -242,8 +242,8 @@ on its conversation context.
 
 The journals are authoritative event history; JSON snapshots and `progress.md` are
 current or human-readable projections. Lease timestamps and `outbox_cursor` are
-coordinator operational state rather than journal events: they are atomically durable,
-but may safely regress only when restoring from backup, in which case the coordinator
+orchestrator operational state rather than journal events: they are atomically durable,
+but may safely regress only when restoring from backup, in which case the orchestrator
 reconsumes idempotently. Write ordering is deterministic:
 
 - append an inbox command, then update `control.json` to reflect it;
@@ -272,18 +272,18 @@ All protocol mutations go through `handoffctl`; direct `echo >>` is unsupported.
 3. JSON snapshots are written to a unique temp file in the same directory, flushed,
    and installed with `os.replace`; the directory is then flushed where supported.
    Revisions increase monotonically.
-4. Each active coordinator and worker receives an opaque writer token. A separate
+4. Each active orchestrator and worker receives an opaque writer token. A separate
    recovery token authorizes ownership recovery but is never supplied to either active
    process. `control.json` stores epochs and token hashes; mutation helpers reject stale
-   tokens. Coordinator takeover requires the recovery token, acquires the coordinator
+   tokens. Orchestrator takeover requires the recovery token, acquires the orchestrator
    lock, increments the epoch, and rotates the writer token after an explicit release or
-   host-time lease expiry. The new coordinator appends a `coordinator-takeover` event
+   host-time lease expiry. The new orchestrator appends a `coordinator-takeover` event
    before issuing other commands.
 5. Worker relaunch increments the worker epoch only after the previous process is
    confirmed dead. Never relaunch a writer into the same writable worktree while the
    old session may still run; use a new worktree if death cannot be established.
 
-These rules make stale coordinator processes fail closed at the protocol boundary.
+These rules make stale orchestrator processes fail closed at the protocol boundary.
 They do not fence arbitrary direct writes to source files, which is why process death
 and worktree isolation remain necessary.
 
@@ -291,10 +291,10 @@ and worktree isolation remain necessary.
 
 The launcher embeds these instructions in every kickoff:
 
-- You are a delegated worker in a coordinator-managed run. Independently execute the
+- You are a delegated worker in an orchestrator-managed run. Independently execute the
   stated task within scope; report durable progress, results, and blockers through
   Handoff. Route scope changes, cross-worker coordination, final acceptance,
-  integration, and user-policy decisions to the coordinator.
+  integration, and user-policy decisions to the orchestrator.
 - Read `run.json`, `control.json`, and all unread inbox messages before beginning; also
   check after resume/compaction, at every turn or stage boundary, before an irreversible
   action, before a commit, and before publishing a result.
@@ -380,8 +380,8 @@ input after the original orchestrator exits. A transient inability to verify thi
 identity is an unknown state: the watcher stays alive but suppresses polling and
 doorbells until ownership can be proved again.
 
-The watcher stores no recovery, coordinator, or worker token. Its state lives in a
-mode-`0700` private coordinator directory with a mode-`0600` atomic JSON snapshot and a
+The watcher stores no recovery, orchestrator, or worker token. Its state lives in a
+mode-`0700` private orchestrator directory with a mode-`0600` atomic JSON snapshot and a
 single-instance lock. At minimum the snapshot contains:
 
 ```json
@@ -405,19 +405,19 @@ single-instance lock. At minimum the snapshot contains:
 The lifecycle CLI surface is:
 
 ```text
-handoffctl coordinator register --state ABSOLUTE_PATH ... --owner-pid PID
-handoffctl coordinator start --state ABSOLUTE_PATH [--interval SECONDS]
+handoffctl orchestrator register --state ABSOLUTE_PATH ... --owner-pid PID
+handoffctl orchestrator start --state ABSOLUTE_PATH [--interval SECONDS]
 ```
 
-The orchestrator/session adapter creates the initial state file safely. `coordinator
+The orchestrator/session adapter creates the initial state file safely. `orchestrator
 start` serializes the check-and-start boundary, reuses a watcher already holding the
 state's lifetime lock, or launches the long-running command with the repository's
-double-fork detached runner. Direct `watch --coordinator-state` remains available for
-foreground diagnostics. Coordinator mode is mutually exclusive with `--run`,
+double-fork detached runner. Direct `watch --orchestrator-state` remains available for
+foreground diagnostics. Orchestrator mode is mutually exclusive with `--run`,
 `--timeout`, `--once`, and `--notify-cmux`, because its target, membership, lifecycle,
-and doorbell policy come from coordinator state. Without `--coordinator-state`, the
+and doorbell policy come from orchestrator state. Without `--orchestrator-state`, the
 existing generic JSONL observer behavior remains unchanged. Its registry-level
-`observed_outbox_cursor` is not reused by coordinator mode: each coordinator keeps
+`observed_outbox_cursor` is not reused by orchestrator mode: each orchestrator keeps
 independent delivery state so concurrent observers cannot steal notifications from one
 another.
 
@@ -430,7 +430,7 @@ These are delivery cursors, not semantic-processing state:
   durably consumed a contiguous outbox prefix.
 
 The watcher must never advance `control.outbox_cursor`, answer a question, review a
-result, acquire a coordinator lease, or write a worker inbox. A doorbell can be
+result, acquire an orchestrator lease, or write a worker inbox. A doorbell can be
 duplicated or lost without changing protocol truth.
 
 The default polling interval is five seconds. Each iteration performs the following
@@ -465,7 +465,7 @@ doorbell. This retry is delivery recovery, not worker-staleness detection.
 A canonical terminal doorbell is intentionally small:
 
 ```text
-Check handoff coordinator <coordinator-id>; pending worker outbox events are recorded.
+Check handoff orchestrator <orchestrator-id>; pending worker outbox events are recorded.
 ```
 
 Prefer a native app/server operation that starts a turn when idle and queues a message
@@ -479,7 +479,7 @@ composer.
 When awakened, the same orchestrator uses its retained conversation context on the
 normal hot path. It reads only the exact status/control snapshots and the unread
 outbox interval needed to process the doorbell. It loads the full `handoffctl context`
-bundle—kickoff, progress, and journals—after compaction or resume, on coordinator
+bundle—kickoff, progress, and journals—after compaction or resume, on orchestrator
 takeover, when memory is ambiguous, or when durable state conflicts with remembered
 context. Conversational context supplies task understanding; durable state always
 supplies exact sequence numbers, message IDs, cursors, review targets, and current
@@ -488,13 +488,13 @@ worker state.
 The orchestrator handles every unread event through a contiguous prefix, writes any
 authorized reply/review through `handoffctl`, rings the worker doorbell only after the
 inbox write is durable, and advances `control.outbox_cursor` according to the existing
-coordinator rules. A question that needs new user authority is surfaced to the user
+orchestrator rules. A question that needs new user authority is surfaced to the user
 rather than guessed; its durable question ID and worker `blocked_on` state remain the
 recovery record.
 
 The watcher is session-owned. Continuous monitoring is the normal orchestration
 default: it starts lazily with the first worker handoff and reuses its singleton when
-more workers launch. Explicit fire-and-forget launches omit coordinator state. The
+more workers launch. Explicit fire-and-forget launches omit orchestrator state. The
 watcher exits when the exact registered orchestrator process disappears or its PID is
 reused. Watcher exit never deletes run directories or changes worker state. On watcher
 failure, a later launch or user-turn pending check may restart it from the private
@@ -504,7 +504,7 @@ snapshot without losing worker events.
 
 1. The worker publishes `result` and enters `awaiting_review`.
 2. For a cmux-launched worker, the helper attempts a native notification titled
-   `Handoff result ready` with body `Awaiting coordinator review`. This alert is only a
+   `Handoff result ready` with body `Awaiting orchestrator review`. This alert is only a
    convenience; the durable result event remains authoritative if it fails.
 3. The orchestrator checks the named artifacts and verification results at the exact
    commit; it never treats a terminal success message as evidence.
@@ -529,7 +529,7 @@ snapshot without losing worker events.
   Reject path traversal and workspace-external attachments unless a later policy
   explicitly allows them.
 - A worker token authorizes only worker-owned mutations; it cannot append inbox commands
-  or change coordinator review state. A coordinator token cannot forge worker status.
+  or change orchestrator review state. A orchestrator token cannot forge worker status.
 - For SSH, use normal host-key verification and invoke a fixed remote helper with
   structured stdin. Do not construct a remote shell program from message content.
 
@@ -554,7 +554,7 @@ handoff` and invoked as:
 
 Except for `watch`, `handoffctl` writes one JSON value to stdout on success and
 diagnostics to stderr. Generic `watch` writes one JSON object per line as events
-arrive; coordinator `watch` keeps delivery detail in its private atomic snapshot and
+arrive; orchestrator `watch` keeps delivery detail in its private atomic snapshot and
 does not print worker event content. The CLI does not print secrets. Mutating commands
 accept message bodies from `--body-file`
 (`-` means stdin), structured type data from `--data-file`, and attachment declarations
@@ -689,7 +689,7 @@ are strings and `exit_code` is an integer or `null` when the check could not sta
 | inbox `stop` | `{"reason":str}` | Created by `send stop`; sets desired state `stop`. |
 | outbox `checkpoint` | `{"state":"working"|"succeeded"|"stopped","stage":str,"current_activity":str,"inbox_cursor":int,"commitments":[str]}` | Advances the worker projection and appends the progress marker. Preconditions for terminal states are in 4.9.4. |
 | outbox `question` | `{"blocking":bool,"stage":str,"current_activity":str,"inbox_cursor":int,"commitments":[str]}` | Blocking adds its generated message ID to `blocked_on` and sets `blocked`; non-blocking leaves the current state. |
-| outbox `result` | `{"head":str|null,"dirty":bool,"stage":str,"inbox_cursor":int,"verification":[object],"commitments":[str]}` | `attachments` name artifacts. Sets `awaiting_review`; clears `blocked_on`. In a Git workspace, `head` must equal current `HEAD` and `dirty` must truthfully report whether `git status --porcelain` is non-empty. A dirty workspace does not prevent publication; the coordinator reviews the diff and must not require unrelated user changes to be stashed, discarded, or committed. |
+| outbox `result` | `{"head":str|null,"dirty":bool,"stage":str,"inbox_cursor":int,"verification":[object],"commitments":[str]}` | `attachments` name artifacts. Sets `awaiting_review`; clears `blocked_on`. In a Git workspace, `head` must equal current `HEAD` and `dirty` must truthfully report whether `git status --porcelain` is non-empty. A dirty workspace does not prevent publication; the orchestrator reviews the diff and must not require unrelated user changes to be stashed, discarded, or committed. |
 | outbox `error` | `{"fatal":bool,"category":str,"stage":str,"inbox_cursor":int,"commitments":[str]}` | Fatal sets `failed` and clears `blocked_on`; nonfatal preserves state. Non-empty `body`. |
 
 For all worker events, `inbox_cursor` cannot decrease or exceed the validated inbox
@@ -703,7 +703,7 @@ nonblocking question also update `last_progress_at`.
 inbox message types: generic `send` rejects them. Their bodies are audit summaries,
 not credentials.
 
-#### 4.9.4 State machine and coordinator invariants
+#### 4.9.4 State machine and orchestrator invariants
 
 The helper enforces these transitions:
 
@@ -729,21 +729,21 @@ integration to pending/null/null. `send review` is rejected unless it replies to
 result, and a superseded result cannot later be reviewed. `control integrate` is allowed only after acceptance of that result and must
 append an `integration` event recording the integration commit. `abandoned` is allowed
 after any result, requires a non-empty reason, and appends the corresponding event.
-Integration and abandonment are terminal coordinator decisions.
-After either decision, the only allowed coordinator operations are `send stop`,
+Integration and abandonment are terminal orchestrator decisions.
+After either decision, the only allowed orchestrator operations are `send stop`,
 `control consume|renew|release|takeover`, read operations, and repair. A second stop or
 any attempt to change the integration decision exits 4.
 
-The coordinator consumes outbox messages only via `control consume --through N`. The
+The orchestrator consumes outbox messages only via `control consume --through N`. The
 helper verifies a contiguous range from the old cursor through `N`, applies the result
 projection described above, then atomically advances `outbox_cursor`. Repeating the
 same or a lower cursor is a successful no-op; skipping a sequence is rejected.
 
 #### 4.9.5 Authentication, epochs, and leases
 
-`init` generates independent 32-byte random recovery, coordinator, and worker tokens.
+`init` generates independent 32-byte random recovery, orchestrator, and worker tokens.
 The recovery token is an owner/rescue credential and is never supplied to a worker or
-an active coordinator process. `init` writes the tokens as raw lowercase hexadecimal
+an active orchestrator process. `init` writes the tokens as raw lowercase hexadecimal
 plus newline to caller-selected credential files using `O_CREAT|O_EXCL` and mode
 `0600`; it writes only their SHA-256 hashes into `control.json`. Credential files must
 be outside `<run-dir>`. The CLI reports their paths, never their contents. Mutating
@@ -752,10 +752,10 @@ commands accept `--token-file`; otherwise they use `HANDOFF_COORDINATOR_TOKEN_FI
 `HANDOFF_RECOVERY_TOKEN_FILE`. Tokens are never accepted directly in argv. Library
 callers pass token bytes in memory.
 
-The local-v1 coordinator lease is 180 seconds and is renewed every 60 seconds by an
-active orchestrator. Every successful coordinator mutation except `release` and
+The local-v1 orchestrator lease is 180 seconds and is renewed every 60 seconds by an
+active orchestrator. Every successful orchestrator mutation except `release` and
 `takeover` renews it; `control renew` exists for periods with no other mutations. Both
-are valid only for the current unexpired coordinator token and replace expiry with
+are valid only for the current unexpired orchestrator token and replace expiry with
 host-now plus 180 seconds. `control release` sets expiry to
 host-now and records `released_at` only in the command's JSON response; a subsequent
 takeover still writes the durable takeover event. This release does not stop the
@@ -772,10 +772,10 @@ the recovery token. A failure before append
 leaves protocol state unchanged and the helper removes or reports the unused token
 file.
 
-`control rotate-worker` requires the current coordinator token, the literal
+`control rotate-worker` requires the current orchestrator token, the literal
 `--confirmed-dead` flag, and a non-empty reason. The session adapter, not
 `handoffctl`, supplies that assertion after probing the old process. It acquires both
-role locks in coordinator-then-worker order, calculates the next worker epoch, creates
+role locks in orchestrator-then-worker order, calculates the next worker epoch, creates
 the rotated worker token, appends a `worker-relaunched` inbox event, then updates
 control and resets status to the initial `starting` projection for the new epoch while
 preserving journal sequence/cursors. A relaunch cannot reduce either journal sequence
@@ -793,7 +793,7 @@ handoffctl init --workspace PATH --kickoff FILE --harness ID --model MODEL
                 --transport ID [--effort VALUE] [--input PATH ...]
                 [--state-root PATH | --run-dir PATH]
                 --recovery-token-file PATH
-                --coordinator-token-file PATH --worker-token-file PATH
+                --orchestrator-token-file PATH --worker-token-file PATH
 
 handoffctl read --run-dir PATH --journal inbox|outbox [--after N] [--through N]
 handoffctl status --run-dir PATH
@@ -802,19 +802,19 @@ handoffctl control show --run-dir PATH
 
 handoffctl runs list
 handoffctl runs show --run SELECTOR
-handoffctl runs adopt --run SELECTOR --coordinator-state ABSOLUTE_PATH
-handoffctl coordinator register --state ABSOLUTE_PATH
+handoffctl runs adopt --run SELECTOR --orchestrator-state ABSOLUTE_PATH
+handoffctl orchestrator register --state ABSOLUTE_PATH
                                 --transport cmux|tmux|native-app
                                 [--target HANDLE_OR_THREAD] [--surface UUID]
                                 --owner-pid PID
-handoffctl coordinator start --state ABSOLUTE_PATH [--interval SECONDS]
-handoffctl coordinator show --state ABSOLUTE_PATH
-handoffctl coordinator pending --state ABSOLUTE_PATH [--full-context]
+handoffctl orchestrator start --state ABSOLUTE_PATH [--interval SECONDS]
+handoffctl orchestrator show --state ABSOLUTE_PATH
+handoffctl orchestrator pending --state ABSOLUTE_PATH [--full-context]
 handoffctl context --run SELECTOR
 handoffctl dispatch --run SELECTOR --body-file FILE
 handoffctl watch [--run SELECTOR ...] [--interval SECONDS]
                  [--timeout SECONDS] [--once] [--notify-cmux]
-handoffctl watch --coordinator-state ABSOLUTE_PATH [--interval SECONDS]
+handoffctl watch --orchestrator-state ABSOLUTE_PATH [--interval SECONDS]
 
 handoffctl send --run-dir PATH --type TYPE [--message-id UUID] [--reply-to UUID]
                 [--body-file FILE] [--data-file FILE]
@@ -873,14 +873,14 @@ message ID derived from the run ID so retrying the command is idempotent.
 Every successful launcher call writes a mode-`0600` owner-side registry entry under
 `~/.local/state/agents/handoff/registry.json` (overridable with
 `HANDOFF_REGISTRY_FILE`). It records run/session routing and the owner-only credential
-directory plus an optional opaque coordinator ID; public registry output redacts the
+directory plus an optional opaque orchestrator ID; public registry output redacts the
 credential directory. A remote launch also writes
 a credential-free proxy entry on the caller while the owning host retains the private
 entry.
 
 `context` resolves a registered selector and returns the durable kickoff, projections,
 progress, and unread journals from the owning host. `dispatch` is a one-shot
-coordinator transaction: after a released lease it takes over with the registered
+orchestrator transaction: after a released lease it takes over with the registered
 recovery credential, sends either `steer` or an exact-result `supersede`, rings the
 registered terminal doorbell, releases the lease, and removes its ephemeral token. A
 remote dispatch performs that owner-side sequence over one SSH invocation with the
@@ -892,7 +892,7 @@ After `emit --type result` has durably appended the result, projected
 `awaiting_review`, and fsynced the run directory, the CLI checks the immutable run
 transport. For a cmux run with `CMUX_SURFACE_ID` in the worker environment, it attempts
 `cmux notify --surface "$CMUX_SURFACE_ID" --title "Handoff result ready" --body
-"Awaiting coordinator review"` with a five-second timeout. The command's output is
+"Awaiting orchestrator review"` with a five-second timeout. The command's output is
 suppressed. Missing cmux context, a nonzero exit, timeout, or process-launch failure is
 ignored and does not alter the successful JSON response or durable state. No native
 notification is attempted for tmux transport.
@@ -901,7 +901,7 @@ Successful JSON output shapes are exact:
 
 | Command | Output |
 |---|---|
-| `init` | `{"run_dir":str,"credential_files":{"recovery":str,"coordinator":str,"worker":str},"run":object,"status":object,"control":object}` |
+| `init` | `{"run_dir":str,"credential_files":{"recovery":str,"orchestrator":str,"worker":str},"run":object,"status":object,"control":object}` |
 | `read` | `[message,...]` |
 | `status` / `control show` | The raw snapshot object |
 | `send` | `{"message":object,"control":object}` |
@@ -914,11 +914,11 @@ Successful JSON output shapes are exact:
 | `doctor` or a repair | The report object specified in 4.9.7 |
 | `runs list` / `runs show` | Public registry record(s), with `credential_dir` omitted |
 | `runs adopt` | The adopted public registry record |
-| `coordinator register` / `coordinator show` | The raw credential-free coordinator watcher snapshot |
-| `coordinator start` | `{"coordinator_id":str,"pid":int|null,"running":true,"started":bool,"state":str}` |
-| `coordinator pending` | `{"coordinator_id":str,"mode":"hot"|"recovery","pending":[...]}`; hot detail contains exact status/control and unread outbox only, while recovery detail contains the full `context` bundle |
+| `orchestrator register` / `orchestrator show` | The raw credential-free orchestrator watcher snapshot |
+| `orchestrator start` | `{"coordinator_id":str,"pid":int|null,"running":true,"started":bool,"state":str}` |
+| `orchestrator pending` | `{"coordinator_id":str,"mode":"hot"|"recovery","pending":[...]}`; hot detail contains exact status/control and unread outbox only, while recovery detail contains the full `context` bundle |
 | `context` | `{"run":object,"status":object,"control":object,"kickoff":str,"progress":str,"unread_inbox":[message,...],"unread_outbox":[message,...],"registry":object}` |
-| `dispatch` | `{"run":object,"takeover":object,"message":object,"superseded_result":str|null,"doorbell_sent":bool,"doorbell_error":str|null,"coordinator_released":bool}` |
+| `dispatch` | `{"run":object,"takeover":object,"message":object,"superseded_result":str|null,"doorbell_sent":bool,"doorbell_error":str|null,"orchestrator_released":bool}` |
 | `watch` | JSONL records containing either `{"run":object,"event":message}` or `{"run":object,"watch_error":str}` |
 
 The library exposes `HandoffError` with an `exit_code` from the table in 4.9.1 and
@@ -947,7 +947,7 @@ automatically removed.
 
 `--repair-status` requires the worker token and replays current-epoch outbox events after
 `status.outbox_seq`. It rejects a snapshot ahead of the outbox or inconsistent with a
-full replay. `--repair-control` requires the coordinator token and replays inbox events
+full replay. `--repair-control` requires the orchestrator token and replays inbox events
 after `last_command_seq`; the recovery token is accepted instead when completing an
 appended takeover whose epoch is not yet projected. Because the journal intentionally
 does not contain credential hashes or paths, completing an appended takeover also
@@ -1005,11 +1005,11 @@ optional second `.goal` message, the adapter must satisfy both conditions:
    the protocol instructions.
 
 Launch-only mode is the default: after the terminal session is created (and Kimi's fixed
-kickoff pointer is delivered), the launcher releases the coordinator lease and returns
+kickoff pointer is delivered), the launcher releases the orchestrator lease and returns
 without a semantic readiness poll. `--wait-ready` explicitly requests the readiness
-wait, and `--retain-coordinator` preserves ownership for managed monitoring. A supplied
+wait, and `--retain-orchestrator` preserves ownership for managed monitoring. A supplied
 `HANDOFF_CREDENTIAL_DIR` is the exact mode-`0700` private directory and therefore has
-fixed token filenames; the coordinator never discovers them with a filesystem search.
+fixed token filenames; the orchestrator never discovers them with a filesystem search.
 The launcher privately registers the generated directory even when it chose that
 directory itself, so later one-shot dispatch also avoids discovery.
 The Kimi TUI process probe requests cmux output with both refs and UUIDs, which makes its
@@ -1049,7 +1049,7 @@ the interpreter executing the remote launcher, so no macOS path appears in a Lin
 run.
 
 SSH key authentication, tmux, the selected agent, and a compatible `agents` package
-must already exist on the worker host. Launch-only releases the remote coordinator
+must already exist on the worker host. Launch-only releases the remote orchestrator
 lease. Managed coordination additionally requires a caller-known remote private
 credential directory; its path and contents are never returned in launch JSON or
 reported to the user. Read, renew, send, review, doctor, doorbell, rescue, and close
@@ -1058,7 +1058,7 @@ unknown state and never authorizes an unfenced replacement worker.
 
 An explicit operator request to close, kill, or terminate named worker sessions is a
 transport-level instruction, not a request for semantic protocol completion. The
-coordinator resolves each exact launch handle and directly closes the cmux surface or
+orchestrator resolves each exact launch handle and directly closes the cmux surface or
 tmux session; it does not first take over a lease, append `stop`, or wait for an
 acknowledgment. Multiple requested handles may close independently. The run can remain
 nonterminal afterward and is reported as such. The protocol stop path is reserved for
@@ -1068,8 +1068,8 @@ integration.
 ## 5. v2: multiple workers and the cross-host roster
 
 ```text
-<coordinator-state>/
-  roster.jsonl       coordinator-owned event journal
+<orchestrator-state>/
+  roster.jsonl       orchestrator-owned event journal
   runs/<run-id>/     authoritative local run directories
   archives/<run-id>/ closed run snapshots, including sandbox-fallback runs
 
@@ -1078,7 +1078,7 @@ integration.
 ```
 
 Roster events contain at least `run_id`, display name, task, run-dir URI, host,
-transport handle, worktree, branch or detached HEAD, base commit, coordinator epoch,
+transport handle, worktree, branch or detached HEAD, base commit, orchestrator epoch,
 and event type (`launched`, `observed`, `accepted`, `integrated`, `closed`,
 `abandoned`). The roster is a recovery index; the per-run journals remain authoritative.
 
@@ -1139,10 +1139,10 @@ Build the thin protocol and reuse task/session products where they fit:
 3. **Worktree pilot:** launch one worker in a disposable worktree, verify the
    orchestrator and worker share the external run path, test the in-worktree fallback,
    prohibit external branch mutation, and archive before fallback worktree cleanup.
-4. **Detached orchestrator watcher:** add coordinator-session registration, associate
+4. **Detached orchestrator watcher:** add orchestrator-session registration, associate
    launched runs with `coordinator_id`, reload the registry on every poll, persist
-   per-coordinator notification state, and ring coalesced opaque doorbells as specified
-   in 4.6.1. Preserve the existing generic `watch` behavior when no coordinator state
+   per-orchestrator notification state, and ring coalesced opaque doorbells as specified
+   in 4.6.1. Preserve the existing generic `watch` behavior when no orchestrator state
    is supplied.
 5. **Hook adapters:** integrate Claude Code and Codex lifecycle hooks, but retain
    checkpoint polling and terminal doorbells. Maintain a conformance matrix rather than
@@ -1159,9 +1159,9 @@ Acceptance tests for v1 should demonstrate:
 
 - a steer cannot be reported consumed before its durable effects/reminder exist;
 - replay after worker death is harmless and does not skip a sequence;
-- worker `succeeded` cannot be confused with coordinator `accepted` or `integrated`;
-- an old coordinator token cannot append after takeover;
-- the coordinator can find a worker run directory in a different worktree;
+- worker `succeeded` cannot be confused with orchestrator `accepted` or `integrated`;
+- an old orchestrator token cannot append after takeover;
+- the orchestrator can find a worker run directory in a different worktree;
 - a partial final JSONL line is detected and repaired without hiding mid-file corruption;
 - a stuck TUI is detected by session probe even when semantic status is stale; and
 - launcher paths and message bodies containing spaces or shell metacharacters are
@@ -1170,7 +1170,7 @@ Acceptance tests for v1 should demonstrate:
 Detached watcher acceptance tests should additionally demonstrate:
 
 - the watcher is a singleton per `coordinator_id` and never selects runs owned by a
-  different coordinator;
+  different orchestrator;
 - a worker registered after watcher startup is discovered without restarting the
   process;
 - the detached start operation is singleton-safe, and the watcher exits when the exact
@@ -1192,7 +1192,7 @@ Detached watcher acceptance tests should additionally demonstrate:
 The implemented local-v1 build includes the core, launcher, private roster, fast
 dispatch, generic read-only watcher, and detached orchestrator watcher in 4.6.1.
 Provider-specific hook and native-app messaging adapters, automated archival, and a
-richer derived fleet index remain follow-up work. Native-app coordinator registration
+richer derived fleet index remain follow-up work. Native-app orchestrator registration
 and exact routing are present; when no provider sender is installed, delivery failure
 stays visible in the pending watcher snapshot and the filesystem hot path remains the
 recovery mechanism.
