@@ -1,10 +1,20 @@
 # Handoff: rename "coordinator" → "orchestrator" across the handoff stack
 
-**Status:** not started — this doc is the spec for a delegated worker (Kimi via
-/delegate-first). Written 2026-07-19; revised the same day after the
-handoff-agent skill restructure landed (agents `6e23c54`, skills `b21231c`):
-the skill is now a lean `SKILL.md` plus `references/`, and four helper scripts
-were added under `scripts/`.
+**Status (2026-07-20):** **Phase 1 done, reviewed, and pushed.**
+**Phase 2 deliberately deferred — and its approach has changed; see below.**
+
+- Phase 1 landed via a delegated Kimi worker: agents `940aa14` (code, tests,
+  `handoff_coordinator_ensure.sh` → `handoff_orchestrator_ensure.sh`) and
+  `ee7ece8` (docs); skills `cd9839e` (SKILL.md + all four references).
+  Both repos pushed.
+- Independently verified at review: 175 tests pass; `orchestrator` and the
+  `coordinator` alias resolve identically; **zero diff lines touched any
+  persisted spelling**; every live `watcher.json` still uses `coordinator_id`;
+  the live investment watcher survived unharmed.
+
+Written 2026-07-19 after the handoff-agent skill restructure landed (agents
+`6e23c54`, skills `b21231c`): the skill is a lean `SKILL.md` plus
+`references/`, and four helper scripts live under `scripts/`.
 
 ## Decision and goal
 
@@ -29,11 +39,19 @@ compatibility (see Phase 2 read-compat and the CLI alias).
 ## CRITICAL constraint: one live handoff run
 
 There is currently **one live remote worker running for the investment
-project**, with its authoritative run directory on the remote worker host, plus
-local registry/watcher state for its orchestrator session. The rename must not
-break steering, watching, or reviewing that run. Therefore the work is split
-into two phases, and **Phase 2 must not ship without read-compatibility for the
-old field spellings** (or explicit confirmation that no live runs remain).
+project** — run `f6d7d1b2` (`phase3b-tier0-triage`, Codex on `oci-box`), whose
+authoritative run directory lives on the remote host, plus local
+registry/watcher state for its orchestrator session. The rename must not break
+steering, watching, or reviewing that run. Therefore the work is split into two
+phases.
+
+**Correction (2026-07-20):** this section originally said Phase 2 was safe to
+ship "with read-compatibility for the old field spellings." **That was wrong,**
+and the Phase 1 worker caught it. Read-compat makes *new code tolerate old
+state*; the actual hazard is the reverse — **long-lived old-code watcher
+processes reading state that new code writes.** No reader-side compatibility in
+the new code can help a process that is already running the old code. See
+"Phase 2" below for what this changes.
 
 Check live runs before and after any change:
 
@@ -110,39 +128,98 @@ Both working trees (`~/projects/agents` and `~/skills`) are clean as of the
 restructure commits above. If `git status` shows local modifications when you
 start, they are the user's — work on top of them, do not revert or stash them.
 
-## Phase 2 — persisted protocol state (GATED)
+## Phase 2 — persisted protocol state (DEFERRED; approach revised 2026-07-20)
 
-**Gate:** ship only with read-compat for old spellings, or after
-`handoffctl runs list` shows no live runs. The live investment run's
-`control.json`, lock files, and credential files on the remote host use the old
-names, and the local registry/orchestrator-session state does too.
+**Recommendation: do not do this until the machine is quiescent, then do it
+clean — with no compatibility layer at all.**
 
-Rename with backward compatibility (accept old name on read, write new name):
+### Why the original "read-compat" plan was dropped
+
+The Phase 1 worker showed that read-compat does not unblock anything. The
+hazard is old-code *processes*, not old *files*: a watcher started before the
+rename holds the old code in memory and keeps reading state that new code
+writes. Writing the new spelling while such a process lives would (1) fail its
+per-poll `registry.json` validation, (2) make it exit when `acknowledge`/
+`dismiss` rewrites `watcher.json`, (3) fail its `control.json` validation, (4)
+split lock mutual exclusion if `coordinator.lock` is renamed, and (5) fail its
+journal validation on a renamed `coordinator-takeover` event. Reader-side
+compatibility in the *new* code cannot fix any of these.
+
+So Phase 2 already requires quiescence (no live runs, no old-code watchers).
+And **once you have quiescence, the compat layer is unnecessary** — its only
+purpose was to ship while runs were live. Skipping it avoids permanently
+carrying a `_compat_field` fallback branch through the lease/token validation
+paths, which is exactly where the code should stay simple. Waiting costs
+nothing but time; compat costs complexity forever.
+
+### Why it is low priority
+
+Phase 1 already renamed everything a human sees: the CLI verb and flags, help
+text, notification bodies, all Python identifiers, docs, and the skill. What
+remains is invisible plumbing — JSON keys inside `control.json`, lock and
+credential filenames, a state directory name, and one registry key. The benefit
+is consistency for someone reading protocol files during debugging; the cost is
+churn plus risk to whatever is running at the time. Treat this as opportunistic
+cleanup, not scheduled work.
+
+### Gate (both conditions)
+
+1. `handoffctl runs list` shows no live runs (in particular the investment run
+   `f6d7d1b2` has finished), **and**
+2. no old-code watcher processes remain — verify with
+   `pgrep -fl 'agents.orchestration.handoffctl'` and confirm any survivor was
+   started after the Phase 2 code landed.
+
+### Scope when it happens
 
 - `control.json` fields: `coordinator_epoch`, `coordinator_token_sha256`,
   `coordinator_lease_expires_at` → `orchestrator_*`.
-- Inbox event type `coordinator-takeover` → `orchestrator-takeover` (readers
-  must accept both).
+- Inbox event type `coordinator-takeover` → `orchestrator-takeover`.
 - Lock file `coordinator.lock` and the `_lock(run_dir, "coordinator")` name.
-- Credential file naming (`coordinator` token file created by `init`).
-- Registry / orchestrator-session state keys (whatever `coordinator register`
-  persists — inspect `handoff_registry.py` and the watcher's cursor state for
-  key names), including `last_doorbell_method` payloads if they embed the word.
-- The `role = "coordinator"` string derived from message direction in
-  `handoff.py:581`.
+- Credential filename `coordinator.token` (constructed in
+  `handoff_launcher.py:618`; the *parameter* is already `orchestrator_token_file`).
+  Update the two skill references that quote the filename.
+- Registry / watcher-state key `coordinator_id` (`handoff_registry.py`, watcher
+  cursor state, and the CLI JSON outputs that mirror it).
+- The `role = "coordinator"` literal in `handoff.py` (message-direction
+  derivation) — note this also renames the credential env var, because
+  `handoffctl.py:76` derives it as `f"HANDOFF_{role.upper()}_TOKEN_FILE"`;
+  `HANDOFF_COORDINATOR_TOKEN_FILE` becomes `HANDOFF_ORCHESTRATOR_TOKEN_FILE`
+  automatically. Running sessions that exported the old name will break, which
+  is another reason to wait for quiescence.
+- `HANDOFF_COORDINATOR_STATE` (the `--orchestrator-state` fallback default at
+  `handoff_launcher.py:928`).
+- **The state directory name** `~/.local/state/agents/handoff/coordinators/`
+  — missing from the original spec; existing session directories would need
+  migrating or abandoning.
+- The remote host's installed `agents` package must be updated in step, since
+  remote runs execute owner-side operations there.
 
-Implementation suggestion: a small `_compat_field(mapping, new, old)` helper at
-the read sites, and writers always emit the new spelling. Do **not** bump
-`protocol_version` (`local-v1` stays); this is a spelling migration, not a
-semantic change.
+Do **not** bump `protocol_version` (`local-v1` stays); this is a spelling
+migration, not a semantic change.
+
+### Related footgun worth documenting at the same time
+
+`HANDOFF_COORDINATOR_STATE` and `HANDOFF_COORDINATOR_TOKEN_FILE` are
+process-scoped and are not set in `~/.zshenv`, `~/.zshrc`, or
+`~/.config/secrets.env` — parallel orchestrator sessions stay isolated because
+each has its own `mktemp`-created `session.XXXXXX/watcher.json` path and passes
+it explicitly via `--orchestrator-state`. But `env.build_env()` sources
+`~/.zshenv` and `~/.config/secrets.env`, so exporting either variable in those
+shared files would make it effectively machine-global: a launch that omitted
+`--orchestrator-state` would then silently attach its worker to another
+session's watcher, sending that worker's doorbells to the wrong surface with no
+error. Keep both variables per-invocation only.
 
 ## Verification
 
 1. Full suite: `/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python -m
    pytest tests/` — must pass after each phase.
 2. After Phase 1: `grep -rniE 'coordinator' orchestration/ tests/ docs/
-   scripts/ CLAUDE.md ~/skills/handoff-agent/` returns only (a) deliberate
-   compat aliases/read-compat code, (b) historical transcripts in plan docs.
+   scripts/ CLAUDE.md ~/skills/handoff-agent/` returns only (a) the CLI aliases
+   and the deliberately-kept persisted spellings listed under "Phase 1
+   outcome", (b) historical transcripts in plan docs, (c) gitignored
+   `__pycache__` binaries.
 3. Live-run smoke test after each phase, without steering the worker:
    `handoffctl runs list`, `handoffctl orchestrator show` (and via the
    `coordinator` alias), `handoffctl orchestrator pending`, and a
@@ -153,7 +230,55 @@ semantic change.
 ## Suggested commit split
 
 1. Phase 1 code + tests + `handoff_coordinator_ensure.sh` rename (this repo).
-2. Phase 1 docs + CLAUDE.md (this repo).
+   — done: `940aa14`
+2. Phase 1 docs + CLAUDE.md (this repo). — done: `ee7ece8`
 3. Skill core + references (separate commit in the `~/skills` repo).
-4. Phase 2 (compat-gated persisted-state rename) as its own commit in this
-   repo, only if the gate is satisfied.
+   — done: `cd9839e`
+4. Phase 2 (clean persisted-state rename, no compat layer) as its own commit in
+   this repo, only once the two-condition gate above is satisfied.
+
+## Phase 1 outcome (2026-07-20)
+
+### Deliberately kept as "coordinator" (all Phase 2 scope)
+
+Persisted/protocol spellings: `control.json` fields (`coordinator_epoch`,
+`coordinator_token_sha256`, `coordinator_lease_expires_at`); inbox type
+`coordinator-takeover`; role literals (locks, `_authorize`, the
+message-direction derivation in `handoff.py`); `coordinator.lock`; the
+`coordinator.token` filename; the registry/watcher key `coordinator_id` and the
+CLI JSON outputs that mirror it; the remote-request wire keys
+`retain_coordinator`/`coordinator_id` (the remote host still runs old code);
+the env vars `HANDOFF_COORDINATOR_TOKEN_FILE` (derived from the role literal)
+and `HANDOFF_COORDINATOR_STATE`; and the `handoff/coordinators` state
+directory.
+
+### Renamed but worth knowing
+
+User-facing JSON keys changed: launcher/dispatch output `coordinator_released`
+→ `orchestrator_released`, and the `init` output's `credential_files` key
+`coordinator` → `orchestrator` (the file on disk is still `coordinator.token`).
+Any external consumer of those keys must be updated. `ORCHESTRATOR_DOORBELL_TITLE`
+now reads "Handoff orchestrator pending", and review notifications say
+"Awaiting orchestrator review".
+
+### Accepted deviations from this spec
+
+1. `scripts/cmux_close_surface_safe.sh` needed no edit — its single role mention
+   already said "orchestrator" (the spec's match count was stale).
+2. CLI aliases are not *hidden*: argparse displays
+   `orchestrator (coordinator)` in the subcommand list and shows both option
+   strings in help. Old invocations resolve correctly; hiding them would
+   require custom argparse formatting not worth the complexity.
+3. `dispatch`'s ephemeral token filename prefix was renamed to
+   `orchestrator-dispatch-*` (transient, single-process lifecycle).
+
+### Known gap, unrelated to the rename
+
+The review acceptance for run `b9778f37` could not be sent: it was launched in
+launch-only mode, so the lease was released and the credential directory is
+private and redacted in `runs show`, while `dispatch` has no review-disposition
+flag (for an `awaiting_review` worker it sends `supersede`). A managed run
+(`HANDOFF_CREDENTIAL_DIR` + `--retain-orchestrator`) is required if the
+orchestrator intends to send a formal `review` later. Worth considering as a
+protocol/CLI improvement: a registry-backed review path that takes over the
+lease the way `dispatch` does.
