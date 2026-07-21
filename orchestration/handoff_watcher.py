@@ -22,6 +22,9 @@ from agents.orchestration import handoff_registry
 STATE_VERSION = 2
 DEFAULT_RETRY_SECONDS = 30.0
 DoorbellNotifier = Callable[[dict[str, Any], dict[str, int]], str | None]
+# A method label containing this marker means the typed channel was withheld
+# because the human was editing a prompt in the orchestrator's own composer.
+DEFERRED_INPUT = "deferred_input"
 """Delivers one coalesced doorbell; returns the channel(s) that accepted it.
 
 The returned label (for example ``terminal_input``, a ``+``-joined multi-
@@ -599,14 +602,21 @@ def poll(
             notification_error = str(exc)
             errors.append({"run_id": ",".join(sorted(coverage)), "error": notification_error})
         attempted_at = current_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        # A deferred typed channel is not an attempt to back off from: the
+        # human is at the keyboard mid-prompt, and the doorbell should land as
+        # soon as that composer clears.  Leaving the delivery cursors and
+        # timestamp untouched lets the very next poll retry instead of waiting
+        # out the retry interval, while the method still records the deferral.
+        deferred = delivered_method is not None and DEFERRED_INPUT in delivered_method
         for run_id, through in coverage.items():
             run_state = value["runs"][run_id]
-            run_state["doorbell_through"] = through
             run_state["doorbell_pending"] = (
                 run_state["observed_through"] > run_state["control_through"]
             )
-            run_state["last_doorbell_at"] = attempted_at
-            run_state["doorbell_after_cursor"] = run_state["control_through"]
+            if not deferred:
+                run_state["doorbell_through"] = through
+                run_state["last_doorbell_at"] = attempted_at
+                run_state["doorbell_after_cursor"] = run_state["control_through"]
             run_state["last_doorbell_error"] = notification_error
             run_state["last_doorbell_method"] = (
                 delivered_method if notification_error is None else None

@@ -653,6 +653,8 @@ def test_launch_only_returns_without_readiness_wait_and_releases_orchestrator(tm
         "wait_ready",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launch-only must not wait")),
     )
+    # Folder-trust rescue has its own tests; this one is about release semantics.
+    monkeypatch.setattr(handoff_launcher, "_rescue_local_codex_folder_trust", lambda *a, **k: None)
 
     orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     result = handoff_launcher.launch(
@@ -994,3 +996,250 @@ def test_managed_remote_launch_requires_known_remote_credential_directory(tmp_pa
         assert "HANDOFF_REMOTE_CREDENTIAL_DIR" in str(exc)
     else:
         raise AssertionError("managed remote launch without a known credential directory must fail")
+
+
+def composer_screen(draft="", *, agent_busy=False):
+    """Render a Claude-Code-shaped screen: transcript, composer box, status."""
+    lines = ["> an earlier prompt echoed into the transcript", "  some tool output"]
+    if agent_busy:
+        lines.append("✻ Forging… (1m 20s · ↓ 4.0k tokens)")
+    border = "─" * 40
+    lines.extend([border, f"❯ {draft}".rstrip(), border])
+    lines.append("  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)")
+    return "\n".join(lines) + "\n"
+
+
+def test_composer_draft_reads_the_input_box_not_the_transcript():
+    assert handoff_launcher.composer_draft(composer_screen()) == ""
+    assert handoff_launcher.composer_draft(composer_screen(agent_busy=True)) == ""
+    assert handoff_launcher.composer_draft(
+        composer_screen("please refactor the"),
+    ) == "please refactor the"
+    # An unrecognized surface reads as empty so doorbells keep flowing.
+    assert handoff_launcher.composer_draft("desktop surface with no composer\n") == ""
+
+
+def test_composer_draft_includes_wrapped_continuation_lines():
+    border = "─" * 40
+    screen = "\n".join([
+        border,
+        "❯ please refactor the launcher so that",
+        "  every adapter shares one guard",
+        border,
+        "  -- INSERT --",
+    ])
+    draft = handoff_launcher.composer_draft(screen)
+    assert draft == "please refactor the launcher so that every adapter shares one guard"
+
+
+def test_composer_guard_sends_immediately_into_an_empty_composer(monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+    verdict = handoff_launcher._composer_guard(
+        lambda: composer_screen(), lambda: pytest.fail("focus must not be consulted"),
+    )
+    assert verdict == handoff_launcher.COMPOSER_CLEAR
+
+
+def test_composer_guard_forces_a_parked_draft_on_an_unfocused_surface(monkeypatch):
+    def never_sleep(value):
+        pytest.fail("an unfocused surface must not wait out the stability timer")
+
+    monkeypatch.setattr(handoff_launcher.time, "sleep", never_sleep)
+    verdict = handoff_launcher._composer_guard(
+        lambda: composer_screen("half a thought"), lambda: False,
+    )
+    assert verdict == handoff_launcher.COMPOSER_FORCED
+
+
+def test_composer_guard_defers_while_the_focused_draft_keeps_changing(monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+    drafts = iter([
+        composer_screen("please"),
+        composer_screen("please refactor"),
+        composer_screen("please refactor the"),
+    ])
+    verdict = handoff_launcher._composer_guard(lambda: next(drafts), lambda: True)
+    assert verdict == handoff_launcher.COMPOSER_BUSY
+
+
+def test_composer_guard_forces_a_focused_draft_that_never_changes(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(handoff_launcher.time, "sleep", sleeps.append)
+    verdict = handoff_launcher._composer_guard(
+        lambda: composer_screen("parked mid-sentence"), lambda: True,
+    )
+    assert verdict == handoff_launcher.COMPOSER_FORCED
+    assert sum(sleeps) == pytest.approx(handoff_launcher.COMPOSER_STABLE_SECONDS)
+
+
+def test_composer_guard_clears_when_the_human_submits_mid_wait(monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+    screens = iter([composer_screen("nearly done"), composer_screen()])
+    verdict = handoff_launcher._composer_guard(lambda: next(screens), lambda: True)
+    assert verdict == handoff_launcher.COMPOSER_CLEAR
+
+
+def test_surface_focus_ignores_keyboard_activity_in_other_applications(monkeypatch):
+    listing = (
+        "  surface:6 807ABF25-584D-44EF-8910-7C48C57169B0  other tab\n"
+        "* surface:7 5ABE8AEB-14EE-4907-A714-3C819BB81073  orchestrator  [selected]\n"
+    )
+
+    def fake_run(argv, check=True):
+        if "list-pane-surfaces" in argv:
+            return Completed(stdout=listing)
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    adapter = handoff_launcher.CmuxAdapter("cmux")
+    adapter.workspace = "workspace:9"
+
+    monkeypatch.setattr(handoff_launcher, "_macos_frontmost_app", lambda: "cmux")
+    assert adapter._surface_has_user_focus("5ABE8AEB-14EE-4907-A714-3C819BB81073") is True
+    assert adapter._surface_has_user_focus("807ABF25-584D-44EF-8910-7C48C57169B0") is False
+    # A surface missing from the focused pane's listing cannot be typed into.
+    assert adapter._surface_has_user_focus("11111111-2222-3333-4444-555555555555") is False
+
+    # Busy in another app: the surface may stay selected, but keystrokes are
+    # going elsewhere, so the draft is parked no matter how active the mouse is.
+    monkeypatch.setattr(handoff_launcher, "_macos_frontmost_app", lambda: "Safari")
+    assert adapter._surface_has_user_focus("5ABE8AEB-14EE-4907-A714-3C819BB81073") is False
+
+    # An unreadable environment must not force a doorbell into a live draft.
+    monkeypatch.setattr(handoff_launcher, "_macos_frontmost_app", lambda: None)
+
+    def broken_run(argv, check=True):
+        return Completed(returncode=1)
+
+    monkeypatch.setattr(handoff_launcher, "_run", broken_run)
+    assert adapter._surface_has_user_focus("5ABE8AEB-14EE-4907-A714-3C819BB81073") is True
+
+
+def test_forced_doorbell_warns_about_the_draft_and_verifies_only_the_pointer(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    pointer = handoff_launcher.orchestrator_doorbell_body(orchestrator_id)
+    sent = []
+
+    def fake_run(argv, check=True):
+        if argv[1] == "read-screen":
+            # The forced body wraps well past the submit-pending window; only
+            # the pointer sentence is guaranteed near the composer.
+            return Completed(stdout="filler\n" * 40 + pointer + "\n")
+        if argv[1] == "send":
+            sent.append(argv[-1])
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda value: None)
+    adapter = handoff_launcher.CmuxAdapter("cmux")
+    adapter.workspace = "workspace:9"
+
+    assert adapter.orchestrator_doorbell_input(
+        "surface-uuid", orchestrator_id, forced=True,
+    ) is True
+    assert sent == [handoff_launcher.FORCED_DOORBELL_PREAMBLE + pointer]
+    assert sent[0].endswith(pointer)
+    assert "quote it back verbatim" in sent[0]
+    assert orchestrator_id in sent[0]
+
+
+def test_forced_doorbell_separates_itself_from_the_draft_it_follows():
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    forced = handoff_launcher.orchestrator_doorbell_body(orchestrator_id, forced=True)
+    # cmux inserts at the cursor, so the body must not fuse with the draft's
+    # last word the way "...is actually" + "Ignore..." once did.
+    assert forced.startswith(" ")
+    draft = "also please double check whether the worker is actually"
+    assert "actuallyIgnore" not in draft + forced
+
+
+class FakeTrustAdapter:
+    """A local adapter whose screen/process evolve across capture() calls."""
+
+    def __init__(self, screens, *, codex_after=0):
+        self._screens = list(screens)
+        self._i = 0
+        self._codex_after = codex_after
+        self.enters = 0
+
+    def capture(self, handle):
+        s = self._screens[min(self._i, len(self._screens) - 1)]
+        self._i += 1
+        return s
+
+    def probe(self, handle, expected_agent):
+        return expected_agent == "codex" and self._i >= self._codex_after
+
+    def press_enter(self, handle):
+        self.enters += 1
+        # After Enter, every later capture shows the trusted input loop.
+        self._screens.append("codex is running\n› Ask anything\n")
+        self._i = len(self._screens) - 1
+
+
+def _trust_screen(cwd, *, truncate=0):
+    path = str(cwd)
+    if truncate:
+        path = path[:-truncate]
+    return (
+        f"> You are in {path}\n\n"
+        "  Do you trust the contents of this directory?\n"
+        "› 1. Yes, continue\n  2. No, quit\n\n  Press enter to continue\n"
+    )
+
+
+def test_codex_trust_matcher_tolerates_width_truncation(tmp_path):
+    cwd = tmp_path / "tmp.HGz7Inppmd"
+    cwd.mkdir()
+    full = _trust_screen(cwd)
+    cut = _trust_screen(cwd, truncate=1)  # the observed "…Inppm" for "…Inppmd"
+    assert handoff_launcher._codex_folder_trust_dialog_present(full)
+    assert handoff_launcher._codex_trust_cwd_matches(full, cwd)
+    assert handoff_launcher._codex_trust_cwd_matches(cut, cwd)
+    # A dialog for a different directory must not match.
+    other = _trust_screen(tmp_path / "somewhere-else-entirely")
+    assert not handoff_launcher._codex_trust_cwd_matches(other, cwd)
+
+
+def test_local_codex_trust_rescue_presses_enter_once_for_the_authorized_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    cwd = tmp_path / "repo"; cwd.mkdir()
+    adapter = FakeTrustAdapter([_trust_screen(cwd, truncate=1)], codex_after=0)
+    result = {}
+    handoff_launcher._rescue_local_codex_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd,
+    )
+    assert adapter.enters == 1
+    assert result["folder_trust_rescued"] is True
+    assert "startup_unconfirmed" not in result
+
+
+def test_local_codex_trust_rescue_leaves_a_foreign_dialog_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    cwd = tmp_path / "repo"; cwd.mkdir()
+    foreign = _trust_screen(tmp_path / "not-our-repo")
+    adapter = FakeTrustAdapter([foreign], codex_after=0)
+    result = {}
+    handoff_launcher._rescue_local_codex_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd,
+    )
+    assert adapter.enters == 0
+    assert result["folder_trust_rescued"] is False
+    assert result["startup_unconfirmed"] is True
+
+
+def test_local_codex_trust_rescue_returns_promptly_when_already_trusted(tmp_path, monkeypatch):
+    import itertools
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    ticks = itertools.count(0.0, 0.5)  # advances well before the 30s cap
+    monkeypatch.setattr(handoff_launcher.time, "monotonic", lambda: next(ticks))
+    cwd = tmp_path / "repo"; cwd.mkdir()
+    # No dialog ever; codex is already at its input loop.
+    adapter = FakeTrustAdapter(["codex running\n› Ask anything\n"], codex_after=0)
+    result = {}
+    handoff_launcher._rescue_local_codex_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd, render_grace=3.0,
+    )
+    assert adapter.enters == 0
+    assert result["folder_trust_rescued"] is False
+    assert "startup_unconfirmed" not in result

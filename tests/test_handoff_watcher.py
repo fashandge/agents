@@ -12,6 +12,13 @@ from agents.orchestration import handoff_watcher
 from agents.orchestration import handoffctl
 
 
+class ComposerClear:
+    """Adapter fakes default to an empty composer, i.e. send the doorbell now."""
+
+    def composer_guard(self, handle):
+        return handoff_launcher.COMPOSER_CLEAR
+
+
 def orchestrator_state(tmp_path, *, transport="tmux", target=None):
     state_path = tmp_path / "orchestrator" / "watcher.json"
     value = handoff_watcher.initialize(
@@ -422,20 +429,20 @@ def test_orchestrator_doorbell_routes_exact_opaque_target(monkeypatch):
     orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
-    class Tmux:
-        def orchestrator_doorbell(self, handle, observed_id):
+    class Tmux(ComposerClear):
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
             calls.append(("tmux", handle, observed_id))
 
-    class Cmux:
+    class Cmux(ComposerClear):
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
 
-        def orchestrator_doorbell_input(self, surface, observed_id):
+        def orchestrator_doorbell_input(self, surface, observed_id, *, forced=False):
             calls.append(("cmux_input", self.workspace, surface, observed_id))
             return True
 
-        def orchestrator_doorbell(self, surface, observed_id):
+        def orchestrator_doorbell(self, surface, observed_id, *, forced=False):
             calls.append(("cmux", self.workspace, surface, observed_id))
 
     monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Tmux)
@@ -486,15 +493,15 @@ def test_orchestrator_cmux_falls_back_to_workspace_notification(monkeypatch):
     orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
-    class Cmux:
+    class Cmux(ComposerClear):
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
 
-        def orchestrator_doorbell_input(self, handle, observed_id):
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
             raise handoff_launcher.AdapterError("Broken pipe")
 
-        def orchestrator_doorbell(self, handle, observed_id):
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
             raise handoff_launcher.AdapterError("Broken pipe")
 
         def notify(self, handle, *, title, body):
@@ -525,15 +532,15 @@ def test_orchestrator_cmux_uses_macos_notification_when_cmux_notifications_fail(
     orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     calls = []
 
-    class Cmux:
+    class Cmux(ComposerClear):
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
 
-        def orchestrator_doorbell_input(self, handle, observed_id):
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
             raise handoff_launcher.AdapterError("Broken pipe")
 
-        def orchestrator_doorbell(self, handle, observed_id):
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
             raise handoff_launcher.AdapterError("Broken pipe")
 
         def notify(self, handle, *, title, body):
@@ -568,15 +575,15 @@ def test_orchestrator_cmux_uses_macos_notification_when_cmux_notifications_fail(
 def test_orchestrator_cmux_reports_combined_error_when_every_channel_fails(monkeypatch):
     orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
 
-    class Cmux:
+    class Cmux(ComposerClear):
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
 
-        def orchestrator_doorbell_input(self, handle, observed_id):
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
             raise handoff_launcher.AdapterError("input rejected")
 
-        def orchestrator_doorbell(self, handle, observed_id):
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
             raise handoff_launcher.AdapterError("surface gone")
 
         def notify(self, handle, *, title, body):
@@ -612,16 +619,16 @@ def test_orchestrator_cmux_reports_combined_error_when_every_channel_fails(monke
 def test_orchestrator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch):
     orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
 
-    class Cmux:
+    class Cmux(ComposerClear):
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
 
-        def orchestrator_doorbell_input(self, handle, observed_id):
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
             # Zero-exit send with no visible echo: the code-mode surface trap.
             return False
 
-        def orchestrator_doorbell(self, handle, observed_id):
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
             pass
 
     monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
@@ -644,15 +651,15 @@ def test_orchestrator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch
 def test_orchestrator_cmux_confirmed_input_survives_notification_failure(monkeypatch):
     orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
 
-    class Cmux:
+    class Cmux(ComposerClear):
         def __init__(self, binary):
             self.binary = binary
             self.workspace = None
 
-        def orchestrator_doorbell_input(self, handle, observed_id):
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
             return True
 
-        def orchestrator_doorbell(self, handle, observed_id):
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
             raise handoff_launcher.AdapterError("surface alert gone")
 
         def notify(self, handle, *, title, body):
@@ -1145,3 +1152,202 @@ def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, m
         ),
     ]
     assert "token" not in repr(commands).lower()
+
+
+def test_deferred_input_doorbell_retries_on_the_very_next_poll(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
+    )
+    awaiting_review(run, "secret body")
+    run_id = run["run"]["run_id"]
+    now = datetime.datetime(2026, 7, 21, tzinfo=datetime.timezone.utc)
+    attempts = []
+
+    def deferring(value, coverage):
+        attempts.append(dict(coverage))
+        return f"cmux_notify+{handoff_watcher.DEFERRED_INPUT}"
+
+    handoff_watcher.poll(
+        state_path, registry_path=registry, notifier=deferring, now=now,
+    )
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert len(attempts) == 1
+    # The human is mid-prompt, so nothing was typed and nothing is recorded as
+    # attempted; only the deferral itself is visible in the method.
+    assert state["last_doorbell_at"] is None
+    assert state["doorbell_through"] == 0
+    assert handoff_watcher.DEFERRED_INPUT in state["last_doorbell_method"]
+    assert state["last_doorbell_error"] is None
+
+    # One second later — far inside the 30s retry interval — it tries again
+    # rather than backing off, because no delivery was ever attempted.
+    handoff_watcher.poll(
+        state_path, registry_path=registry, notifier=deferring,
+        now=now + datetime.timedelta(seconds=1),
+    )
+    assert len(attempts) == 2
+
+    # Once the composer clears the typed doorbell lands and is recorded.
+    handoff_watcher.poll(
+        state_path, registry_path=registry,
+        notifier=lambda value, coverage: "cmux_input+cmux_notify",
+        now=now + datetime.timedelta(seconds=2),
+    )
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert state["last_doorbell_at"] is not None
+    assert state["doorbell_through"] > 0
+    assert state["last_doorbell_method"] == "cmux_input+cmux_notify"
+
+    # And a delivered doorbell resumes normal backoff instead of re-ringing.
+    handoff_watcher.poll(
+        state_path, registry_path=registry,
+        notifier=lambda value, coverage: pytest.fail("must back off after delivery"),
+        now=now + datetime.timedelta(seconds=3),
+    )
+
+
+def test_cmux_doorbell_defers_typed_channel_while_the_human_types(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    calls = []
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def composer_guard(self, handle):
+            return handoff_launcher.COMPOSER_BUSY
+
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
+            pytest.fail("a live draft must never be typed into")
+
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
+            calls.append(("cmux_notify", handle, observed_id))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    # The banner still reaches the human; only the composer is left alone.
+    assert method == f"{handoff_watcher.DEFERRED_INPUT}+cmux_notify"
+    assert calls == [("cmux_notify", "surface-uuid", orchestrator_id)]
+
+
+def test_cmux_doorbell_forces_a_parked_draft_with_the_recovery_warning(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    typed = []
+
+    class Cmux(ComposerClear):
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def composer_guard(self, handle):
+            return handoff_launcher.COMPOSER_FORCED
+
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
+            typed.append(forced)
+            return True
+
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
+            pass
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    assert typed == [True]
+    assert method == "cmux_input_forced+cmux_notify"
+
+
+def test_unreadable_composer_guard_keeps_sending_the_doorbell(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    typed = []
+
+    class Cmux(ComposerClear):
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def composer_guard(self, handle):
+            raise handoff_launcher.AdapterError("read-screen failed")
+
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
+            typed.append(forced)
+            return True
+
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
+            pass
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    assert typed == [False]
+    assert method == "cmux_input+cmux_notify"
+
+
+def test_deferral_does_not_stand_in_for_a_failed_visible_alert(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    banners = []
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def composer_guard(self, handle):
+            return handoff_launcher.COMPOSER_BUSY
+
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
+            pytest.fail("a live draft must never be typed into")
+
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
+            raise handoff_launcher.AdapterError("surface alert gone")
+
+        def notify(self, handle, *, title, body):
+            raise handoff_launcher.AdapterError("workspace alert gone")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+    monkeypatch.setattr(
+        handoffctl, "_notify_macos", lambda title, body: banners.append(title),
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9})
+
+    assert banners == ["Handoff orchestrator pending"]
+    assert method == f"{handoff_watcher.DEFERRED_INPUT}+macos_notification"

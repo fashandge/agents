@@ -26,6 +26,7 @@ RESULT_NOTIFICATION_BODY = "Awaiting orchestrator review"
 RESULT_NOTIFICATION_TIMEOUT_SECONDS = 5
 ORCHESTRATOR_NOTIFICATION_TITLE = handoff_launcher.ORCHESTRATOR_DOORBELL_TITLE
 ORCHESTRATOR_NOTIFICATION_BODY = "Worker updates are ready for orchestrator review."
+DEFERRED_INPUT = handoff_watcher.DEFERRED_INPUT
 SURFACE_WATCHER_READY_TIMEOUT_SECONDS = 20.0
 WATCHER_MODES = ("auto", "detached", "surface")
 WATCHER_WORKSPACE_TITLE = "handoff-watchers"
@@ -376,6 +377,19 @@ def _notify_macos(title: str, body: str) -> None:
         )
 
 
+def _composer_guard(adapter: Any, handle: str) -> str:
+    """Ask the adapter whether a typed doorbell may enter the composer now.
+
+    A guard that cannot read the surface must not withhold doorbells, so any
+    probe failure resolves to the clear verdict and keeps the previous
+    send-immediately behavior.
+    """
+    try:
+        return adapter.composer_guard(handle)
+    except handoff_launcher.AdapterError:
+        return handoff_launcher.COMPOSER_CLEAR
+
+
 def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str:
     """Deliver one coalesced, opaque orchestrator doorbell.
 
@@ -399,8 +413,13 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str
     orchestrator_id = value["orchestrator_id"]
     target = value["target"]
     if value["transport"] == "tmux":
-        handoff_launcher.TmuxAdapter().orchestrator_doorbell(
+        tmux = handoff_launcher.TmuxAdapter()
+        guard = _composer_guard(tmux, target["handle"])
+        if guard == handoff_launcher.COMPOSER_BUSY:
+            return DEFERRED_INPUT
+        tmux.orchestrator_doorbell(
             target["handle"], orchestrator_id,
+            forced=guard == handoff_launcher.COMPOSER_FORCED,
         )
         return "terminal_input"
     if value["transport"] == "cmux":
@@ -408,15 +427,25 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str
         adapter.workspace = target["workspace"]
         accepted: list[str] = []
         failures: list[str] = []
-        try:
-            if adapter.orchestrator_doorbell_input(target["surface"], orchestrator_id):
-                accepted.append("cmux_input")
-            else:
-                failures.append(
-                    "cmux input was accepted but never echoed on the surface",
-                )
-        except handoff_launcher.AdapterError as input_error:
-            failures.append(f"cmux input failed ({input_error})")
+        guard = _composer_guard(adapter, target["surface"])
+        if guard == handoff_launcher.COMPOSER_BUSY:
+            # The human is editing a prompt in this composer right now.  Skip
+            # the typed channel only; the visible alert below still fires, and
+            # the watcher retries the typed channel on its next poll.
+            accepted.append(DEFERRED_INPUT)
+        else:
+            forced = guard == handoff_launcher.COMPOSER_FORCED
+            try:
+                if adapter.orchestrator_doorbell_input(
+                    target["surface"], orchestrator_id, forced=forced,
+                ):
+                    accepted.append("cmux_input_forced" if forced else "cmux_input")
+                else:
+                    failures.append(
+                        "cmux input was accepted but never echoed on the surface",
+                    )
+            except handoff_launcher.AdapterError as input_error:
+                failures.append(f"cmux input failed ({input_error})")
         try:
             adapter.orchestrator_doorbell(target["surface"], orchestrator_id)
             accepted.append("cmux_notify")
@@ -433,7 +462,9 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str
                 failures.append(
                     f"cmux workspace notification failed ({notification_error})",
                 )
-        if not accepted:
+        # A withheld typed channel is a postponement, not a delivery, so it
+        # must not stand in for one when every real channel has failed.
+        if not [channel for channel in accepted if channel != DEFERRED_INPUT]:
             try:
                 _notify_macos(
                     ORCHESTRATOR_NOTIFICATION_TITLE,

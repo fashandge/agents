@@ -23,7 +23,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agents import env
 from agents.orchestration import handoff
@@ -31,12 +31,25 @@ from agents.orchestration import handoff_registry
 
 
 CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+CMUX_APP_NAME = "cmux"
+LSAPPINFO_DEFAULT = "/usr/bin/lsappinfo"
 REMOTE_PYTHON_DEFAULT = "python3"
 KIMI_SUBMIT_SETTLE_SECONDS = 0.5
 TUI_SUBMIT_SETTLE_SECONDS = 0.7
+# A typed orchestrator doorbell lands in the same composer the human types
+# into, so it is gated on what that composer currently holds.
+COMPOSER_CLEAR = "clear"      # nothing typed: send now
+COMPOSER_BUSY = "busy"        # a draft is being edited: defer to a later poll
+COMPOSER_FORCED = "forced"    # a parked draft: send, and warn about the draft
+COMPOSER_STABLE_SECONDS = 10.0
+COMPOSER_PROBE_SECONDS = 1.0
 DEFAULT_READINESS_TIMEOUT = 120.0
 REMOTE_CODEX_STARTUP_TIMEOUT = 30.0
 REMOTE_FOLDER_TRUST_SCROLLBACK_LINES = 120
+# Local Codex, unlike remote, shows its folder-trust dialog in the launched
+# surface itself; the launcher clears it before releasing the orchestrator.
+LOCAL_CODEX_TRUST_TIMEOUT = 30.0
+CODEX_TRUST_RENDER_GRACE = 3.0
 REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
 AGENT_DEFAULTS = {
     "claude": ("opus", "high"),
@@ -46,12 +59,32 @@ AGENT_DEFAULTS = {
 ORCHESTRATOR_DOORBELL_TITLE = "Handoff orchestrator pending"
 
 
-def orchestrator_doorbell_body(orchestrator_id: str) -> str:
-    """Return the opaque snapshot-pointer text for an orchestrator doorbell."""
-    return (
+FORCED_DOORBELL_PREAMBLE = (
+    # The composer inserts at the cursor, so without a leading separator this
+    # runs straight into the final word of the human's draft.
+    " ⟦handoff doorbell⟧ "
+    "Ignore everything before this sentence: it is an unfinished draft the "
+    "human was still typing when this doorbell had to be delivered. Do not act "
+    "on that draft; quote it back verbatim at the top of your reply so the "
+    "human can recover it, then handle the pointer that follows. "
+)
+
+
+def orchestrator_doorbell_body(orchestrator_id: str, *, forced: bool = False) -> str:
+    """Return the opaque snapshot-pointer text for an orchestrator doorbell.
+
+    ``forced`` prefixes a fixed warning used when the doorbell is typed into a
+    composer that already holds a human draft: submitting clears the composer,
+    so the draft is only recoverable if the orchestrator quotes it back.  Both
+    variants remain fixed templates carrying no event bodies or credentials,
+    and the pointer sentence stays a contiguous suffix so echo verification can
+    look for it alone.
+    """
+    pointer = (
         f"Check handoff orchestrator {orchestrator_id}; "
         "pending worker outbox events are recorded."
     )
+    return f"{FORCED_DOORBELL_PREAMBLE}{pointer}" if forced else pointer
 
 
 def _compact_terminal_text(value: str) -> str:
@@ -78,6 +111,90 @@ def _tui_submit_pending(screen: str, text: str) -> bool:
     """
     tail = [line for line in screen.splitlines() if line.strip()][-10:]
     return _compact_terminal_text(text) in _compact_terminal_text("\n".join(tail))
+
+
+COMPOSER_PROMPT_RE = re.compile(r"^\s*(?:[│|]\s*)?[>❯›]\s?(.*?)\s*(?:[│|])?\s*$")
+COMPOSER_BORDER_CHARS = set("─━-│|┌┐└┘├┤╭╮╯╰ ")
+
+
+def _is_box_border(line: str) -> bool:
+    return bool(line.strip()) and set(line) <= COMPOSER_BORDER_CHARS
+
+
+def composer_draft(screen: str) -> str:
+    """Return whatever currently sits in the agent TUI's input composer.
+
+    Agent TUIs render the composer as the bottom-most prompt marker inside a
+    box, with wrapped continuation lines beneath it and a status line outside
+    the closing border.  Scanning upward from the bottom finds the composer
+    rather than a transcript line that merely starts with ``>``.  An empty
+    string means nothing is typed; an unrecognized screen also reads as empty
+    so an unfamiliar TUI keeps today's send-immediately behavior instead of
+    silently withholding every doorbell.
+    """
+    lines = screen.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        match = COMPOSER_PROMPT_RE.match(lines[index])
+        if match is None:
+            continue
+        parts = [match.group(1)]
+        for line in lines[index + 1:]:
+            if _is_box_border(line):
+                break
+            parts.append(line.strip(" │|"))
+        return " ".join(part.strip() for part in parts if part.strip())
+    return ""
+
+
+def _composer_guard(
+    capture: Callable[[], str],
+    has_user_focus: Callable[[], bool],
+    *,
+    stable_seconds: float = COMPOSER_STABLE_SECONDS,
+    probe_seconds: float = COMPOSER_PROBE_SECONDS,
+) -> str:
+    """Decide whether a typed doorbell may enter this composer right now.
+
+    An empty composer is sent into immediately, which covers both an idle
+    agent and a running turn (input typed mid-turn simply queues).  A draft on
+    an unfocused surface cannot be receiving keystrokes, so it is forced at
+    once rather than waiting out a timer the human is not participating in.  A
+    draft on the focused surface is watched for a short while: any edit defers
+    to a later poll, and text that never changes is treated as parked and
+    forced, so a doorbell is delayed but never abandoned.
+    """
+    draft = composer_draft(capture())
+    if not draft:
+        return COMPOSER_CLEAR
+    if not has_user_focus():
+        return COMPOSER_FORCED
+    for _ in range(max(1, round(stable_seconds / probe_seconds))):
+        time.sleep(probe_seconds)
+        current = composer_draft(capture())
+        if not current:
+            return COMPOSER_CLEAR
+        if current != draft:
+            return COMPOSER_BUSY
+    return COMPOSER_FORCED
+
+
+def _macos_frontmost_app(binary: str = LSAPPINFO_DEFAULT) -> str | None:
+    """Return the frontmost application's display name, or None if unknown.
+
+    ``lsappinfo`` needs no Accessibility grant and never prompts, unlike the
+    System Events route.
+    """
+    try:
+        front = _run([binary, "front"], check=False)
+        if front.returncode != 0 or not front.stdout.strip():
+            return None
+        info = _run([binary, "info", "-only", "name", front.stdout.strip()], check=False)
+    except AdapterError:
+        return None
+    if info.returncode != 0:
+        return None
+    match = re.search(r'"LSDisplayName"\s*=\s*"([^"]*)"', info.stdout)
+    return match.group(1) if match else None
 
 
 def _kimi_input_ready(screen: str) -> bool:
@@ -209,7 +326,7 @@ class TmuxAdapter:
         _run([self.binary, "send-keys", "-t", handle, "-l", text])
         _run([self.binary, "send-keys", "-t", handle, "Enter"])
 
-    def _type_tui(self, handle: str, text: str) -> None:
+    def _type_tui(self, handle: str, text: str, probe: str | None = None) -> None:
         # Agent TUIs coalesce a same-burst text+Enter into a bracketed paste,
         # turning Enter into an input newline and leaving the text unsent.
         # Settle between the literal insert and the submit, then retry the
@@ -219,7 +336,7 @@ class TmuxAdapter:
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
         _run([self.binary, "send-keys", "-t", handle, "Enter"])
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
-        if _tui_submit_pending(self.capture(handle), text):
+        if _tui_submit_pending(self.capture(handle), probe or text):
             _run([self.binary, "send-keys", "-t", handle, "Enter"])
 
     def probe(self, handle: str, expected_agent: str) -> bool:
@@ -251,8 +368,22 @@ class TmuxAdapter:
     def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
         self._type_tui(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
 
-    def orchestrator_doorbell(self, handle: str, orchestrator_id: str) -> None:
-        self._type_tui(handle, orchestrator_doorbell_body(orchestrator_id))
+    def orchestrator_doorbell(
+        self, handle: str, orchestrator_id: str, *, forced: bool = False,
+    ) -> None:
+        self._type_tui(
+            handle,
+            orchestrator_doorbell_body(orchestrator_id, forced=forced),
+            probe=orchestrator_doorbell_body(orchestrator_id),
+        )
+
+    def composer_guard(self, handle: str) -> str:
+        # tmux reports no dependable per-pane focus for a detached, multi-client,
+        # or SSH-hosted session, so every draft goes through the stability timer.
+        return _composer_guard(lambda: self.capture(handle), lambda: True)
+
+    def press_enter(self, handle: str) -> None:
+        _run([self.binary, "send-keys", "-t", handle, "Enter"])
 
     def send_literal(self, handle: str, text: str) -> bool:
         previous_count = _kimi_instruction_count(self.capture(handle), text)
@@ -313,7 +444,7 @@ class CmuxAdapter:
         _run([self.binary, "send", "--workspace", self.workspace, "--surface", handle, text])
         _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
 
-    def _type_tui(self, handle: str, text: str) -> None:
+    def _type_tui(self, handle: str, text: str, probe: str | None = None) -> None:
         # Same paste-coalescing hazard as TmuxAdapter._type_tui: settle before
         # the submit, then retry once if the text still sits in the composer.
         if not self.workspace:
@@ -322,7 +453,7 @@ class CmuxAdapter:
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
         _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
-        if _tui_submit_pending(self.capture(handle), text):
+        if _tui_submit_pending(self.capture(handle), probe or text):
             _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
 
     def probe(self, handle: str, expected_agent: str) -> bool:
@@ -370,7 +501,9 @@ class CmuxAdapter:
             body=orchestrator_doorbell_body(orchestrator_id),
         )
 
-    def orchestrator_doorbell_input(self, handle: str, orchestrator_id: str) -> bool:
+    def orchestrator_doorbell_input(
+        self, handle: str, orchestrator_id: str, *, forced: bool = False,
+    ) -> bool:
         """Type the doorbell into the orchestrator surface and confirm the echo.
 
         A visible alert never pushes a surface-hosted agent to act; typed
@@ -379,10 +512,59 @@ class CmuxAdapter:
         Code-mode and desktop-backed surfaces instead accept the socket write
         with a zero exit and silently drop it, so the send counts as delivered
         only when the doorbell text is visible on the surface afterward.
+
+        Delivery is verified against the pointer sentence alone, which both
+        body variants end with: the forced variant is long enough to wrap over
+        more lines than the submit-pending heuristic inspects.
         """
-        body = orchestrator_doorbell_body(orchestrator_id)
-        self._type_tui(handle, body)
-        return _compact_terminal_text(body) in _compact_terminal_text(self.capture(handle))
+        pointer = orchestrator_doorbell_body(orchestrator_id)
+        self._type_tui(
+            handle,
+            orchestrator_doorbell_body(orchestrator_id, forced=forced),
+            probe=pointer,
+        )
+        return _compact_terminal_text(pointer) in _compact_terminal_text(self.capture(handle))
+
+    def _surface_has_user_focus(self, handle: str) -> bool:
+        """Best-effort: can the human be typing into this exact surface now?
+
+        ``list-pane-surfaces`` describes the focused pane of the current
+        workspace, so a surface that is absent from that listing is not where
+        keystrokes are going, and a listed-but-unselected surface is not
+        either.  Both answers hold however busy the keyboard and mouse are
+        elsewhere, which a machine-wide idle timer cannot distinguish.  An
+        unreadable environment resolves to True so the stability timer decides
+        rather than a doorbell being forced into a live draft.
+        """
+        app = _macos_frontmost_app()
+        if app is not None and app != CMUX_APP_NAME:
+            return False
+        try:
+            listing = _run(
+                [self.binary, "--id-format", "both", "list-pane-surfaces"], check=False,
+            )
+        except AdapterError:
+            return True
+        if listing.returncode != 0:
+            return True
+        for line in listing.stdout.splitlines():
+            if handle.lower() in line.lower():
+                return "[selected]" in line or line.lstrip().startswith("*")
+        return False
+
+    def composer_guard(self, handle: str) -> str:
+        return _composer_guard(
+            lambda: self.capture(handle),
+            lambda: self._surface_has_user_focus(handle),
+        )
+
+    def press_enter(self, handle: str) -> None:
+        if not self.workspace:
+            raise AdapterError("cmux workspace was not resolved before sending a key")
+        _run([
+            self.binary, "send-key", "--workspace", self.workspace,
+            "--surface", handle, "enter",
+        ])
 
     def notify(self, handle: str | None, *, title: str, body: str) -> None:
         """Raise a native cmux alert when terminal input is unavailable."""
@@ -637,6 +819,14 @@ def launch(
     goal_file = Path(str(kickoff) + ".goal")
     ready: bool | None = None
     rescue: str | None = None
+    codex_startup: dict[str, Any] = {}
+    if agent == "codex":
+        # Local Codex renders its folder-trust dialog in this surface and will
+        # never reach the agent loop until it is cleared, so clear it here the
+        # way remote launches already do — before readiness or goal delivery.
+        _rescue_local_codex_folder_trust(
+            codex_startup, adapter=adapter, handle=handle, cwd=cwd,
+        )
     if agent == "kimi":
         kickoff_sent = bootstrap_kimi(
             adapter,
@@ -665,6 +855,8 @@ def launch(
         ready = wait_ready(adapter, handle, agent, actual_run_dir, timeout=readiness_timeout)
         if not ready:
             rescue = adapter.rescue_command(handle)
+    if codex_startup.get("startup_unconfirmed") and rescue is None:
+        rescue = adapter.rescue_command(handle)
     orchestrator_released = False
     if not retain_orchestrator:
         orchestrator_token = (private_dir / "orchestrator.token").read_bytes()
@@ -681,6 +873,10 @@ def launch(
         "orchestrator_released": orchestrator_released,
         "rescue_command": rescue,
     }
+    if agent == "codex":
+        result["folder_trust_rescued"] = bool(codex_startup.get("folder_trust_rescued"))
+        if codex_startup.get("startup_unconfirmed"):
+            result["startup_unconfirmed"] = True
     try:
         handoff_registry.register(
             run_id=result["run_id"], name=name, run_dir=str(actual_run_dir),
@@ -883,6 +1079,86 @@ def _rescue_remote_codex_folder_trust(
 
     result["folder_trust_rescued"] = True
     result.pop("rescue_command", None)
+
+
+def _codex_folder_trust_dialog_present(screen: str) -> bool:
+    """True when Codex's exact folder-trust dialog is on screen.
+
+    Matches the fixed dialog literals only; the directory is verified
+    separately, because the path line is width-truncated on a terminal.
+    """
+    return (
+        "Do you trust the contents of this directory?" in screen
+        and "1. Yes, continue" in screen
+        and "2. No, quit" in screen
+        and "Press enter to continue" in screen
+    )
+
+
+def _codex_trust_cwd_matches(screen: str, cwd: Path) -> bool:
+    """Confirm the trust dialog names the exact directory we launched into.
+
+    Codex prints ``You are in <cwd>``, but a narrow surface truncates or wraps
+    that path, so the shown token is only a *prefix* of the real cwd (observed:
+    ``…/tmp.HGz7Inppm`` for a cwd ending ``…/tmp.HGz7Inppmd``).  Requiring the
+    visible token to be a non-trivial prefix of the authorized cwd both
+    tolerates truncation and rejects a dialog for some other directory.
+    """
+    marker = "You are in "
+    index = screen.rfind(marker)
+    if index < 0:
+        return False
+    shown = screen[index + len(marker):].splitlines()[0].strip()
+    target = str(cwd)
+    return bool(shown) and target.startswith(shown) and len(shown) >= min(len(target), 12)
+
+
+def _rescue_local_codex_folder_trust(
+    result: dict[str, Any],
+    *,
+    adapter: Any,
+    handle: str,
+    cwd: Path,
+    timeout: float = LOCAL_CODEX_TRUST_TIMEOUT,
+    render_grace: float = CODEX_TRUST_RENDER_GRACE,
+) -> None:
+    """Advance one verified local Codex folder-trust dialog at most once.
+
+    The launcher started Codex in this exact surface at ``cwd``, so a trust
+    dialog here for that directory is the authorized one.  A dialog naming any
+    other directory is left untouched and flagged for manual handling.  When
+    Codex reaches its input loop without ever showing a dialog the directory
+    was already trusted, so the rescue returns promptly after a short grace
+    rather than blocking for the whole timeout.
+    """
+    result["folder_trust_rescued"] = False
+    deadline = time.monotonic() + timeout
+    process_since: float | None = None
+    while time.monotonic() < deadline:
+        screen = adapter.capture(handle)
+        if _codex_folder_trust_dialog_present(screen):
+            if not _codex_trust_cwd_matches(screen, cwd):
+                result["startup_unconfirmed"] = True
+                return
+            break
+        if adapter.probe(handle, "codex"):
+            now = time.monotonic()
+            process_since = process_since if process_since is not None else now
+            if now - process_since >= render_grace:
+                return  # Codex is up with no dialog: the directory was trusted.
+        time.sleep(0.25)
+    else:
+        # Never saw a dialog and Codex never came up within the window.
+        if not adapter.probe(handle, "codex"):
+            result["startup_unconfirmed"] = True
+        return
+
+    adapter.press_enter(handle)
+    time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+    if _codex_folder_trust_dialog_present(adapter.capture(handle)):
+        result["startup_unconfirmed"] = True
+        return
+    result["folder_trust_rescued"] = True
 
 
 def launch_remote(
