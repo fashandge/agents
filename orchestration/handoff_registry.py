@@ -7,6 +7,7 @@ import datetime
 import fcntl
 import json
 import os
+import shutil
 import tempfile
 import uuid
 from pathlib import Path
@@ -345,15 +346,51 @@ def _resolve_lenient(
     return key, runs[key], invalid.get(key)
 
 
-def forget(selector: str, *, path: Path | None = None, force: bool = False) -> dict[str, Any]:
-    """Remove one registry record; never touches the run itself.
+def _delete_run_dir(record: dict[str, Any], *, dry_run: bool = False) -> tuple[bool, str | None]:
+    """Delete one run's on-disk directory; return ``(deleted, note)``.
+
+    Deletion is deliberately narrower than the record: a remote run's
+    directory lives on another host, and a local directory is removed only
+    when it carries a ``status.json`` — proof it is a handoff run directory
+    rather than an arbitrary path a corrupt record happens to name.  With
+    ``dry_run`` the same checks run but nothing is removed, so a prune plan
+    reports exactly what a real run would delete.
+    """
+    host = record.get("host")
+    if host is not None:
+        return False, f"run is remote (host {host!r}); delete its run directory on that host"
+    run_dir = record.get("run_dir")
+    if not isinstance(run_dir, str) or not run_dir:
+        return False, "record has no usable run_dir"
+    path = Path(run_dir)
+    if not path.is_dir():
+        return False, "run directory is already missing"
+    if not (path / "status.json").is_file():
+        raise handoff.HandoffError(
+            f"refusing to delete {path}: no status.json; "
+            "not recognizable as a handoff run directory",
+            4,
+        )
+    if not dry_run:
+        shutil.rmtree(path)
+    return True, None
+
+
+def forget(
+    selector: str, *, path: Path | None = None, force: bool = False,
+    delete_run_dir: bool = False,
+) -> dict[str, Any]:
+    """Remove one registry record; by default never touches the run itself.
 
     The run directory, journals, and credential files stay exactly where they
-    are — the run remains fully inspectable by absolute ``--run-dir``.
-    Refuses a run that is not known to be terminal unless ``force`` is given:
-    dropping the registry record of a live run orphans a running worker.  The
-    registry is read leniently so a corrupt record — the reason this command
-    exists — can be found and removed while every strict read still fails.
+    are — the run remains fully inspectable by absolute ``--run-dir`` — unless
+    ``delete_run_dir`` is given, which also removes the run directory (never
+    the separate credential directory) once the record passes the same
+    terminal check.  Refuses a run that is not known to be terminal unless
+    ``force`` is given: dropping the registry record of a live run orphans a
+    running worker.  The registry is read leniently so a corrupt record — the
+    reason this command exists — can be found and removed while every strict
+    read still fails.
     """
     if not isinstance(selector, str) or not selector:
         raise handoff.HandoffError("run selector must be non-empty", 2)
@@ -387,18 +424,27 @@ def forget(selector: str, *, path: Path | None = None, force: bool = False) -> d
                 "use --force to remove the record anyway",
                 4,
             )
+        deleted, delete_note = False, None
+        if delete_run_dir:
+            # Delete before dropping the record so a refusal leaves the run
+            # fully registered and retryable.
+            deleted, delete_note = _delete_run_dir(record if isinstance(record, dict) else {})
         del registry["runs"][key]
         _write_unlocked(registry_path, registry)
     if not terminal:
         note = f"removed with --force despite: {note}"
-    return {"removed": record, "note": note}
+    return {
+        "removed": record, "note": note,
+        "run_dir_deleted": deleted, "run_dir_note": delete_note,
+    }
 
 
 def prune(
     *, path: Path | None = None, older_than: float | None = None,
     terminal_only: bool = True, host: str | None = None, dry_run: bool = False,
+    delete_run_dir: bool = False,
 ) -> dict[str, Any]:
-    """Remove registry records for finished runs in bulk; registry-only.
+    """Remove registry records for finished runs in bulk; registry-only by default.
 
     Filters select candidates by ``registered_at`` age (``older_than`` days)
     and ``host``.  A candidate that is not known to be terminal is skipped
@@ -406,7 +452,10 @@ def prune(
     the way ``forget --force`` does for one record.  Invalid records are
     never bulk-removed: they are reported as skipped so they can be removed
     deliberately with ``runs forget``.  ``dry_run`` computes the same plan
-    under a shared lock and changes nothing.
+    under a shared lock and changes nothing.  With ``delete_run_dir`` each
+    removed run's directory is deleted as well (never the separate credential
+    directory); a run whose directory fails the deletion checks is skipped
+    with the reason and keeps its registry record.
     """
     if older_than is not None and older_than < 0:
         raise handoff.HandoffError("--older-than must be non-negative", 2)
@@ -448,6 +497,27 @@ def prune(
             if not terminal:
                 note = f"not known to be terminal ({note}); included by --no-terminal-only"
             removed.append({"record": dict(record), "note": note})
+        if removed and delete_run_dir:
+            planned = []
+            for entry in removed:
+                try:
+                    deleted, delete_note = _delete_run_dir(entry["record"], dry_run=dry_run)
+                except handoff.HandoffError as exc:
+                    if dry_run:
+                        entry["run_dir_deleted"] = False
+                        entry["run_dir_note"] = str(exc)
+                        planned.append(entry)
+                    else:
+                        skipped.append({
+                            "run_id": entry["record"]["run_id"],
+                            "name": entry["record"]["name"],
+                            "reason": str(exc),
+                        })
+                    continue
+                entry["run_dir_deleted"] = deleted
+                entry["run_dir_note"] = delete_note
+                planned.append(entry)
+            removed = planned
         if removed and not dry_run:
             for entry in removed:
                 del registry["runs"][entry["record"]["run_id"]]

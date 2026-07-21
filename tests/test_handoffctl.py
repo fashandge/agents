@@ -1029,6 +1029,38 @@ def test_cli_runs_prune_skips_live_records_with_reasons(tmp_path, monkeypatch, c
     assert len(handoff_registry.list_records()) == 1
 
 
+def test_cli_runs_forget_delete_run_dir_removes_the_run(tmp_path, monkeypatch, capsys):
+    run = registered_run(tmp_path, monkeypatch)
+    fail_registered_run(run)
+
+    assert handoffctl.main(["runs", "forget", "--run", "weather", "--delete-run-dir"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["run_dir_deleted"] is True
+    assert "credential_dir" not in output["removed"]
+    assert handoff_registry.list_records() == []
+    assert not Path(run["run_dir"]).exists()
+    assert (run["private"] / "recovery.token").exists()
+
+
+def test_cli_runs_prune_delete_run_dir_removes_terminal_runs(tmp_path, monkeypatch, capsys):
+    run = registered_run(tmp_path, monkeypatch)
+    fail_registered_run(run)
+
+    assert handoffctl.main(["runs", "prune", "--dry-run", "--delete-run-dir"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["removed"][0]["run_dir_deleted"] is True
+    assert Path(run["run_dir"]).exists()
+    assert len(handoff_registry.list_records()) == 1
+
+    assert handoffctl.main(["runs", "prune", "--yes", "--delete-run-dir"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["removed"][0]["run_dir_deleted"] is True
+    assert handoff_registry.list_records() == []
+    assert not Path(run["run_dir"]).exists()
+    assert (run["private"] / "recovery.token").exists()
+
+
 def test_cli_runs_doctor_reports_invalid_records_individually(tmp_path, monkeypatch, capsys):
     registered_run(tmp_path, monkeypatch)
     registry = tmp_path / "registry.json"

@@ -1,5 +1,6 @@
 import json
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -7,12 +8,12 @@ from agents.orchestration import handoff
 from agents.orchestration import handoff_registry
 
 
-def record(registry, *, run_id, name="weather", host=None, credential_dir="/private/run"):
+def record(registry, *, run_id, name="weather", host=None, credential_dir="/private/run", run_dir=None):
     return handoff_registry.register(
         path=registry,
         run_id=run_id,
         name=name,
-        run_dir=f"/state/{run_id}",
+        run_dir=run_dir or f"/state/{run_id}",
         run_uri=f"ssh://worker/state/{run_id}" if host else f"/state/{run_id}",
         host=host,
         remote_python="/opt/python" if host else None,
@@ -271,6 +272,93 @@ def test_prune_no_terminal_only_includes_live_records_with_a_note(tmp_path):
     assert "not known to be terminal" in entry["note"]
     assert handoff_registry.list_records(path=registry) == []
     assert handoff.status(run["run_dir"])["state"] == "starting"
+
+
+def test_forget_delete_run_dir_removes_run_files_but_keeps_credentials(tmp_path):
+    registry = tmp_path / "registry.json"
+    run = live_run(tmp_path, registry)
+    fail_run(run)
+
+    result = handoff_registry.forget("run-one", path=registry, delete_run_dir=True)
+
+    assert result["run_dir_deleted"] is True
+    assert result["run_dir_note"] is None
+    assert handoff_registry.list_records(path=registry) == []
+    assert not Path(run["run_dir"]).exists()
+    # Credentials live outside the run directory and survive deletion.
+    assert (run["private"] / "recovery.token").exists()
+    assert (run["private"] / "worker.token").exists()
+
+
+def test_forget_delete_run_dir_keeps_a_remote_run_directory(tmp_path):
+    registry = tmp_path / "registry.json"
+    record(registry, run_id="run-one", host="oci-box")
+
+    result = handoff_registry.forget("run-one", path=registry, force=True, delete_run_dir=True)
+
+    assert result["run_dir_deleted"] is False
+    assert "remote" in result["run_dir_note"]
+    assert handoff_registry.list_records(path=registry) == []
+
+
+def test_forget_delete_run_dir_refuses_a_directory_without_status(tmp_path):
+    registry = tmp_path / "registry.json"
+    fake = tmp_path / "not-a-run"
+    fake.mkdir()
+    record(registry, run_id="run-one", run_dir=str(fake))
+
+    with pytest.raises(handoff.HandoffError, match="refusing to delete") as excinfo:
+        handoff_registry.forget("run-one", path=registry, force=True, delete_run_dir=True)
+
+    assert excinfo.value.exit_code == 4
+    assert fake.exists()
+    assert handoff_registry.resolve("run-one", path=registry)["run_id"] == "run-one"
+
+
+def test_prune_delete_run_dir_removes_terminal_run_files(tmp_path):
+    registry = tmp_path / "registry.json"
+    terminal = live_run(tmp_path, registry, run_id="run-terminal")
+    fail_run(terminal)
+    live_run(tmp_path, registry, run_id="run-live")
+
+    result = handoff_registry.prune(path=registry, delete_run_dir=True)
+
+    entry = result["removed"][0]
+    assert entry["record"]["run_id"] == "run-terminal"
+    assert entry["run_dir_deleted"] is True
+    assert entry["run_dir_note"] is None
+    assert not Path(terminal["run_dir"]).exists()
+    assert (terminal["private"] / "recovery.token").exists()
+    assert [skip["run_id"] for skip in result["skipped"]] == ["run-live"]
+    assert [item["run_id"] for item in handoff_registry.list_records(path=registry)] == ["run-live"]
+
+
+def test_prune_delete_run_dir_dry_run_reports_without_deleting(tmp_path):
+    registry = tmp_path / "registry.json"
+    terminal = live_run(tmp_path, registry, run_id="run-terminal")
+    fail_run(terminal)
+
+    result = handoff_registry.prune(path=registry, dry_run=True, delete_run_dir=True)
+
+    assert result["dry_run"] is True
+    assert result["removed"][0]["run_dir_deleted"] is True
+    assert Path(terminal["run_dir"]).exists()
+    assert len(handoff_registry.list_records(path=registry)) == 1
+
+
+def test_prune_delete_run_dir_skips_an_unrecognized_directory(tmp_path):
+    registry = tmp_path / "registry.json"
+    fake = tmp_path / "not-a-run"
+    fake.mkdir()
+    record(registry, run_id="run-one", run_dir=str(fake))
+
+    result = handoff_registry.prune(path=registry, terminal_only=False, delete_run_dir=True)
+
+    assert result["removed"] == []
+    assert [skip["run_id"] for skip in result["skipped"]] == ["run-one"]
+    assert "refusing to delete" in result["skipped"][0]["reason"]
+    assert fake.exists()
+    assert len(handoff_registry.list_records(path=registry)) == 1
 
 
 def test_prune_rejects_negative_age(tmp_path):

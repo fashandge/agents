@@ -990,15 +990,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_adopt.add_argument("--run", required=True, help="registered run selector")
     run_adopt.add_argument("--orchestrator-state", "--coordinator-state", dest="orchestrator_state", required=True, type=_absolute)
     run_forget = run_commands.add_parser(
-        "forget", help="remove one terminal run's registry record (never the run itself)",
+        "forget", help="remove one terminal run's registry record (never the run itself, unless --delete-run-dir)",
     )
     run_forget.add_argument("--run", required=True, help="run ID, unique prefix, name, handle, or URI")
     run_forget.add_argument(
         "--force", action="store_true",
         help="remove the record even when the run may still be live",
     )
+    run_forget.add_argument(
+        "--delete-run-dir", action="store_true",
+        help="also delete the run directory (journals, status, control; never the credential directory)",
+    )
     run_prune = run_commands.add_parser(
-        "prune", help="remove registry records for finished runs in bulk (never the runs themselves)",
+        "prune", help="remove registry records for finished runs in bulk (never the runs themselves, unless --delete-run-dir)",
     )
     run_prune.add_argument(
         "--older-than", type=float, metavar="DAYS",
@@ -1009,6 +1013,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip records whose runs may still be live (default; --no-terminal-only overrides)",
     )
     run_prune.add_argument("--host", help="only records for this remote host")
+    run_prune.add_argument(
+        "--delete-run-dir", action="store_true",
+        help="also delete each removed run's directory (never the credential directory)",
+    )
     confirmation = run_prune.add_mutually_exclusive_group()
     confirmation.add_argument(
         "--dry-run", action="store_true", help="print the removal plan and change nothing",
@@ -1152,7 +1160,9 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
                 record["run_id"], orchestrator["orchestrator_id"],
             ))
         if args.runs_command == "forget":
-            result = handoff_registry.forget(args.run, force=args.force)
+            result = handoff_registry.forget(
+                args.run, force=args.force, delete_run_dir=args.delete_run_dir,
+            )
             if isinstance(result["removed"], dict):
                 result["removed"] = handoff_registry.public(result["removed"])
             return result
@@ -1164,7 +1174,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
                 )
             result = handoff_registry.prune(
                 older_than=args.older_than, terminal_only=args.terminal_only,
-                host=args.host, dry_run=args.dry_run,
+                host=args.host, dry_run=args.dry_run, delete_run_dir=args.delete_run_dir,
             )
             for entry in result["removed"]:
                 entry["record"] = handoff_registry.public(entry["record"])
