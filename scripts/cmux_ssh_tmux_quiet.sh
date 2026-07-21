@@ -5,11 +5,14 @@
 #
 #   Path A (host already connected): per-session `cmux rpc remote.tmux.attach`
 #     revives/creates the mirror views with NO new window at all.
-#   Path B (cold connection): `cmux ssh-tmux --no-focus` (cmux insists on a
-#     dedicated window), then: minimize the window while its title is still
-#     unique, move every mirrored workspace under the calling workspace, and
-#     best-effort close the vacated window (cmux may refill it with a
-#     placeholder; it is re-minimized so the husk sits in the Dock).
+#   Path B (cold connection): `cmux ssh-tmux --no-focus`, then: move every
+#     mirrored workspace under the calling workspace. Only when the reported
+#     window is genuinely NEW (absent from a pre-call window snapshot and not
+#     the caller's own): minimize it while its title is still unique, and
+#     close it only once it is verifiably empty (cmux may refill it with a
+#     placeholder; the husk is re-minimized to the Dock). On a warm
+#     connection ssh-tmux can reuse an EXISTING window — even the caller's —
+#     and that window is never minimized or closed.
 #
 # Usage: cmux_ssh_tmux_quiet.sh <ssh-host> [session ...]
 #   With session names, only those sessions are attached/placed; other
@@ -105,9 +108,21 @@ if sessions_json=$("$cmux_bin" rpc remote.tmux.sessions "{\"host\":\"$host\"}" 2
 fi
 
 # --- Path B: cold connection -> ssh-tmux window flow ------------------------
+# Snapshot the window list BEFORE ssh-tmux. cmux only creates a dedicated
+# mirror window on a truly cold connection; on a warm one it can revive the
+# mirror into an EXISTING window — including the caller's own — and report
+# that window's UUID. Every minimize/close below must be gated on the window
+# being genuinely new (2026-07-21: an ungated close-window here destroyed the
+# orchestrator's own window and every session in it).
+pre_windows=$("$cmux_bin" --id-format uuids list-windows 2>/dev/null | grep -oiE "$UUID_RE" || true)
+
 out=$("$cmux_bin" --id-format both ssh-tmux "$host" --no-focus)
 mirror_window=$(uuid_of "$(echo "$out" | grep -oiE "window=$UUID_RE")")
 [[ -n "$mirror_window" ]] || { echo "ERROR: ssh-tmux gave no window uuid: $out" >&2; exit 1; }
+
+window_is_new=true
+if grep -qiF "$mirror_window" <<<"$pre_windows"; then window_is_new=false; fi
+[[ "$mirror_window" == "$target_window" ]] && window_is_new=false
 
 # Wait for the mirrored session workspaces to materialize.
 deadline=$((SECONDS + 20))
@@ -124,7 +139,7 @@ done
 selected_name=$(printf '%s\n' "${ws_lines[@]}" | grep -F '[selected]' | head -1 \
   | sed -E 's/^\*? *[^ ]+ +//; s/ +\[selected\].*$//')
 minimized=visible
-if [[ -n "$selected_name" ]]; then
+if [[ "$window_is_new" == true && -n "$selected_name" ]]; then
   if osascript -e "tell application \"System Events\" to tell process \"cmux\" to set value of attribute \"AXMinimized\" of (first window whose name is \"$selected_name\") to true" >/dev/null 2>&1; then
     minimized=minimized
   fi
@@ -138,14 +153,41 @@ printf '%s\n' "${ws_lines[@]}" | while read -r line; do
   place "$ws_name" "$ws_uuid"
 done
 
-# Best-effort close of the vacated mirror window; re-minimize the husk if
-# cmux refills it with a placeholder instead of closing.
-"$cmux_bin" close-window --window "$mirror_window" >/dev/null 2>&1 || true
-sleep 1
-if "$cmux_bin" --id-format uuids list-windows 2>/dev/null | grep -qi "$mirror_window"; then
-  osascript -e 'tell application "System Events" to tell process "cmux" to set value of attribute "AXMinimized" of (first window whose name is "~") to true' >/dev/null 2>&1 || true
-  echo "mirror-window $mirror_window $minimized (husk remains, minimized)"
+# Close the vacated mirror window ONLY when it is provably disposable: this
+# call created it AND nothing lives in it anymore. A pre-existing window is
+# never minimized or closed (it hosts unrelated sessions — possibly the
+# caller's own); a new-but-nonempty window still holds other sessions'
+# mirrors, and the bidirectional mapping means closing those kills the
+# REMOTE tmux sessions behind them.
+if [[ "$window_is_new" != true ]]; then
+  echo "mirror-window $mirror_window pre-existing (left untouched)"
 else
-  echo "mirror-window $mirror_window closed"
+  remaining=$("$cmux_bin" --id-format uuids list-workspaces --window "$mirror_window" 2>/dev/null | grep -oiE "$UUID_RE" | head -1 || true)
+  if [[ -n "$remaining" ]]; then
+    echo "mirror-window $mirror_window $minimized (still hosts workspaces; left open)"
+  else
+    "$cmux_bin" close-window --window "$mirror_window" >/dev/null 2>&1 || true
+    sleep 1
+    if "$cmux_bin" --id-format uuids list-windows 2>/dev/null | grep -qi "$mirror_window"; then
+      osascript -e 'tell application "System Events" to tell process "cmux" to set value of attribute "AXMinimized" of (first window whose name is "~") to true' >/dev/null 2>&1 || true
+      echo "mirror-window $mirror_window $minimized (husk remains, minimized)"
+    else
+      echo "mirror-window $mirror_window closed"
+    fi
+  fi
+fi
+
+# Invariant check: every window that existed before the mutation must still
+# exist. If one vanished, layout actions must stop and the user must know.
+post_windows=$("$cmux_bin" --id-format uuids list-windows 2>/dev/null | grep -oiE "$UUID_RE" || true)
+missing=""
+while read -r w; do
+  [[ -n "$w" ]] || continue
+  grep -qiF "$w" <<<"$post_windows" || missing="$missing$w "
+done <<<"$pre_windows"
+if [[ -n "$missing" ]]; then
+  echo "ERROR: pre-existing window(s) disappeared during mirror placement: $missing" >&2
+  echo "Restore via cmux's closed-item history / reopen; report this to the user." >&2
+  exit 1
 fi
 echo "mode ssh-tmux (window created)"
