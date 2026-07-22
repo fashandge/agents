@@ -20,9 +20,15 @@ additionally removes the cleaned runs' registry records (like ``runs forget``);
 (guarded: only a directory that still contains ``status.json``). No token or
 credential material is read, printed, or accepted.
 
+Scope: by default every remote run in the registry is considered. Narrow it with
+``--host NAME``, and/or restrict to the workers a single orchestrator session
+spawned with ``--orchestrator <id>`` (or ``--orchestrator-state <watcher.json>``
+to derive that id from this session's watcher state).
+
 Usage:
     python -m agents.orchestration.handoff_remote_gc \
-        [--host NAME] [--yes] [--forget] [--delete-run-dir]
+        [--host NAME] [--orchestrator ID | --orchestrator-state PATH] \
+        [--yes] [--forget] [--delete-run-dir]
 
 Output: one JSON object on stdout describing what was (or would be) done.
 """
@@ -98,12 +104,27 @@ print(json.dumps(out))
 """
 
 
-def _remote_runs(host_filter: str | None) -> list[dict[str, Any]]:
-    """Registry records for remote runs, optionally limited to one host."""
+def _orchestrator_id_from_state(state_path: str) -> str:
+    """Read the orchestrator_id from a watcher state file (handoffctl state)."""
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    orchestrator_id = state.get("orchestrator_id")
+    if not orchestrator_id:
+        raise ValueError(f"no orchestrator_id in {state_path}")
+    return orchestrator_id
+
+
+def _remote_runs(
+    host_filter: str | None, orchestrator_filter: str | None,
+) -> list[dict[str, Any]]:
+    """Registry records for remote runs, optionally limited to one host and/or
+    to the workers a single orchestrator session spawned."""
     records = handoff_registry.list_records(private=True)
     remote = [r for r in records if r.get("host")]
     if host_filter is not None:
         remote = [r for r in remote if r["host"] == host_filter]
+    if orchestrator_filter is not None:
+        remote = [r for r in remote if r.get("orchestrator_id") == orchestrator_filter]
     return remote
 
 
@@ -142,6 +163,8 @@ def _probe_host(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Garbage-collect stale remote handoff worker sessions")
     parser.add_argument("--host", help="limit to one owning host")
+    parser.add_argument("--orchestrator", help="limit to runs spawned by this orchestrator id")
+    parser.add_argument("--orchestrator-state", help="derive --orchestrator from a watcher state file")
     parser.add_argument("--yes", action="store_true", help="perform kills (default: dry-run)")
     parser.add_argument("--forget", action="store_true", help="also remove cleaned runs' registry records")
     parser.add_argument("--delete-run-dir", action="store_true", help="with --forget, also delete each cleaned run's directory")
@@ -152,7 +175,17 @@ def main(argv: list[str] | None = None) -> int:
     if (args.forget or args.delete_run_dir) and not args.yes:
         parser.error("--forget/--delete-run-dir require --yes (they mutate state)")
 
-    remote = _remote_runs(args.host)
+    orchestrator_filter = args.orchestrator
+    if args.orchestrator_state is not None:
+        try:
+            resolved = _orchestrator_id_from_state(args.orchestrator_state)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            parser.error(f"--orchestrator-state: {exc}")
+        if orchestrator_filter is not None and orchestrator_filter != resolved:
+            parser.error("--orchestrator and --orchestrator-state disagree")
+        orchestrator_filter = resolved
+
+    remote = _remote_runs(args.host, orchestrator_filter)
     mode = "kill" if args.yes else "probe"
     groups = _group_by_host(remote)
 
@@ -188,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = {
         "dry_run": not args.yes,
+        "scope": {"host": args.host, "orchestrator": orchestrator_filter},
         "remote_runs_examined": len(rows),
         "stale_sessions": [
             {"run_id": r["run_id"], "handle": r["handle"], "host": r["host"], "state": r.get("state")}

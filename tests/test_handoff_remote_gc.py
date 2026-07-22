@@ -8,10 +8,11 @@ from agents.orchestration import handoff_remote_gc as gc
 from agents.orchestration import handoff_launcher
 
 
-def _rec(run_id, host, handle, *, python="/py"):
+def _rec(run_id, host, handle, *, python="/py", orchestrator_id=None):
     return {
         "run_id": run_id, "host": host, "handle": handle,
         "run_dir": f"/remote/state/{run_id}", "remote_python": python,
+        "orchestrator_id": orchestrator_id,
     }
 
 
@@ -29,11 +30,47 @@ def test_group_by_host_partitions_by_host_and_python():
 def test_remote_runs_filters_local_and_by_host(monkeypatch):
     monkeypatch.setattr(gc.handoff_registry, "list_records", lambda private: [
         _rec("remote1", "oci-box", "h1"),
-        {"run_id": "local1", "host": None, "handle": "x", "run_dir": "/l", "remote_python": None},
+        {"run_id": "local1", "host": None, "handle": "x", "run_dir": "/l",
+         "remote_python": None, "orchestrator_id": None},
         _rec("remote2", "box2", "h2"),
     ])
-    assert {r["run_id"] for r in gc._remote_runs(None)} == {"remote1", "remote2"}
-    assert {r["run_id"] for r in gc._remote_runs("oci-box")} == {"remote1"}
+    assert {r["run_id"] for r in gc._remote_runs(None, None)} == {"remote1", "remote2"}
+    assert {r["run_id"] for r in gc._remote_runs("oci-box", None)} == {"remote1"}
+
+
+def test_remote_runs_filters_by_orchestrator(monkeypatch):
+    monkeypatch.setattr(gc.handoff_registry, "list_records", lambda private: [
+        _rec("mine", "oci-box", "h1", orchestrator_id="orch-A"),
+        _rec("theirs", "oci-box", "h2", orchestrator_id="orch-B"),
+        _rec("orphan", "oci-box", "h3", orchestrator_id=None),
+    ])
+    assert {r["run_id"] for r in gc._remote_runs(None, "orch-A")} == {"mine"}
+    assert {r["run_id"] for r in gc._remote_runs(None, None)} == {"mine", "theirs", "orphan"}
+
+
+def test_orchestrator_state_scopes_to_session(monkeypatch, tmp_path, capsys):
+    state = tmp_path / "watcher.json"
+    state.write_text(json.dumps({"orchestrator_id": "orch-A"}))
+    monkeypatch.setattr(gc.handoff_registry, "list_records", lambda private: [
+        _rec("mine", "oci-box", "mine-h", orchestrator_id="orch-A"),
+        _rec("theirs", "oci-box", "theirs-h", orchestrator_id="orch-B"),
+    ])
+    seen = {}
+    def fake(host, argv, *, stdin, timeout):
+        # argv = [python, "-c", PROG, mode, base64(payload)]
+        payload = json.loads(base64.b64decode(argv[4]))
+        seen["run_ids"] = [r["run_id"] for r in payload]
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps([
+            {"run_id": r["run_id"], "handle": r["handle"], "run_dir": "/r",
+             "state": "working", "desired_state": "run", "session_alive": False, "terminal": False}
+            for r in payload
+        ]), stderr="")
+    monkeypatch.setattr(handoff_launcher, "_run_ssh", fake)
+    rc = gc.main(["--orchestrator-state", str(state)])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["scope"] == {"host": None, "orchestrator": "orch-A"}
+    assert seen["run_ids"] == ["mine"]  # theirs was filtered out before the probe
 
 
 def _fake_ssh_returning(rows):
