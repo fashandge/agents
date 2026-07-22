@@ -1580,6 +1580,72 @@ def test_concluded_run_stays_quiet_across_final_checkpoints(tmp_path, monkeypatc
     assert [entry["run"]["run_id"] for entry in quiet["quiet"]] == [run_id]
 
 
+def test_paused_run_stays_quiet_and_rerings_on_a_new_result(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
+    )
+    run_dir = Path(run["run_dir"])
+    result = awaiting_review(run)
+    handoff.control_consume(run_dir, run["orchestrator"], through=1)
+    handoff.send(
+        run_dir, run["orchestrator"], type="review",
+        data={"disposition": "accepted"},
+        reply_to=result["message"]["message_id"],
+    )
+    handoff.control_integrate(run_dir, run["orchestrator"], commit="deadbeef")
+    handoff.send(
+        run_dir, run["orchestrator"], type="pause",
+        data={"reason": "Result accepted and integrated; pausing worker (resumable)"},
+    )
+    worker_checkpoint(run, "worker paused", state="paused", inbox_cursor=3)
+    run_id = run["run"]["run_id"]
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    def poll_at(seconds):
+        handoff_watcher.poll(
+            state_path,
+            registry_path=registry,
+            notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
+            now=now + datetime.timedelta(seconds=seconds),
+        )
+
+    for seconds in (0, 31, 62):
+        poll_at(seconds)
+
+    # A paused run is NOT concluded: nothing is auto-dismissed, and "paused"
+    # is not a ringing state, so the idle run simply stays quiet.
+    assert calls == []
+    notification = handoff_watcher.read(state_path)["runs"][run_id]
+    assert notification["observed_through"] == 2
+    assert notification["dismissed_through"] == 0
+
+    # Resume: a steer and a fresh result re-ring the run naturally.
+    handoff.send(run_dir, run["orchestrator"], type="steer", body="fresh work")
+    worker_checkpoint(run, "resumed", state="working", inbox_cursor=4)
+    handoff.emit(
+        run_dir,
+        run["worker"],
+        type="result",
+        body="fresh result",
+        data={
+            "head": None,
+            "dirty": False,
+            "stage": "implementation",
+            "inbox_cursor": 4,
+            "verification": [],
+            "commitments": [],
+        },
+    )
+    poll_at(93)
+
+    assert calls == [({run_id: 4}, "active")]
+    notification = handoff_watcher.read(state_path)["runs"][run_id]
+    assert notification["dismissed_through"] == 0
+
+
 def test_concluded_run_with_fatal_tail_keeps_ringing(tmp_path):
     registry = tmp_path / "registry.json"
     state_path, owner = orchestrator_state(tmp_path)

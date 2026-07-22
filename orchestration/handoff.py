@@ -43,13 +43,13 @@ MAX_ATTACHMENT = 32 * 1024 * 1024
 
 INBOX_TYPES = {
     "steer", "supersede", "answer", "review", "input-changed", "base-changed",
-    "integration", "orchestrator-takeover", "worker-relaunched", "stop",
+    "integration", "orchestrator-takeover", "worker-relaunched", "stop", "pause",
 }
 SYSTEM_INBOX_TYPES = {"integration", "orchestrator-takeover", "worker-relaunched"}
 OUTBOX_TYPES = {"checkpoint", "question", "result", "error"}
 WORKER_STATES = {
     "starting", "working", "blocked", "awaiting_review", "succeeded",
-    "failed", "stopped",
+    "failed", "stopped", "paused",
 }
 UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -416,7 +416,7 @@ def _validate_control(value: Any, *, path: Path | None = None) -> None:
         if not isinstance(value[field], str) or not HEX_RE.fullmatch(value[field]):
             _fail(f"invalid {field}")
     _parse_time(value["orchestrator_lease_expires_at"])
-    if value["desired_state"] not in {"run", "stop"}:
+    if value["desired_state"] not in {"run", "stop", "pause"}:
         _fail("invalid desired_state")
     if value["review_state"] not in {"pending", "changes_requested", "superseded", "accepted"}:
         _fail("invalid review_state")
@@ -469,7 +469,7 @@ def _validate_attachment(value: Any) -> None:
 VERIFICATION_ITEM_SCHEMA = '{"command": str, "exit_code": int|null, "summary": str}'
 
 EMIT_DATA_SCHEMAS = f"""Data schemas for `emit --type <kind> --data-file data.json` (fields are exact — missing or unknown fields are rejected; cursors are non-negative integers):
-- checkpoint: {{"state": "working"|"succeeded"|"stopped", "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
+- checkpoint: {{"state": "working"|"succeeded"|"stopped"|"paused", "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
 - question: {{"blocking": bool, "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
 - result: {{"head": str|null, "dirty": bool, "stage": str, "inbox_cursor": int, "verification": [{VERIFICATION_ITEM_SCHEMA}], "commitments": [str]}}
 - error: {{"fatal": bool, "category": str, "stage": str, "inbox_cursor": int, "commitments": [str]}} (non-empty body required)
@@ -548,10 +548,13 @@ def _validate_type_data(direction: str, kind: str, body: str, reply_to: Any, dat
         elif kind == "stop":
             _fields(data, {"reason"}, "data")
             _string(data["reason"], "reason", nonempty=True)
+        elif kind == "pause":
+            _fields(data, {"reason"}, "data")
+            _string(data["reason"], "reason", nonempty=True)
     else:
         if kind == "checkpoint":
             _fields(data, {"state", "stage", "current_activity", "inbox_cursor", "commitments"}, "data")
-            if data["state"] not in {"working", "succeeded", "stopped"}:
+            if data["state"] not in {"working", "succeeded", "stopped", "paused"}:
                 _fail("invalid checkpoint state")
             _string(data["stage"], "stage", max_bytes=256)
             _string(data["current_activity"], "current_activity", max_bytes=2048)
@@ -713,6 +716,7 @@ def _standing_instructions() -> str:
 {EMIT_DATA_SCHEMAS}
 - Assume the orchestrator knows the kickoff but not your live progress. Every blocking question must be self-contained: state the current stage and completed work, concrete evidence, the exact conflict, the decision or authority needed, your recommended resolution, the consequences of the available options, and actions intentionally deferred. Do not rely on earlier checkpoints to supply this context.
 - End the turn after a blocking question. On completion publish an exact result and await review; report `succeeded` only after consuming an accepted review. After a successful result publication, `handoffctl` attempts a best-effort cmux notification for cmux-launched workers; the durable result remains authoritative if notification delivery fails.
+- After consuming an accepted review, follow the lifecycle message that accompanies it. A `stop` means emit `succeeded` then `stopped` checkpoints and exit. A `pause` means emit a `paused` checkpoint (directly, even if you already reported `succeeded`) and idle awaiting further instructions — a doorbell will arrive with the next one. Resume from paused only after consuming a `steer`, `answer`, or `supersede` newer than the `pause`: checkpoint back to `working` and continue. A `stop` consumed while paused means emit `stopped` directly, without `succeeded` first.
 - A dirty Git workspace does not block work or result publication. Preserve unrelated pre-existing changes and report the current `HEAD` and dirty state truthfully in every result.
 - Put cross-stage commitments in checkpoint data so they survive context compaction.
 
@@ -981,6 +985,8 @@ def _apply_inbox(control: dict[str, Any], message: dict[str, Any]) -> None:
         control["review_result_id"] = message["reply_to"]
     elif kind == "stop":
         control["desired_state"] = "stop"
+    elif kind == "pause":
+        control["desired_state"] = "pause"
     elif kind == "integration":
         control["integration"] = dict(message["data"])
     elif kind == "orchestrator-takeover":
@@ -1008,7 +1014,11 @@ def send(
         _authorize(control, token, "orchestrator", lease=True)
         inbox = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
         outbox = _journal(run_dir, "outbox")
-        if control["integration"]["state"] != "pending" and type != "stop":
+        if (
+            control["integration"]["state"] != "pending"
+            and type not in {"stop", "pause"}
+            and control["desired_state"] != "pause"
+        ):
             _fail("integration decision is terminal", 4)
         if type == "answer" and _resolve_reply(outbox, reply_to, "question") is None:
             _fail("answer reply_to must name an outbox question", 4)
@@ -1026,6 +1036,11 @@ def send(
                 _fail("changes requested after worker success require worker rotation or a new run", 4)
         if type == "stop" and control["desired_state"] == "stop":
             _fail("stop was already requested", 4)
+        if type == "pause":
+            if control["desired_state"] == "pause":
+                _fail("pause was already requested", 4)
+            if control["desired_state"] == "stop":
+                _fail("cannot pause after stop was requested", 4)
         existing = _resolve_reply(inbox, message_id)
         declarations = [_relative_path(item) for item in (attachments or [])]
         if existing:
@@ -1110,8 +1125,10 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
     blocked_on = list(status_value["blocked_on"])
     if old_state in {"failed", "stopped"}:
         _fail("worker epoch is terminal", 4)
-    if old_state == "succeeded" and not (kind == "checkpoint" and data["state"] in {"succeeded", "stopped"}):
-        _fail("succeeded worker can only remain succeeded or stop", 4)
+    if old_state == "succeeded" and not (kind == "checkpoint" and data["state"] in {"succeeded", "stopped", "paused"}):
+        _fail("succeeded worker can only remain succeeded, pause, or stop", 4)
+    if old_state == "paused" and not (kind == "checkpoint" and data["state"] in {"working", "stopped"}):
+        _fail("paused worker can only resume working or stop", 4)
     if kind == "checkpoint":
         target = data["state"]
         activity = data["current_activity"]
@@ -1130,6 +1147,18 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
                 if not changed and not superseded:
                     _fail("awaiting_review can resume only after matching changes_requested or supersede", 4)
                 new_state = "working"
+            elif old_state == "paused":
+                pause_seq = max(
+                    (item["seq"] for item in prefix if item["type"] == "pause"),
+                    default=None,
+                )
+                resumed = pause_seq is not None and any(
+                    item["type"] in {"steer", "answer", "supersede"} and item["seq"] > pause_seq
+                    for item in prefix
+                )
+                if not resumed:
+                    _fail("paused can resume only after a newer steer, answer, or supersede", 4)
+                new_state = "working"
             else:
                 _fail(f"invalid checkpoint transition {old_state} -> working", 4)
         elif target == "succeeded":
@@ -1143,6 +1172,15 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
             if control["desired_state"] != "stop" or not any(item["type"] == "stop" for item in prefix):
                 _fail("stopped requires a consumed orchestrator stop", 4)
             new_state = "stopped"; blocked_on = []
+        elif target == "paused":
+            if old_state not in {"awaiting_review", "succeeded"}:
+                _fail("paused requires awaiting_review or succeeded", 4)
+            result = _last_result(outbox_before, status_value["worker_epoch"])
+            if result is None or not _matching_review(prefix, result["message_id"], "accepted"):
+                _fail("paused requires a consumed matching accepted review", 4)
+            if not any(item["type"] == "pause" for item in prefix):
+                _fail("paused requires a consumed orchestrator pause", 4)
+            new_state = "paused"; blocked_on = []
     elif kind == "question":
         activity = data["current_activity"]
         if data["blocking"]:
@@ -1499,7 +1537,7 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
         if control["outbox_cursor"] > len(outbox): issues.append(_issue("cursor", run_dir / "control.json", "outbox_cursor exceeds outbox tail"))
         if control["last_command_seq"] < len(inbox): issues.append(_issue("projection-lag", run_dir / "control.json", "control projection trails inbox"))
         if control["last_command_seq"] == len(inbox):
-            expected_desired = "stop" if any(message["type"] == "stop" for message in inbox) else "run"
+            expected_desired = "run"
             expected_orchestrator_epoch = 1
             expected_worker_epoch = 1
             expected_integration = {"state": "pending", "commit": None, "reason": None}
@@ -1507,6 +1545,8 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
                 if message["type"] == "orchestrator-takeover": expected_orchestrator_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "worker-relaunched": expected_worker_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "integration": expected_integration = dict(message["data"])
+                elif message["type"] == "stop": expected_desired = "stop"
+                elif message["type"] == "pause": expected_desired = "pause"
             consumed_results = [message for message in outbox[:control["outbox_cursor"]] if message["type"] == "result"]
             expected_result = consumed_results[-1]["message_id"] if consumed_results else None
             expected_review = "pending"

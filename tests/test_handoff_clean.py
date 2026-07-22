@@ -92,6 +92,34 @@ def stop_run(run):
     assert handoff.control_show(run["run_dir"])["desired_state"] == "stop"
 
 
+def pause_run(run):
+    orchestrator = (run["private"] / "orchestrator.token").read_bytes()
+    worker = (run["private"] / "worker.token").read_bytes()
+    run_dir = Path(run["run_dir"])
+    result = handoff.emit(
+        run_dir, worker, type="result", body="done",
+        data={
+            "head": None, "dirty": False, "stage": "complete", "inbox_cursor": 0,
+            "verification": [], "commitments": [],
+        },
+    )
+    handoff.control_consume(run_dir, orchestrator, through=result["message"]["seq"])
+    review = handoff.send(
+        run_dir, orchestrator, type="review",
+        reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
+    )
+    handoff.send(run_dir, orchestrator, type="pause", data={"reason": "idle"})
+    handoff.emit(
+        run_dir, worker, type="checkpoint", body="paused",
+        data={
+            "state": "paused", "stage": "complete", "current_activity": "paused",
+            "inbox_cursor": review["message"]["seq"] + 1, "commitments": [],
+        },
+    )
+    assert handoff.status(run_dir)["state"] == "paused"
+    assert handoff.control_show(run_dir)["desired_state"] == "pause"
+
+
 def corrupt_record(registry, key="run-broken", **extra):
     value = json.loads(registry.read_text())
     value["runs"][key] = {"run_id": key, "name": "broken", **extra}
@@ -233,6 +261,29 @@ def test_clean_desired_state_stop_counts_as_terminal(tmp_path, monkeypatch):
     entry = result["cleaned"][0]
     assert entry["run_id"] == "run-one"
     assert "desired_state" in entry["note"]
+    assert handoff_registry.list_records(path=registry) == []
+
+
+def test_clean_skips_a_paused_run_until_forced(tmp_path, monkeypatch):
+    """A paused worker idles resumably; desired_state pause is not terminal, so
+    cleanup must leave the run (and its resident session) alone unless forced."""
+    registry = tmp_path / "registry.json"
+    run = live_run(tmp_path, registry)
+    pause_run(run)
+    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux())
+
+    result = handoff_clean.clean(path=registry)
+
+    assert result["cleaned"] == []
+    assert [skip["run_id"] for skip in result["skipped"]] == ["run-one"]
+    assert "paused" in result["skipped"][0]["reason"]
+    assert len(handoff_registry.list_records(path=registry)) == 1
+    assert handoff.status(run["run_dir"])["state"] == "paused"
+
+    forced = handoff_clean.clean(path=registry, force=True)
+
+    assert [entry["run_id"] for entry in forced["cleaned"]] == ["run-one"]
+    assert "not known to be terminal" in forced["cleaned"][0]["note"]
     assert handoff_registry.list_records(path=registry) == []
 
 

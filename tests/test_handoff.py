@@ -264,6 +264,110 @@ def test_result_acceptance_success_and_integration_are_distinct(run):
     assert integrated["control"]["integration"]["state"] == "integrated"
 
 
+def _publish_accepted_result(run):
+    run_dir = Path(run["run_dir"])
+    result = handoff.emit(
+        run_dir, run["worker"], type="result", body="done",
+        data={"head": None, "dirty": True, "stage": "done", "inbox_cursor": 0, "verification": [], "commitments": []},
+    )
+    handoff.control_consume(run_dir, run["orchestrator"], through=result["message"]["seq"])
+    review = handoff.send(
+        run_dir, run["orchestrator"], type="review",
+        reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
+    )
+    return result, review
+
+
+def test_pause_checkpoints_pause_and_resume_through_working(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    _, review = _publish_accepted_result(run)
+    handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
+    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
+    assert pause["control"]["desired_state"] == "pause"
+
+    paused = checkpoint(run, pause["message"]["seq"], state="paused")
+    assert paused["status"]["state"] == "paused"
+
+    # A paused worker cannot publish a result without resuming first.
+    with pytest.raises(handoff.HandoffError, match="resume working or stop") as caught:
+        handoff.emit(
+            run_dir, run["worker"], type="result", body="early",
+            data={
+                "head": None, "dirty": True, "stage": "done",
+                "inbox_cursor": pause["message"]["seq"], "verification": [], "commitments": [],
+            },
+        )
+    assert caught.value.exit_code == 4
+
+    # A paused run accepts a new instruction despite the recorded integration.
+    steer = handoff.send(run_dir, run["orchestrator"], type="steer", body="fresh work")
+    resumed = checkpoint(run, steer["message"]["seq"])
+    assert resumed["status"]["state"] == "working"
+    assert handoff.doctor(run_dir)["ok"]
+
+
+def test_paused_resume_requires_an_instruction_newer_than_the_pause(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    _, review = _publish_accepted_result(run)
+    handoff.send(run_dir, run["orchestrator"], type="steer", body="pre-pause steer")
+    handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
+    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
+    paused = checkpoint(run, pause["message"]["seq"], state="paused")
+    assert paused["status"]["state"] == "paused"
+
+    # The steer predates the pause, so it cannot authorize a resume.
+    with pytest.raises(handoff.HandoffError, match="newer steer, answer, or supersede") as caught:
+        checkpoint(run, pause["message"]["seq"])
+    assert caught.value.exit_code == 4
+
+    steer = handoff.send(run_dir, run["orchestrator"], type="steer", body="fresh work")
+    assert checkpoint(run, steer["message"]["seq"])["status"]["state"] == "working"
+
+
+def test_pause_lifecycle_rules_second_pause_pause_after_stop_and_stop_after_pause(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    _, review = _publish_accepted_result(run)
+    handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
+    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
+    paused = checkpoint(run, pause["message"]["seq"], state="paused")
+    assert paused["status"]["state"] == "paused"
+
+    with pytest.raises(handoff.HandoffError, match="pause was already requested") as caught:
+        handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "again"})
+    assert caught.value.exit_code == 4
+
+    # Stop after pause is allowed, and the paused worker stops directly.
+    stop = handoff.send(run_dir, run["orchestrator"], type="stop", data={"reason": "wrap up"})
+    assert stop["control"]["desired_state"] == "stop"
+    stopped = checkpoint(run, stop["message"]["seq"], state="stopped")
+    assert stopped["status"]["state"] == "stopped"
+
+    with pytest.raises(handoff.HandoffError, match="cannot pause after stop") as caught:
+        handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "too late"})
+    assert caught.value.exit_code == 4
+    assert handoff.doctor(run_dir)["ok"]
+
+
+def test_succeeded_worker_can_pause_instead_of_stopping(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    _, review = _publish_accepted_result(run)
+    succeeded = checkpoint(run, review["message"]["seq"], state="succeeded")
+    assert succeeded["status"]["state"] == "succeeded"
+    handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
+    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
+
+    # The lifecycle message arrived after the succeeded checkpoint; the worker
+    # still reaches the resumable paused state.
+    paused = checkpoint(run, pause["message"]["seq"], state="paused")
+    assert paused["status"]["state"] == "paused"
+    steer = handoff.send(run_dir, run["orchestrator"], type="steer", body="fresh work")
+    assert checkpoint(run, steer["message"]["seq"])["status"]["state"] == "working"
+
+
 def test_supersede_resumes_awaiting_review_and_binds_fresh_result(run):
     run_dir = Path(run["run_dir"])
     checkpoint(run, 0)

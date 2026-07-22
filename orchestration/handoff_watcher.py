@@ -558,7 +558,10 @@ def poll(
                 # A new event-cycle restarts the backoff schedule.
                 run_state["doorbell_attempts"] = 0
             concluded = (
-                control["integration"]["state"] != "pending"
+                (
+                    control["integration"]["state"] != "pending"
+                    and control["desired_state"] != "pause"
+                )
                 or control["desired_state"] == "stop"
             )
             fatal_tail = status["state"] == "failed" or any(
@@ -570,7 +573,10 @@ def poll(
                 # once a run is concluded its remaining tail — including the
                 # final "stopped" checkpoint, which arrives after the worker
                 # exits and can never be consumed — goes durably quiet.  A
-                # badly-dying run is exempt and keeps ringing.
+                # badly-dying run is exempt and keeps ringing.  A paused run
+                # (desired_state "pause") is NOT concluded: it stays quiet on
+                # its own because "paused" is not a ringing state, and it must
+                # re-ring when the worker resumes and emits a new result.
                 run_state["dismissed_through"] = max(
                     run_state.get("dismissed_through", 0), tail,
                 )
