@@ -74,27 +74,49 @@ place() {
 }
 
 # --- Path A: connection already up -> silent per-session RPC attach ---------
+# Per-session attach is the ONLY way to mirror just this run's workers: cmux
+# ssh-tmux (Path B) has no session filter and mirrors the WHOLE host, so every
+# stale session on the box becomes a stray workspace. A warm-connection attach
+# can ack before its workspace materializes; a single quick check then wrongly
+# falls back to the whole-host path (observed 2026-07-21, leaving strays). So
+# poll for each wanted view, re-issuing attach for the still-missing ones, and
+# fall back only after the full window genuinely fails to produce a view.
 if sessions_json=$("$cmux_bin" rpc remote.tmux.sessions "{\"host\":\"$host\"}" 2>/dev/null); then
-  typeset -a remote_sessions
+  typeset -a remote_sessions want
   remote_sessions=("${(@f)$(print -r -- "$sessions_json" | grep -oE '"name" *: *"[^"]+"' | sed -E 's/.*: *"([^"]+)"/\1/')}")
-
+  want=()
   for session in "${remote_sessions[@]}"; do
-    wanted "$session" || continue
-    "$cmux_bin" rpc remote.tmux.attach "{\"host\":\"$host\",\"session\":\"$session\"}" >/dev/null 2>&1 || true
+    wanted "$session" && want+=("$session")
   done
-  sleep 2
 
-  # Recent cmux versions can acknowledge an RPC attach without creating a
-  # visible local workspace. Only use the no-window path when every requested
-  # mirror actually materialized; otherwise use ssh-tmux below.
+  typeset -A placed_uuid
+  attach_deadline=$((SECONDS + 15))
+  while true; do
+    for session in "${want[@]}"; do
+      [[ -n "${placed_uuid[$session]:-}" ]] && continue
+      "$cmux_bin" rpc remote.tmux.attach "{\"host\":\"$host\",\"session\":\"$session\"}" >/dev/null 2>&1 || true
+    done
+    sleep 1
+    all_present=true
+    for session in "${want[@]}"; do
+      [[ -n "${placed_uuid[$session]:-}" ]] && continue
+      line=$("$cmux_bin" --id-format uuids list-workspaces 2>/dev/null \
+        | grep -iE " $session( +\[selected\])?\$" | head -1 || true)
+      ws_uuid=$(uuid_of "${line:-}" || true)
+      if [[ -n "$ws_uuid" ]]; then
+        placed_uuid[$session]=$ws_uuid
+      else
+        all_present=false
+      fi
+    done
+    [[ "$all_present" == true ]] && break
+    (( SECONDS >= attach_deadline )) && break
+  done
+
   rpc_views_complete=true
-  for session in "${remote_sessions[@]}"; do
-    wanted "$session" || continue
-    line=$("$cmux_bin" --id-format uuids list-workspaces 2>/dev/null \
-      | grep -iE " $session( +\[selected\])?\$" | head -1 || true)
-    ws_uuid=$(uuid_of "${line:-}" || true)
-    if [[ -n "$ws_uuid" ]]; then
-      place "$session" "$ws_uuid"
+  for session in "${want[@]}"; do
+    if [[ -n "${placed_uuid[$session]:-}" ]]; then
+      place "$session" "${placed_uuid[$session]}"
     else
       rpc_views_complete=false
       echo "workspace ? $session (RPC attach returned without a view)"

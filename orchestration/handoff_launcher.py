@@ -50,6 +50,11 @@ REMOTE_FOLDER_TRUST_SCROLLBACK_LINES = 120
 # surface itself; the launcher clears it before releasing the orchestrator.
 LOCAL_CODEX_TRUST_TIMEOUT = 30.0
 CODEX_TRUST_RENDER_GRACE = 3.0
+# Claude Code shows an equivalent "trust the files in this folder?" dialog on
+# first launch into an untrusted directory. Like Codex it is cleared in the
+# launched surface (local and, via receive_remote_request, on the SSH host).
+LOCAL_CLAUDE_TRUST_TIMEOUT = 30.0
+CLAUDE_TRUST_RENDER_GRACE = 3.0
 REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
 AGENT_DEFAULTS = {
     "claude": ("opus", "high"),
@@ -820,13 +825,22 @@ def launch(
     goal_file = Path(str(kickoff) + ".goal")
     ready: bool | None = None
     rescue: str | None = None
-    codex_startup: dict[str, Any] = {}
+    startup_rescue: dict[str, Any] = {}
     if agent == "codex":
         # Local Codex renders its folder-trust dialog in this surface and will
         # never reach the agent loop until it is cleared, so clear it here the
         # way remote launches already do — before readiness or goal delivery.
         _rescue_local_codex_folder_trust(
-            codex_startup, adapter=adapter, handle=handle, cwd=cwd,
+            startup_rescue, adapter=adapter, handle=handle, cwd=cwd,
+        )
+    elif agent == "claude":
+        # Claude Code shows its own "trust the files in this folder?" dialog on
+        # first launch into an untrusted directory and blocks below the agent
+        # loop until it is cleared — the same failure mode Codex has, so clear
+        # it the same way. This launch() runs both locally and, via
+        # receive_remote_request, on the SSH host, so one call covers both.
+        _rescue_local_claude_folder_trust(
+            startup_rescue, adapter=adapter, handle=handle, cwd=cwd,
         )
     if agent == "kimi":
         kickoff_sent = bootstrap_kimi(
@@ -856,7 +870,7 @@ def launch(
         ready = wait_ready(adapter, handle, agent, actual_run_dir, timeout=readiness_timeout)
         if not ready:
             rescue = adapter.rescue_command(handle)
-    if codex_startup.get("startup_unconfirmed") and rescue is None:
+    if startup_rescue.get("startup_unconfirmed") and rescue is None:
         rescue = adapter.rescue_command(handle)
     orchestrator_released = False
     if not retain_orchestrator:
@@ -874,9 +888,9 @@ def launch(
         "orchestrator_released": orchestrator_released,
         "rescue_command": rescue,
     }
-    if agent == "codex":
-        result["folder_trust_rescued"] = bool(codex_startup.get("folder_trust_rescued"))
-        if codex_startup.get("startup_unconfirmed"):
+    if agent in ("codex", "claude"):
+        result["folder_trust_rescued"] = bool(startup_rescue.get("folder_trust_rescued"))
+        if startup_rescue.get("startup_unconfirmed"):
             result["startup_unconfirmed"] = True
     try:
         handoff_registry.register(
@@ -1082,6 +1096,70 @@ def _rescue_remote_codex_folder_trust(
     result.pop("rescue_command", None)
 
 
+def _is_remote_claude_folder_trust_prompt(
+    pane_command: str,
+    screen: str,
+    remote_cwd: Path,
+) -> bool:
+    """Recognize only Claude's exact trust dialog for the authorized checkout."""
+    return (
+        "claude" in pane_command.casefold()
+        and _claude_folder_trust_dialog_present(screen)
+        and _claude_trust_cwd_matches(screen, remote_cwd)
+    )
+
+
+def _rescue_remote_claude_folder_trust(
+    result: dict[str, Any],
+    *,
+    host: str,
+    handle: str,
+    remote_cwd: Path,
+) -> None:
+    """Advance one verified, pre-agent Claude folder-trust dialog at most once.
+
+    The on-host ``launch()`` already clears this dialog when the SSH host runs
+    an up-to-date package; this orchestrator-side pass is the belt-and-suspenders
+    that still works when the host's package predates the Claude rescue.
+    """
+    result["folder_trust_rescued"] = False
+    if result.get("worker_ready") is not False:
+        return
+    try:
+        pane_command = _remote_tmux_pane_command(host, handle)
+        screen = _remote_tmux_capture(
+            host, handle, scrollback_lines=REMOTE_FOLDER_TRUST_SCROLLBACK_LINES,
+        )
+    except AdapterError:
+        result["startup_unconfirmed"] = True
+        return
+    if not _is_remote_claude_folder_trust_prompt(pane_command, screen, remote_cwd):
+        result["startup_unconfirmed"] = True
+        return
+
+    try:
+        _run_ssh(
+            host,
+            ["tmux", "send-keys", "-t", handle, "C-m"],
+            stdin="",
+            timeout=15.0,
+        )
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        pane_command = _remote_tmux_pane_command(host, handle)
+        screen = _remote_tmux_capture(host, handle)
+    except AdapterError:
+        result["startup_unconfirmed"] = True
+        return
+    if "claude" not in pane_command.casefold() or _is_remote_claude_folder_trust_prompt(
+        pane_command, screen, remote_cwd,
+    ):
+        result["startup_unconfirmed"] = True
+        return
+
+    result["folder_trust_rescued"] = True
+    result.pop("rescue_command", None)
+
+
 def _codex_folder_trust_dialog_present(screen: str) -> bool:
     """True when Codex's exact folder-trust dialog is on screen.
 
@@ -1114,6 +1192,106 @@ def _codex_trust_cwd_matches(screen: str, cwd: Path) -> bool:
     return bool(shown) and target.startswith(shown) and len(shown) >= min(len(target), 12)
 
 
+def _claude_folder_trust_dialog_present(screen: str) -> bool:
+    """True when Claude Code's exact folder-trust dialog is on screen.
+
+    Matches the fixed menu literals only; the directory is verified separately
+    by :func:`_claude_trust_cwd_matches`, because the shown path can be wrapped
+    or symlink-canonicalized independently of the menu text.
+    """
+    return (
+        "1. Yes, I trust this folder" in screen
+        and "2. No, exit" in screen
+        and "Enter to confirm" in screen
+    )
+
+
+def _claude_trust_cwd_matches(screen: str, cwd: Path) -> bool:
+    """Confirm Claude's trust dialog names the exact directory we launched into.
+
+    Claude prints the workspace path on the line after ``Accessing workspace:``.
+    Two wrinkles the match must tolerate: macOS canonicalizes the path through
+    its symlinks (a ``/var/folders/...`` cwd is shown as ``/private/var/...``),
+    and a narrow surface truncates or wraps the path so the visible token is
+    only a *prefix* of the real path.  Requiring the shown token to be a
+    non-trivial prefix of either the raw or resolved cwd both tolerates those
+    and rejects a dialog for some other directory.
+    """
+    marker = "Accessing workspace:"
+    index = screen.find(marker)
+    if index < 0:
+        return False
+    shown = ""
+    for line in screen[index + len(marker):].splitlines():
+        stripped = line.strip()
+        if stripped:
+            shown = stripped
+            break
+    if not shown:
+        return False
+    candidates = {str(cwd)}
+    try:
+        candidates.add(str(cwd.resolve()))
+    except OSError:
+        pass
+    return any(
+        target.startswith(shown) and len(shown) >= min(len(target), 12)
+        for target in candidates
+    )
+
+
+def _rescue_local_folder_trust(
+    result: dict[str, Any],
+    *,
+    adapter: Any,
+    handle: str,
+    cwd: Path,
+    agent: str,
+    dialog_present: Callable[[str], bool],
+    cwd_matches: Callable[[str, Path], bool],
+    timeout: float,
+    render_grace: float,
+) -> None:
+    """Advance one verified local folder-trust dialog at most once.
+
+    The launcher started ``agent`` in this exact surface at ``cwd``, so a trust
+    dialog here for that directory is the authorized one.  A dialog naming any
+    other directory is left untouched and flagged for manual handling.  When the
+    agent reaches its input loop without ever showing a dialog the directory was
+    already trusted, so the rescue returns promptly after a short grace rather
+    than blocking for the whole timeout.  Shared by the Codex and Claude
+    wrappers below, which supply the agent-specific dialog/cwd matchers.
+    """
+    result["folder_trust_rescued"] = False
+    deadline = time.monotonic() + timeout
+    process_since: float | None = None
+    while time.monotonic() < deadline:
+        screen = adapter.capture(handle)
+        if dialog_present(screen):
+            if not cwd_matches(screen, cwd):
+                result["startup_unconfirmed"] = True
+                return
+            break
+        if adapter.probe(handle, agent):
+            now = time.monotonic()
+            process_since = process_since if process_since is not None else now
+            if now - process_since >= render_grace:
+                return  # Agent is up with no dialog: the directory was trusted.
+        time.sleep(0.25)
+    else:
+        # Never saw a dialog and the agent never came up within the window.
+        if not adapter.probe(handle, agent):
+            result["startup_unconfirmed"] = True
+        return
+
+    adapter.press_enter(handle)
+    time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+    if dialog_present(adapter.capture(handle)):
+        result["startup_unconfirmed"] = True
+        return
+    result["folder_trust_rescued"] = True
+
+
 def _rescue_local_codex_folder_trust(
     result: dict[str, Any],
     *,
@@ -1123,43 +1301,31 @@ def _rescue_local_codex_folder_trust(
     timeout: float = LOCAL_CODEX_TRUST_TIMEOUT,
     render_grace: float = CODEX_TRUST_RENDER_GRACE,
 ) -> None:
-    """Advance one verified local Codex folder-trust dialog at most once.
+    """Advance one verified local Codex folder-trust dialog at most once."""
+    _rescue_local_folder_trust(
+        result, adapter=adapter, handle=handle, cwd=cwd, agent="codex",
+        dialog_present=_codex_folder_trust_dialog_present,
+        cwd_matches=_codex_trust_cwd_matches,
+        timeout=timeout, render_grace=render_grace,
+    )
 
-    The launcher started Codex in this exact surface at ``cwd``, so a trust
-    dialog here for that directory is the authorized one.  A dialog naming any
-    other directory is left untouched and flagged for manual handling.  When
-    Codex reaches its input loop without ever showing a dialog the directory
-    was already trusted, so the rescue returns promptly after a short grace
-    rather than blocking for the whole timeout.
-    """
-    result["folder_trust_rescued"] = False
-    deadline = time.monotonic() + timeout
-    process_since: float | None = None
-    while time.monotonic() < deadline:
-        screen = adapter.capture(handle)
-        if _codex_folder_trust_dialog_present(screen):
-            if not _codex_trust_cwd_matches(screen, cwd):
-                result["startup_unconfirmed"] = True
-                return
-            break
-        if adapter.probe(handle, "codex"):
-            now = time.monotonic()
-            process_since = process_since if process_since is not None else now
-            if now - process_since >= render_grace:
-                return  # Codex is up with no dialog: the directory was trusted.
-        time.sleep(0.25)
-    else:
-        # Never saw a dialog and Codex never came up within the window.
-        if not adapter.probe(handle, "codex"):
-            result["startup_unconfirmed"] = True
-        return
 
-    adapter.press_enter(handle)
-    time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
-    if _codex_folder_trust_dialog_present(adapter.capture(handle)):
-        result["startup_unconfirmed"] = True
-        return
-    result["folder_trust_rescued"] = True
+def _rescue_local_claude_folder_trust(
+    result: dict[str, Any],
+    *,
+    adapter: Any,
+    handle: str,
+    cwd: Path,
+    timeout: float = LOCAL_CLAUDE_TRUST_TIMEOUT,
+    render_grace: float = CLAUDE_TRUST_RENDER_GRACE,
+) -> None:
+    """Advance one verified local Claude folder-trust dialog at most once."""
+    _rescue_local_folder_trust(
+        result, adapter=adapter, handle=handle, cwd=cwd, agent="claude",
+        dialog_present=_claude_folder_trust_dialog_present,
+        cwd_matches=_claude_trust_cwd_matches,
+        timeout=timeout, render_grace=render_grace,
+    )
 
 
 def launch_remote(
@@ -1183,13 +1349,16 @@ def launch_remote(
         )
     if readiness_timeout is not None:
         effective_readiness_timeout = readiness_timeout
-    elif agent == "codex":
+    elif agent in ("codex", "claude"):
+        # Both self-rescue their folder-trust dialog; a short readiness gate lets
+        # the launcher deterministically detect a blocked dialog (worker_ready
+        # False) and clear it, rather than blocking for the full default window.
         effective_readiness_timeout = REMOTE_CODEX_STARTUP_TIMEOUT
     else:
         effective_readiness_timeout = DEFAULT_READINESS_TIMEOUT
     if effective_readiness_timeout <= 0:
         raise handoff.HandoffError("readiness_timeout must be positive", 2)
-    confirm_ready = confirm_ready or agent == "codex"
+    confirm_ready = confirm_ready or agent in ("codex", "claude")
     goal_file = Path(str(kickoff) + ".goal")
     payload = {
         "name": name,
@@ -1245,6 +1414,10 @@ def launch_remote(
     })
     if agent == "codex":
         _rescue_remote_codex_folder_trust(
+            result, host=host, handle=remote_handle, remote_cwd=remote_cwd,
+        )
+    elif agent == "claude":
+        _rescue_remote_claude_folder_trust(
             result, host=host, handle=remote_handle, remote_cwd=remote_cwd,
         )
     try:

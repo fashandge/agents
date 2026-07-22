@@ -38,12 +38,16 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: handoff_orchestrator_ensure.sh --transport cmux|tmux --owner-pid <pid> [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
+Usage: handoff_orchestrator_ensure.sh --transport cmux|tmux [--owner-pid <pid>|auto] [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
 
 Idempotent handoff session-watcher bootstrap: registers the orchestrator
 target once (unless --state already exists), then starts or reuses the
 singleton watcher. Prints one JSON line:
   {"state": "<path>", "registered": true|false, "started": true|false}
+
+--owner-pid is optional: omit it (or pass "auto") to auto-detect the long-lived
+orchestrator agent PID by walking process ancestry (handoff_orchestrator_pid.sh).
+Pass an explicit numeric PID to override.
 EOF
 }
 
@@ -71,12 +75,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$transport" ]] || { usage >&2; die "--transport is required"; }
-[[ -n "$owner_pid" ]] || { usage >&2; die "--owner-pid is required"; }
 case "$transport" in
   cmux|tmux) ;;
   *) die "--transport must be cmux or tmux" ;;
 esac
-[[ "$owner_pid" =~ ^[0-9]+$ ]] || die "--owner-pid must be the numeric PID of the long-lived orchestrator process, never a transient tool shell's \$\$ or \$PPID"
+
+# Resolve the orchestrator PID automatically when omitted or set to "auto":
+# handoff_orchestrator_pid.sh walks this call's process ancestry to the nearest
+# long-lived agent (claude|codex|kimi). An explicit numeric PID always wins.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "$owner_pid" || "$owner_pid" == "auto" ]]; then
+  if ! owner_pid=$("$here/handoff_orchestrator_pid.sh" --pid-only 2>/dev/null); then
+    die "could not auto-detect the orchestrator PID; pass --owner-pid <pid> explicitly (see handoff_orchestrator_pid.sh)"
+  fi
+fi
+[[ "$owner_pid" =~ ^[0-9]+$ ]] || die "--owner-pid must be the numeric PID of the long-lived orchestrator process (or 'auto'), never a transient tool shell's \$\$ or \$PPID"
 if [[ "$transport" == tmux && -z "$target" ]]; then
   die "--target <exact-tmux-handle> is required for --transport tmux"
 fi

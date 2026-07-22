@@ -687,6 +687,10 @@ def test_managed_launch_uses_exact_private_directory_and_retains_lease(tmp_path,
     private = tmp_path / "private"
     monkeypatch.setenv("HANDOFF_CREDENTIAL_DIR", str(private))
     monkeypatch.setattr(handoff_launcher, "TmuxAdapter", Adapter)
+    # This test covers the credential directory and lease, not folder-trust; the
+    # claude rescue (exercised by its own tests) would otherwise poll a minimal
+    # Adapter lacking capture/probe. Stub it, as the codex wiring is here too.
+    monkeypatch.setattr(handoff_launcher, "_rescue_local_claude_folder_trust", lambda *a, **k: None)
 
     result = handoff_launcher.launch(
         name="managed", kickoff=kickoff, cwd=workspace, agent="claude", backend="tmux",
@@ -1156,10 +1160,11 @@ def test_forced_doorbell_separates_itself_from_the_draft_it_follows():
 class FakeTrustAdapter:
     """A local adapter whose screen/process evolve across capture() calls."""
 
-    def __init__(self, screens, *, codex_after=0):
+    def __init__(self, screens, *, agent="codex", ready_after=0):
         self._screens = list(screens)
         self._i = 0
-        self._codex_after = codex_after
+        self._agent = agent
+        self._ready_after = ready_after
         self.enters = 0
 
     def capture(self, handle):
@@ -1168,12 +1173,12 @@ class FakeTrustAdapter:
         return s
 
     def probe(self, handle, expected_agent):
-        return expected_agent == "codex" and self._i >= self._codex_after
+        return expected_agent == self._agent and self._i >= self._ready_after
 
     def press_enter(self, handle):
         self.enters += 1
         # After Enter, every later capture shows the trusted input loop.
-        self._screens.append("codex is running\n› Ask anything\n")
+        self._screens.append(f"{self._agent} is running\n› Ask anything\n")
         self._i = len(self._screens) - 1
 
 
@@ -1204,7 +1209,7 @@ def test_codex_trust_matcher_tolerates_width_truncation(tmp_path):
 def test_local_codex_trust_rescue_presses_enter_once_for_the_authorized_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
     cwd = tmp_path / "repo"; cwd.mkdir()
-    adapter = FakeTrustAdapter([_trust_screen(cwd, truncate=1)], codex_after=0)
+    adapter = FakeTrustAdapter([_trust_screen(cwd, truncate=1)], ready_after=0)
     result = {}
     handoff_launcher._rescue_local_codex_folder_trust(
         result, adapter=adapter, handle="h", cwd=cwd,
@@ -1218,7 +1223,7 @@ def test_local_codex_trust_rescue_leaves_a_foreign_dialog_untouched(tmp_path, mo
     monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
     cwd = tmp_path / "repo"; cwd.mkdir()
     foreign = _trust_screen(tmp_path / "not-our-repo")
-    adapter = FakeTrustAdapter([foreign], codex_after=0)
+    adapter = FakeTrustAdapter([foreign], ready_after=0)
     result = {}
     handoff_launcher._rescue_local_codex_folder_trust(
         result, adapter=adapter, handle="h", cwd=cwd,
@@ -1235,9 +1240,90 @@ def test_local_codex_trust_rescue_returns_promptly_when_already_trusted(tmp_path
     monkeypatch.setattr(handoff_launcher.time, "monotonic", lambda: next(ticks))
     cwd = tmp_path / "repo"; cwd.mkdir()
     # No dialog ever; codex is already at its input loop.
-    adapter = FakeTrustAdapter(["codex running\n› Ask anything\n"], codex_after=0)
+    adapter = FakeTrustAdapter(["codex running\n› Ask anything\n"], ready_after=0)
     result = {}
     handoff_launcher._rescue_local_codex_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd, render_grace=3.0,
+    )
+    assert adapter.enters == 0
+    assert result["folder_trust_rescued"] is False
+    assert "startup_unconfirmed" not in result
+
+
+def _claude_trust_screen(cwd, *, shown=None):
+    """Render Claude's folder-trust dialog; ``shown`` overrides the path line
+    (e.g. a ``/private``-canonicalized or width-truncated variant)."""
+    path = shown if shown is not None else str(cwd)
+    return (
+        " Accessing workspace:\n"
+        f" {path}\n"
+        " Quick safety check: Is this a project you created or one you trust?\n"
+        " ❯ 1. Yes, I trust this folder\n"
+        "   2. No, exit\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+
+
+def test_claude_trust_matcher_tolerates_symlinked_cwd_and_truncation(tmp_path):
+    # A symlinked launch dir models macOS canonicalization portably: str(cwd)
+    # differs from str(cwd.resolve()), exactly like /var -> /private/var.
+    real = tmp_path / "tmp.bbZMWiMKxr"
+    real.mkdir()
+    cwd = tmp_path / "launched-as"
+    cwd.symlink_to(real)
+    exact = _claude_trust_screen(cwd, shown=str(cwd))
+    assert handoff_launcher._claude_folder_trust_dialog_present(exact)
+    assert handoff_launcher._claude_trust_cwd_matches(exact, cwd)
+    # Claude may render the resolved target instead of the path as launched.
+    resolved = _claude_trust_screen(cwd, shown=str(cwd.resolve()))
+    assert handoff_launcher._claude_trust_cwd_matches(resolved, cwd)
+    # A narrow surface truncates the path to a prefix.
+    truncated = _claude_trust_screen(cwd, shown=str(cwd)[:-1])
+    assert handoff_launcher._claude_trust_cwd_matches(truncated, cwd)
+    # A dialog for a different directory must not match.
+    other = _claude_trust_screen(tmp_path / "somewhere-else-entirely")
+    assert not handoff_launcher._claude_trust_cwd_matches(other, cwd)
+
+
+def test_local_claude_trust_rescue_presses_enter_once_for_the_authorized_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    real = tmp_path / "repo"; real.mkdir()
+    cwd = tmp_path / "launched-as"; cwd.symlink_to(real)
+    # Claude renders the resolved target path; the rescue must still match.
+    screen = _claude_trust_screen(cwd, shown=str(cwd.resolve()))
+    adapter = FakeTrustAdapter([screen], agent="claude", ready_after=0)
+    result = {}
+    handoff_launcher._rescue_local_claude_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd,
+    )
+    assert adapter.enters == 1
+    assert result["folder_trust_rescued"] is True
+    assert "startup_unconfirmed" not in result
+
+
+def test_local_claude_trust_rescue_leaves_a_foreign_dialog_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    cwd = tmp_path / "repo"; cwd.mkdir()
+    foreign = _claude_trust_screen(tmp_path / "not-our-repo")
+    adapter = FakeTrustAdapter([foreign], agent="claude", ready_after=0)
+    result = {}
+    handoff_launcher._rescue_local_claude_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd,
+    )
+    assert adapter.enters == 0
+    assert result["folder_trust_rescued"] is False
+    assert result["startup_unconfirmed"] is True
+
+
+def test_local_claude_trust_rescue_returns_promptly_when_already_trusted(tmp_path, monkeypatch):
+    import itertools
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    ticks = itertools.count(0.0, 0.5)
+    monkeypatch.setattr(handoff_launcher.time, "monotonic", lambda: next(ticks))
+    cwd = tmp_path / "repo"; cwd.mkdir()
+    adapter = FakeTrustAdapter(["claude running\n› Ask anything\n"], agent="claude", ready_after=0)
+    result = {}
+    handoff_launcher._rescue_local_claude_folder_trust(
         result, adapter=adapter, handle="h", cwd=cwd, render_grace=3.0,
     )
     assert adapter.enters == 0
