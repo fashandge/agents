@@ -769,6 +769,46 @@ def _cmux_workspace_for_surface(binary: str, surface: str) -> str:
     )
 
 
+def _resolve_tmux_target(target: str) -> str:
+    """Resolve and validate the exact tmux session a doorbell will type into.
+
+    ``auto`` (any case) names the caller's own session: it resolves through
+    ``$TMUX`` and ``tmux display-message``, so the call itself must run inside
+    tmux.  Any other value must be an existing session handle — an unvalidated
+    guess (the literal string ``auto`` was once stored verbatim) leaves every
+    typed doorbell failing while passive banners keep the state looking
+    healthy.
+    """
+    binary = handoff_launcher.TmuxAdapter().binary
+    if target.lower() == "auto":
+        detail = (
+            "--target auto requires running inside tmux; pass the exact "
+            "orchestrator tmux session handle (e.g. from "
+            "'tmux display-message -p \"#S\"')"
+        )
+        if not os.environ.get("TMUX"):
+            raise handoff.HandoffError(detail, 2)
+        try:
+            handle = handoff_launcher._run(  # noqa: SLF001 - exact tmux session lookup
+                [binary, "display-message", "-p", "#S"],
+            ).stdout.strip()
+        except handoff_launcher.AdapterError as exc:
+            raise handoff.HandoffError(detail, 2) from exc
+        if not handle:
+            raise handoff.HandoffError(detail, 2)
+        return handle
+    if handoff_launcher._run(  # noqa: SLF001 - validate the exact tmux session
+        [binary, "has-session", "-t", target], check=False,
+    ).returncode != 0:
+        raise handoff.HandoffError(
+            f"tmux orchestrator session does not exist: {target}; "
+            "list sessions with 'tmux ls' or pass --target auto from inside "
+            "the orchestrator's tmux session",
+            2,
+        )
+    return target
+
+
 def _register_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
     if args.transport == "cmux":
         surface = args.surface or os.environ.get("CMUX_SURFACE_ID")
@@ -782,7 +822,7 @@ def _register_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
     elif args.transport == "tmux":
         if not args.target:
             raise handoff.HandoffError("tmux orchestrator registration requires --target", 2)
-        target = {"handle": args.target}
+        target = {"handle": _resolve_tmux_target(args.target)}
     else:
         if not args.target:
             raise handoff.HandoffError("native-app orchestrator registration requires --target", 2)
@@ -797,9 +837,15 @@ def _register_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
 
 def _retarget_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
     value = handoff_watcher.read(args.state)
+    if value["transport"] == "tmux":
+        if not args.target:
+            raise handoff.HandoffError("tmux orchestrator retarget requires --target", 2)
+        return handoff_watcher.retarget(
+            args.state, {"handle": _resolve_tmux_target(args.target)},
+        )
     if value["transport"] != "cmux":
         raise handoff.HandoffError(
-            "orchestrator retarget currently supports cmux orchestrators only", 2,
+            "orchestrator retarget currently supports cmux and tmux orchestrators only", 2,
         )
     surface = args.surface or os.environ.get("CMUX_SURFACE_ID")
     if not surface:
@@ -1300,7 +1346,11 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrator_register = orchestrator_commands.add_parser("register")
     orchestrator_register.add_argument("--state", required=True, type=_absolute)
     orchestrator_register.add_argument("--transport", required=True, choices=("cmux", "tmux", "native-app"))
-    orchestrator_register.add_argument("--target", help="exact tmux handle or native-app thread ID")
+    orchestrator_register.add_argument(
+        "--target",
+        help="exact tmux session handle ('auto' resolves the current session) "
+        "or native-app thread ID",
+    )
     orchestrator_register.add_argument("--surface", help="exact cmux orchestrator surface UUID")
     orchestrator_register.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
     orchestrator_register.add_argument(
@@ -1309,9 +1359,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_register.add_argument("--orchestrator-id", "--coordinator-id", dest="orchestrator_id")
     orchestrator_retarget = orchestrator_commands.add_parser(
-        "retarget", help="replace a stopped cmux orchestrator's terminal target",
+        "retarget", help="replace a stopped cmux or tmux orchestrator's terminal target",
     )
     orchestrator_retarget.add_argument("--state", required=True, type=_absolute)
+    orchestrator_retarget.add_argument(
+        "--target", help="exact tmux session handle ('auto' resolves the current session)",
+    )
     orchestrator_retarget.add_argument("--surface", help="exact cmux orchestrator surface UUID")
     orchestrator_retarget.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
     orchestrator_start = orchestrator_commands.add_parser(

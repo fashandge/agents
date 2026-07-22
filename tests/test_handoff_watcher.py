@@ -735,6 +735,79 @@ def test_run_state_from_an_older_snapshot_without_doorbell_method(tmp_path):
     assert handoff_watcher.read(state_path)["runs"]["run-1"] == legacy
 
 
+def test_run_state_from_an_older_snapshot_without_typed_error(tmp_path):
+    state_path, owner = orchestrator_state(tmp_path)
+    value = handoff_watcher.read(state_path)
+    legacy = handoff_watcher._empty_run_state()  # noqa: SLF001 - state fixture
+    del legacy["last_typed_error"]
+    value["runs"] = {"run-1": legacy}
+    handoff_watcher._atomic_write(state_path, value)  # noqa: SLF001 - state fixture
+
+    assert handoff_watcher.read(state_path)["runs"]["run-1"] == legacy
+
+
+def test_failed_active_doorbell_sticks_until_a_typed_ring_lands(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
+    )
+    awaiting_review(run, "secret body")
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+    run_id = run["run"]["run_id"]
+
+    def unavailable(value, coverage, urgency):
+        raise handoff.HandoffError("push unavailable", 6)
+
+    # A failed ACTIVE ring marks the typed channel as possibly dead.
+    handoff_watcher.poll(
+        state_path, registry_path=registry, notifier=unavailable, now=now,
+    )
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert state["last_doorbell_error"] == "push unavailable"
+    assert state["last_typed_error"] == "push unavailable"
+
+    # A later successful PASSIVE banner clears the doorbell error but must not
+    # mask the dead typed channel.
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage, urgency: "macos_notification",
+        now=now + datetime.timedelta(seconds=31),
+    )
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert state["last_doorbell_error"] is None
+    assert state["last_typed_error"] == "push unavailable"
+
+    # A second run with fresh events rings ACTIVE in the same coalesced
+    # doorbell; a landed typed channel clears the sticky error for every run
+    # the ring covered.
+    second = registered_run(
+        tmp_path, registry, name="second", orchestrator_id=owner["orchestrator_id"],
+    )
+    awaiting_review(second, "another body")
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage, urgency: "terminal_input",
+        now=now + datetime.timedelta(seconds=95),
+    )
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert state["last_typed_error"] is None
+
+    # A failing PASSIVE attempt must not set the typed-channel error either.
+    second_id = second["run"]["run_id"]
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=unavailable,
+        now=now + datetime.timedelta(seconds=126),
+    )
+    state = handoff_watcher.read(state_path)["runs"][second_id]
+    assert state["last_doorbell_error"] == "push unavailable"
+    assert state["last_typed_error"] is None
+
+
 def test_pending_uses_hot_path_and_full_context_only_for_recovery(
     tmp_path, monkeypatch,
 ):

@@ -38,7 +38,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: handoff_orchestrator_ensure.sh --transport cmux|tmux [--owner-pid <pid>|auto] [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
+Usage: handoff_orchestrator_ensure.sh --transport cmux|tmux [--owner-pid <pid>|auto] [--target auto|<exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
 
 Idempotent handoff session-watcher bootstrap: registers the orchestrator
 target once (unless --state already exists), then starts or reuses the
@@ -48,6 +48,10 @@ singleton watcher. Prints one JSON line:
 --owner-pid is optional: omit it (or pass "auto") to auto-detect the long-lived
 orchestrator agent PID by walking process ancestry (handoff_orchestrator_pid.sh).
 Pass an explicit numeric PID to override.
+
+For --transport tmux, --target accepts "auto" (resolve to the current tmux
+session; requires running inside tmux) or an exact session handle, validated
+with `tmux has-session` at registration.
 EOF
 }
 

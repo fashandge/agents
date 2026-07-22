@@ -27,6 +27,28 @@ def run_cli(*args, input=None):
     )
 
 
+def register_tmux_orchestrator(monkeypatch, capsys, state, owner_pid, *extra, command="orchestrator"):
+    """Register through the real CLI parser with the tmux probe faked.
+
+    Registration validates the target with ``tmux has-session``, and a fake
+    handle like ``orchestrator:0.4`` can never name a real session.  Running
+    ``main`` in process keeps the argparse-to-registration path under test
+    while the fake answers the probe; subprocess-spawning steps elsewhere in
+    the test are unaffected.
+    """
+    monkeypatch.setattr(
+        handoffctl.handoff_launcher,
+        "_run",
+        lambda argv, check=True: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    assert handoffctl.main([
+        command, "register", "--state", str(state),
+        "--transport", "tmux", "--target", "orchestrator:0.4",
+        "--owner-pid", str(owner_pid), *extra,
+    ]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
 def registered_run(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -499,15 +521,9 @@ def test_remote_dispatch_uses_one_structured_ssh_request(tmp_path, monkeypatch):
     assert observed["stdin"] == "literal ; $(touch NOPE)"
 
 
-def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path):
+def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path, monkeypatch, capsys):
     state = tmp_path / "orchestrator" / "watcher.json"
-    registered = run_cli(
-        "orchestrator", "register", "--state", state,
-        "--transport", "tmux", "--target", "orchestrator:0.4",
-        "--owner-pid", os.getpid(),
-    )
-    assert registered.returncode == 0, registered.stderr
-    value = json.loads(registered.stdout)
+    value = register_tmux_orchestrator(monkeypatch, capsys, state, os.getpid())
     assert value["target"] == {"handle": "orchestrator:0.4"}
 
     shown = run_cli("orchestrator", "show", "--state", state)
@@ -521,23 +537,21 @@ def test_cli_registers_shows_and_enforces_detached_watcher_options(tmp_path):
     assert "cannot be combined" in conflict.stderr
 
 
-def test_cli_coordinator_alias_still_resolves(tmp_path):
+def test_cli_coordinator_alias_still_resolves(tmp_path, monkeypatch, capsys):
     state = tmp_path / "orchestrator" / "watcher.json"
-    registered = run_cli(
-        "coordinator", "register", "--state", state,
-        "--transport", "tmux", "--target", "orchestrator:0.4",
-        "--owner-pid", os.getpid(),
+    registered = register_tmux_orchestrator(
+        monkeypatch, capsys, state, os.getpid(),
         "--coordinator-id", "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+        command="coordinator",
     )
-    assert registered.returncode == 0, registered.stderr
     assert (
-        json.loads(registered.stdout)["orchestrator_id"]
+        registered["orchestrator_id"]
         == "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
     )
 
     shown = run_cli("coordinator", "show", "--state", state)
     assert shown.returncode == 0, shown.stderr
-    assert json.loads(shown.stdout) == json.loads(registered.stdout)
+    assert json.loads(shown.stdout) == registered
 
     conflict = run_cli("watch", "--coordinator-state", state, "--once")
     assert conflict.returncode == 2
@@ -545,17 +559,12 @@ def test_cli_coordinator_alias_still_resolves(tmp_path):
 
 
 def test_cli_orchestrator_dismiss_resolves_registered_run_and_writes_cursor(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, capsys,
 ):
     run = registered_run(tmp_path, monkeypatch)
     state = tmp_path / "orchestrator" / "watcher.json"
-    registered = run_cli(
-        "orchestrator", "register", "--state", state,
-        "--transport", "tmux", "--target", "orchestrator:0.4",
-        "--owner-pid", os.getpid(),
-    )
-    assert registered.returncode == 0, registered.stderr
-    orchestrator_id = json.loads(registered.stdout)["orchestrator_id"]
+    registered = register_tmux_orchestrator(monkeypatch, capsys, state, os.getpid())
+    orchestrator_id = registered["orchestrator_id"]
     handoff_registry.adopt(run["run"]["run_id"], orchestrator_id)
     handoff.emit(
         Path(run["run_dir"]),
@@ -592,7 +601,7 @@ def test_cli_orchestrator_dismiss_resolves_registered_run_and_writes_cursor(
     ] == 1
 
 
-def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monkeypatch):
+def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
     state = tmp_path / "orchestrator" / "watcher.json"
     owner = subprocess.Popen(
@@ -601,12 +610,7 @@ def test_cli_starts_one_detached_watcher_and_it_exits_with_owner(tmp_path, monke
         stderr=subprocess.DEVNULL,
     )
     try:
-        registered = run_cli(
-            "orchestrator", "register", "--state", state,
-            "--transport", "tmux", "--target", "orchestrator:0.4",
-            "--owner-pid", owner.pid,
-        )
-        assert registered.returncode == 0, registered.stderr
+        register_tmux_orchestrator(monkeypatch, capsys, state, owner.pid)
 
         started = run_cli(
             "orchestrator", "start", "--state", state, "--interval", 0.05,
@@ -929,23 +933,212 @@ def test_cmux_orchestrator_registration_finds_an_explicit_surface_workspace(tmp_
     assert value["target"] == {"workspace": "workspace:9", "surface": surface}
 
 
-def test_cli_explicitly_adopts_unowned_registry_run(tmp_path, monkeypatch):
+def _tmux_register_args(state, target):
+    return Namespace(
+        state=state,
+        transport="tmux",
+        target=target,
+        surface=None,
+        cmux_binary="/exact/cmux",
+        owner_pid=os.getpid(),
+        orchestrator_id=None,
+    )
+
+
+def test_tmux_orchestrator_registration_auto_resolves_the_current_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,1234,0")
+
+    def fake_run(argv, check=True):
+        if argv == ["tmux", "display-message", "-p", "#S"]:
+            return subprocess.CompletedProcess(argv, 0, "orchestrator\n", "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+    args = _tmux_register_args(tmp_path / "orchestrator" / "watcher.json", "AUTO")
+
+    value = handoffctl._register_orchestrator(args)
+
+    assert value["target"] == {"handle": "orchestrator"}
+
+
+def test_tmux_orchestrator_registration_auto_requires_running_inside_tmux(tmp_path, monkeypatch):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(
+        handoffctl.handoff_launcher,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("tmux must not be probed outside tmux"),
+    )
+    args = _tmux_register_args(tmp_path / "orchestrator" / "watcher.json", "auto")
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoffctl._register_orchestrator(args)
+
+    assert excinfo.value.exit_code == 2
+    assert "--target auto requires running inside tmux" in str(excinfo.value)
+
+
+def test_tmux_orchestrator_registration_auto_reports_a_failed_lookup(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,1234,0")
+
+    def fake_run(argv, check=True):
+        raise handoffctl.handoff_launcher.AdapterError("no server running")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+    args = _tmux_register_args(tmp_path / "orchestrator" / "watcher.json", "auto")
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoffctl._register_orchestrator(args)
+
+    assert excinfo.value.exit_code == 2
+    assert "--target auto requires running inside tmux" in str(excinfo.value)
+
+
+def test_tmux_orchestrator_registration_rejects_an_unknown_session(tmp_path, monkeypatch):
+    def fake_run(argv, check=True):
+        if argv == ["tmux", "has-session", "-t", "ghost"]:
+            return subprocess.CompletedProcess(argv, 1, "", "can't find session: ghost")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+    args = _tmux_register_args(tmp_path / "orchestrator" / "watcher.json", "ghost")
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoffctl._register_orchestrator(args)
+
+    assert excinfo.value.exit_code == 2
+    assert "ghost" in str(excinfo.value)
+    assert "tmux ls" in str(excinfo.value)
+
+
+def test_tmux_orchestrator_registration_accepts_an_existing_session(tmp_path, monkeypatch):
+    def fake_run(argv, check=True):
+        if argv == ["tmux", "has-session", "-t", "orchestrator:0.1"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+    args = _tmux_register_args(tmp_path / "orchestrator" / "watcher.json", "orchestrator:0.1")
+
+    value = handoffctl._register_orchestrator(args)
+
+    assert value["target"] == {"handle": "orchestrator:0.1"}
+
+
+def _tmux_retarget_args(state, target):
+    return Namespace(state=state, target=target, surface=None, cmux_binary="/exact/cmux")
+
+
+def test_tmux_orchestrator_retarget_replaces_the_handle(tmp_path, monkeypatch):
+    state_path = tmp_path / "orchestrator" / "watcher.json"
+    # A state left over from the unvalidated-registration bug: the recorded
+    # handle never named a real session, so every typed doorbell failed.
+    handoff_watcher.initialize(
+        state_path, transport="tmux", target={"handle": "auto"}, owner_pid=os.getpid(),
+    )
+
+    def fake_run(argv, check=True):
+        if argv == ["tmux", "has-session", "-t", "orchestrator:0.1"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+
+    value = handoffctl._retarget_orchestrator(_tmux_retarget_args(state_path, "orchestrator:0.1"))
+
+    assert value["target"] == {"handle": "orchestrator:0.1"}
+    assert handoff_watcher.read(state_path)["target"] == {"handle": "orchestrator:0.1"}
+
+
+def test_tmux_orchestrator_retarget_auto_resolves_the_current_session(tmp_path, monkeypatch):
+    state_path = tmp_path / "orchestrator" / "watcher.json"
+    handoff_watcher.initialize(
+        state_path, transport="tmux", target={"handle": "stale"}, owner_pid=os.getpid(),
+    )
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,1234,0")
+
+    def fake_run(argv, check=True):
+        if argv == ["tmux", "display-message", "-p", "#S"]:
+            return subprocess.CompletedProcess(argv, 0, "orchestrator\n", "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+
+    value = handoffctl._retarget_orchestrator(_tmux_retarget_args(state_path, "auto"))
+
+    assert value["target"] == {"handle": "orchestrator"}
+
+
+def test_tmux_orchestrator_retarget_rejects_an_unknown_session(tmp_path, monkeypatch):
+    state_path = tmp_path / "orchestrator" / "watcher.json"
+    handoff_watcher.initialize(
+        state_path, transport="tmux", target={"handle": "stale"}, owner_pid=os.getpid(),
+    )
+
+    def fake_run(argv, check=True):
+        if argv == ["tmux", "has-session", "-t", "ghost"]:
+            return subprocess.CompletedProcess(argv, 1, "", "can't find session: ghost")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoffctl._retarget_orchestrator(_tmux_retarget_args(state_path, "ghost"))
+
+    assert excinfo.value.exit_code == 2
+    assert "ghost" in str(excinfo.value)
+    assert handoff_watcher.read(state_path)["target"] == {"handle": "stale"}
+
+
+def test_cmux_orchestrator_retarget_still_uses_the_surface_environment(tmp_path, monkeypatch):
+    surface = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    state_path = tmp_path / "orchestrator" / "watcher.json"
+    handoff_watcher.initialize(
+        state_path,
+        transport="cmux",
+        target={"workspace": "workspace:2", "surface": surface},
+        owner_pid=os.getpid(),
+    )
+    monkeypatch.setenv("CMUX_SURFACE_ID", surface)
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace:9")
+    monkeypatch.setattr(
+        handoffctl.handoff_launcher,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("cmux inventory should not be consulted"),
+    )
+    args = Namespace(state=state_path, target=None, surface=None, cmux_binary="/exact/cmux")
+
+    value = handoffctl._retarget_orchestrator(args)
+
+    assert value["target"] == {"workspace": "workspace:9", "surface": surface}
+
+
+def test_native_app_orchestrator_retarget_is_still_rejected(tmp_path):
+    state_path = tmp_path / "orchestrator" / "watcher.json"
+    handoff_watcher.initialize(
+        state_path, transport="native_app", target={"thread_id": "thread-1"},
+        owner_pid=os.getpid(),
+    )
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoffctl._retarget_orchestrator(_tmux_retarget_args(state_path, "thread-2"))
+
+    assert excinfo.value.exit_code == 2
+    assert "cmux and tmux" in str(excinfo.value)
+    assert handoff_watcher.read(state_path)["target"] == {"thread_id": "thread-1"}
+
+
+def test_cli_explicitly_adopts_unowned_registry_run(tmp_path, monkeypatch, capsys):
     run = registered_run(tmp_path, monkeypatch)
     state = tmp_path / "orchestrator" / "watcher.json"
-    registered = run_cli(
-        "orchestrator", "register", "--state", state,
-        "--transport", "tmux", "--target", "orchestrator:0.4",
-        "--owner-pid", os.getpid(),
-    )
-    assert registered.returncode == 0, registered.stderr
+    registered = register_tmux_orchestrator(monkeypatch, capsys, state, os.getpid())
 
     adopted = run_cli(
         "runs", "adopt", "--run", "weather", "--orchestrator-state", state,
     )
 
     assert adopted.returncode == 0, adopted.stderr
-    assert json.loads(adopted.stdout)["orchestrator_id"] == json.loads(registered.stdout)["orchestrator_id"]
-    assert handoff_registry.resolve(run["run"]["run_id"])["orchestrator_id"] == json.loads(registered.stdout)["orchestrator_id"]
+    assert json.loads(adopted.stdout)["orchestrator_id"] == registered["orchestrator_id"]
+    assert handoff_registry.resolve(run["run"]["run_id"])["orchestrator_id"] == registered["orchestrator_id"]
 
 
 def fail_registered_run(run):
@@ -1108,13 +1301,8 @@ def test_cli_runs_clean_watcher_state_scopes_to_the_session(tmp_path, monkeypatc
     value["runs"]["run-other"] = {**value["runs"][first], "run_id": "run-other", "name": "other"}
     registry.write_text(json.dumps(value), encoding="utf-8")
     state = tmp_path / "orchestrator" / "watcher.json"
-    registered = run_cli(
-        "orchestrator", "register", "--state", state,
-        "--transport", "tmux", "--target", "orchestrator:0.4",
-        "--owner-pid", os.getpid(),
-    )
-    assert registered.returncode == 0, registered.stderr
-    orchestrator_id = json.loads(registered.stdout)["orchestrator_id"]
+    registered = register_tmux_orchestrator(monkeypatch, capsys, state, os.getpid())
+    orchestrator_id = registered["orchestrator_id"]
     adopted_cli = run_cli("runs", "adopt", "--run", "weather", "--orchestrator-state", state)
     assert adopted_cli.returncode == 0, adopted_cli.stderr
 

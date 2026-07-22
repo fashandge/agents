@@ -26,6 +26,11 @@ DoorbellNotifier = Callable[[dict[str, Any], dict[str, int], str], str | None]
 # A method label containing this marker means the typed channel was withheld
 # because the human was editing a prompt in the orchestrator's own composer.
 DEFERRED_INPUT = "deferred_input"
+# Method-label channels that mean a doorbell actually typed into the
+# orchestrator's composer — the only channels that push a hosted agent to read
+# its pending outboxes.  Visible-only alerts (``cmux_notify``,
+# ``macos_notification``, ``native_app``) and deferrals are not typed input.
+TYPED_INPUT_CHANNELS = frozenset({"terminal_input", "cmux_input", "cmux_input_forced"})
 """Delivers one coalesced doorbell; returns the channel(s) that accepted it.
 
 The third argument is the doorbell's *urgency*: ``"active"`` means the run
@@ -146,11 +151,12 @@ def _run_state(value: Any) -> dict[str, Any]:
         "last_doorbell_error",
     }
     # ``last_doorbell_method``, ``acknowledged_through``,
-    # ``dismissed_through``, and ``doorbell_attempts`` are optional so
-    # snapshots written before those fields existed remain readable.
+    # ``dismissed_through``, ``doorbell_attempts``, and ``last_typed_error``
+    # are optional so snapshots written before those fields existed remain
+    # readable.
     optional = {
         "last_doorbell_method", "acknowledged_through", "dismissed_through",
-        "doorbell_attempts",
+        "doorbell_attempts", "last_typed_error",
     }
     if not isinstance(value, dict) or not required <= set(value) <= required | optional:
         raise handoff.HandoffError("invalid orchestrator run notification state", 5)
@@ -174,7 +180,7 @@ def _run_state(value: Any) -> dict[str, Any]:
         raise handoff.HandoffError("doorbell cursor exceeds observed cursor", 5)
     if not isinstance(value["doorbell_pending"], bool):
         raise handoff.HandoffError("doorbell_pending must be boolean", 5)
-    for field in ("last_doorbell_at", "last_doorbell_error", "last_doorbell_method"):
+    for field in ("last_doorbell_at", "last_doorbell_error", "last_doorbell_method", "last_typed_error"):
         if value.get(field) is not None and not isinstance(value.get(field), str):
             raise handoff.HandoffError(f"{field} must be null or a string", 5)
     if value["last_doorbell_at"] is not None:
@@ -376,6 +382,7 @@ def _empty_run_state() -> dict[str, Any]:
         "doorbell_after_cursor": 0,
         "last_doorbell_error": None,
         "last_doorbell_method": None,
+        "last_typed_error": None,
         "acknowledged_through": 0,
         "dismissed_through": 0,
         "doorbell_attempts": 0,
@@ -524,7 +531,11 @@ def poll(
     so operators can tell a visible ``cmux notify`` alert apart from raw
     terminal input or a degraded fallback.  ``last_doorbell_error`` is null
     exactly when a channel accepted; when every channel fails, the method is
-    null and the error describes the combined failure.
+    null and the error describes the combined failure.  ``last_typed_error``
+    is the sticky typed-channel counterpart: a failed active ring sets it and
+    only a later active ring that lands typed input clears it, so a degraded
+    composer channel stays visible even while passive banners keep
+    succeeding.
     """
     if retry_seconds <= 0:
         raise handoff.HandoffError("watcher retry interval must be positive", 2)
@@ -684,6 +695,19 @@ def poll(
             run_state["last_doorbell_method"] = (
                 delivered_method if notification_error is None else None
             )
+            # ``last_typed_error`` tracks the typed input channel only.  An
+            # active ring that raises leaves the channel possibly dead, so the
+            # error stays sticky until an active ring lands typed input again —
+            # a successful passive banner (or a deferral) must never mask it.
+            if urgency == "active" and notification_error is not None:
+                run_state["last_typed_error"] = notification_error
+            elif (
+                urgency == "active"
+                and delivered_method is not None
+                and notification_error is None
+                and TYPED_INPUT_CHANNELS & set(delivered_method.split("+"))
+            ):
+                run_state["last_typed_error"] = None
         _atomic_write(path, value)
 
     return {
