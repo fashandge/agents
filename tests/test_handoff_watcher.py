@@ -193,7 +193,7 @@ def test_watcher_is_singleton_and_isolates_orchestrators(tmp_path):
         result = handoff_watcher.poll(
             state_path,
             registry_path=registry,
-            notifier=lambda value, coverage: calls.append((value, coverage)),
+            notifier=lambda value, coverage, urgency: calls.append((value, coverage)),
         )
 
     assert result["owned_runs"] == [owned["run"]["run_id"]]
@@ -213,7 +213,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
         handoff_watcher.poll(
             state_path,
             registry_path=registry,
-            notifier=lambda value, coverage: calls.append(dict(coverage)),
+            notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         )
         second = registered_run(
             tmp_path, registry, name="second", orchestrator_id=owner["orchestrator_id"],
@@ -222,7 +222,7 @@ def test_watcher_discovers_new_worker_without_restart(tmp_path):
         handoff_watcher.poll(
             state_path,
             registry_path=registry,
-            notifier=lambda value, coverage: calls.append(dict(coverage)),
+            notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         )
 
     assert calls == [
@@ -243,7 +243,7 @@ def test_watch_exits_when_owner_process_is_dead(tmp_path, monkeypatch):
     handoff_watcher.watch(
         state_path,
         interval=0.01,
-        notifier=lambda value, coverage: None,
+        notifier=lambda value, coverage, urgency: None,
         owner_probe=lambda owner: "dead",
     )
 
@@ -265,7 +265,7 @@ def test_watch_suppresses_work_while_owner_liveness_is_unknown(tmp_path, monkeyp
     handoff_watcher.watch(
         state_path,
         interval=0.01,
-        notifier=lambda value, coverage: None,
+        notifier=lambda value, coverage, urgency: None,
         owner_probe=lambda owner: next(statuses),
     )
 
@@ -286,7 +286,7 @@ def test_watch_reports_each_live_poll_to_on_poll(tmp_path, monkeypatch):
     handoff_watcher.watch(
         state_path,
         interval=0.01,
-        notifier=lambda value, coverage: None,
+        notifier=lambda value, coverage, urgency: None,
         owner_probe=lambda owner: next(statuses),
         on_poll=reported.append,
     )
@@ -324,19 +324,21 @@ def test_watcher_coalesces_and_never_advances_protocol_cursor(tmp_path):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
         now=now,
     )
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
         now=now + datetime.timedelta(seconds=31),
     )
 
+    # New events type one active doorbell; the backoff re-ring for the same
+    # events downgrades to a passive alert.
     assert calls == [
-        {first["run"]["run_id"]: 1, second["run"]["run_id"]: 1},
-        {first["run"]["run_id"]: 1, second["run"]["run_id"]: 1},
+        ({first["run"]["run_id"]: 1, second["run"]["run_id"]: 1}, "active"),
+        ({first["run"]["run_id"]: 1, second["run"]["run_id"]: 1}, "passive"),
     ]
     assert handoff.control_show(Path(first["run_dir"]))["outbox_cursor"] == 0
     assert handoff.control_show(Path(second["run_dir"]))["outbox_cursor"] == 0
@@ -362,7 +364,7 @@ def test_watcher_recovers_both_notification_crash_windows(
     awaiting_review(run, "durable event")
     delivered = []
 
-    def crash(value, coverage):
+    def crash(value, coverage, urgency):
         if delivered_before_crash:
             delivered.append(dict(coverage))
         raise KeyboardInterrupt("simulated watcher crash")
@@ -382,7 +384,7 @@ def test_watcher_recovers_both_notification_crash_windows(
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: delivered.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: delivered.append(dict(coverage)),
     )
     assert delivered[-1] == {run["run"]["run_id"]: 1}
     assert len(delivered) == (2 if delivered_before_crash else 1)
@@ -401,24 +403,26 @@ def test_partial_consumption_redoorbells_remainder_and_full_consumption_clears(t
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
     )
     handoff.control_consume(Path(run["run_dir"]), run["orchestrator"], through=1)
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
     )
     handoff.control_consume(Path(run["run_dir"]), run["orchestrator"], through=3)
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
     )
 
+    # A moving control cursor means an orchestrator is working the run, so the
+    # remainder re-ring is a passive nudge rather than another typed prompt.
     assert calls == [
-        {run["run"]["run_id"]: 3},
-        {run["run"]["run_id"]: 3},
+        ({run["run"]["run_id"]: 3}, "active"),
+        ({run["run"]["run_id"]: 3}, "passive"),
     ]
     state = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
     assert state["control_through"] == 3
@@ -463,19 +467,19 @@ def test_orchestrator_doorbell_routes_exact_opaque_target(monkeypatch):
         "transport": "tmux",
         "target": {"handle": "session:3.7"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
     cmux_method = handoffctl._notify_orchestrator({
         "orchestrator_id": orchestrator_id,
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
     native_method = handoffctl._notify_orchestrator({
         "orchestrator_id": orchestrator_id,
         "transport": "native_app",
         "target": {"thread_id": "thread-exact"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert tmux_method == "terminal_input"
     assert cmux_method == "cmux_input+cmux_notify"
@@ -519,7 +523,7 @@ def test_orchestrator_cmux_falls_back_to_workspace_notification(monkeypatch):
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert method == "cmux_notify_workspace"
     assert calls == [(
@@ -563,7 +567,7 @@ def test_orchestrator_cmux_uses_macos_notification_when_cmux_notifications_fail(
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert method == "macos_notification"
     assert calls == [(
@@ -607,7 +611,7 @@ def test_orchestrator_cmux_reports_combined_error_when_every_channel_fails(monke
             "transport": "cmux",
             "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
             "owner_process": {"pid": os.getpid(), "started_at": "test"},
-        }, {"run-secret": 9})
+        }, {"run-secret": 9}, "active")
 
     message = str(captured.value)
     assert "input rejected" in message
@@ -643,7 +647,7 @@ def test_orchestrator_cmux_unechoed_input_does_not_count_as_delivery(monkeypatch
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert method == "cmux_notify"
 
@@ -682,7 +686,7 @@ def test_orchestrator_cmux_confirmed_input_survives_notification_failure(monkeyp
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert method == "cmux_input"
 
@@ -699,14 +703,14 @@ def test_watcher_records_doorbell_channel_and_clears_it_on_failure(tmp_path):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: "cmux_notify",
+        notifier=lambda value, coverage, urgency: "cmux_notify",
         now=now,
     )
     state = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
     assert state["last_doorbell_method"] == "cmux_notify"
     assert state["last_doorbell_error"] is None
 
-    def unavailable(value, coverage):
+    def unavailable(value, coverage, urgency):
         raise handoff.HandoffError("push unavailable", 6)
 
     handoff_watcher.poll(
@@ -745,7 +749,7 @@ def test_pending_uses_hot_path_and_full_context_only_for_recovery(
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: (_ for _ in ()).throw(
+        notifier=lambda value, coverage, urgency: (_ for _ in ()).throw(
             handoff.HandoffError("push unavailable", 6)
         ),
     )
@@ -778,7 +782,7 @@ def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
     )
     assert calls == []
     handoff_registry.adopt(
@@ -787,7 +791,7 @@ def test_unowned_registry_run_requires_explicit_adoption(tmp_path):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
     )
     assert calls == [{run["run"]["run_id"]: 1}]
 
@@ -806,7 +810,7 @@ def test_awaiting_review_result_rings_once_then_acknowledge_stops_reringing(tmp_
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now,
     )
     assert calls == [{run["run"]["run_id"]: 1}]
@@ -821,7 +825,7 @@ def test_awaiting_review_result_rings_once_then_acknowledge_stops_reringing(tmp_
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now + datetime.timedelta(seconds=61),
     )
     assert calls == [{run["run"]["run_id"]: 1}]
@@ -844,14 +848,14 @@ def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now,
     )
     handoffctl._orchestrator_pending(state_path, full_context=False)
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now + datetime.timedelta(seconds=61),
     )
     assert calls == [{run["run"]["run_id"]: 1}]
@@ -861,7 +865,7 @@ def test_new_event_after_acknowledge_rerings(tmp_path, monkeypatch):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now + datetime.timedelta(seconds=122),
     )
     assert calls == [{run["run"]["run_id"]: 1}, {run["run"]["run_id"]: 2}]
@@ -885,7 +889,7 @@ def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now,
     )
     assert calls == [{first["run"]["run_id"]: 1, second["run"]["run_id"]: 1}]
@@ -901,7 +905,7 @@ def test_pending_acknowledges_each_worker_independently(tmp_path, monkeypatch):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now + datetime.timedelta(seconds=61),
     )
     assert calls == [
@@ -958,7 +962,7 @@ def test_working_checkpoint_does_not_ring(tmp_path):
     result = handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
     )
 
     assert calls == []
@@ -978,14 +982,22 @@ def test_blocked_question_rerings_after_acknowledge_until_worker_resumes(tmp_pat
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
         now=now,
     )
     handoff_watcher.acknowledge(state_path, {run["run"]["run_id"]: 1})
+    # A blocked worker keeps pushing actively, but on the backoff schedule:
+    # 29s after the first ring is too early, 31s is due.
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
+        now=now + datetime.timedelta(seconds=29),
+    )
+    handoff_watcher.poll(
+        state_path,
+        registry_path=registry,
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
         now=now + datetime.timedelta(seconds=31),
     )
 
@@ -1002,13 +1014,13 @@ def test_blocked_question_rerings_after_acknowledge_until_worker_resumes(tmp_pat
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
         now=now + datetime.timedelta(seconds=62),
     )
 
     assert calls == [
-        {run["run"]["run_id"]: 1},
-        {run["run"]["run_id"]: 1},
+        ({run["run"]["run_id"]: 1}, "active"),
+        ({run["run"]["run_id"]: 1}, "active"),
     ]
 
 
@@ -1029,6 +1041,9 @@ def test_terminal_worker_state_does_not_ring(tmp_path, state):
             data={"disposition": "accepted"},
             reply_to=result["message"]["message_id"],
         )
+        handoff.control_integrate(
+            Path(run["run_dir"]), run["orchestrator"], commit="deadbeef",
+        )
     else:
         handoff.send(
             Path(run["run_dir"]),
@@ -1043,12 +1058,15 @@ def test_terminal_worker_state_does_not_ring(tmp_path, state):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
     )
 
     notification = handoff_watcher.read(state_path)["runs"][run["run"]["run_id"]]
     assert calls == []
     assert notification["doorbell_pending"] is True
+    # The orchestrator's decision auto-quiets the whole post-decision tail —
+    # including this final checkpoint, which can never be consumed.
+    assert notification["dismissed_through"] == notification["observed_through"]
 
 
 def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
@@ -1064,14 +1082,14 @@ def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now,
     )
     handoff_watcher.dismiss(state_path, {run["run"]["run_id"]: 1})
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now + datetime.timedelta(seconds=31),
     )
     handoff.emit(
@@ -1090,7 +1108,7 @@ def test_dismiss_silences_blocked_worker_until_newer_event(tmp_path):
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
         now=now + datetime.timedelta(seconds=62),
     )
 
@@ -1128,7 +1146,11 @@ def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, m
         if argv[0] == "status":
             return {"state": "blocked", "blocked_on": ["question-id"]}
         if argv[0:2] == ["control", "show"]:
-            return {"outbox_cursor": 0}
+            return {
+                "outbox_cursor": 0,
+                "desired_state": "run",
+                "integration": {"state": "pending", "commit": None, "reason": None},
+            }
         return [{"seq": 1, "type": "question", "body": "remains remote"}]
 
     monkeypatch.setattr(handoff_watcher, "_remote_json", remote_json)
@@ -1136,7 +1158,7 @@ def test_remote_watcher_reads_authoritative_host_without_credentials(tmp_path, m
     handoff_watcher.poll(
         state_path,
         registry_path=registry,
-        notifier=lambda value, coverage: calls.append(dict(coverage)),
+        notifier=lambda value, coverage, urgency: calls.append(dict(coverage)),
     )
 
     assert calls == [{"remote-run": 1}]
@@ -1165,7 +1187,7 @@ def test_deferred_input_doorbell_retries_on_the_very_next_poll(tmp_path):
     now = datetime.datetime(2026, 7, 21, tzinfo=datetime.timezone.utc)
     attempts = []
 
-    def deferring(value, coverage):
+    def deferring(value, coverage, urgency):
         attempts.append(dict(coverage))
         return f"cmux_notify+{handoff_watcher.DEFERRED_INPUT}"
 
@@ -1192,7 +1214,7 @@ def test_deferred_input_doorbell_retries_on_the_very_next_poll(tmp_path):
     # Once the composer clears the typed doorbell lands and is recorded.
     handoff_watcher.poll(
         state_path, registry_path=registry,
-        notifier=lambda value, coverage: "cmux_input+cmux_notify",
+        notifier=lambda value, coverage, urgency: "cmux_input+cmux_notify",
         now=now + datetime.timedelta(seconds=2),
     )
     state = handoff_watcher.read(state_path)["runs"][run_id]
@@ -1203,7 +1225,7 @@ def test_deferred_input_doorbell_retries_on_the_very_next_poll(tmp_path):
     # And a delivered doorbell resumes normal backoff instead of re-ringing.
     handoff_watcher.poll(
         state_path, registry_path=registry,
-        notifier=lambda value, coverage: pytest.fail("must back off after delivery"),
+        notifier=lambda value, coverage, urgency: pytest.fail("must back off after delivery"),
         now=now + datetime.timedelta(seconds=3),
     )
 
@@ -1236,7 +1258,7 @@ def test_cmux_doorbell_defers_typed_channel_while_the_human_types(monkeypatch):
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     # The banner still reaches the human; only the composer is left alone.
     assert method == f"{handoff_watcher.DEFERRED_INPUT}+cmux_notify"
@@ -1272,7 +1294,7 @@ def test_cmux_doorbell_forces_a_parked_draft_with_the_recovery_warning(monkeypat
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert typed == [True]
     assert method == "cmux_input_forced+cmux_notify"
@@ -1307,7 +1329,7 @@ def test_unreadable_composer_guard_keeps_sending_the_doorbell(monkeypatch):
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert typed == [False]
     assert method == "cmux_input+cmux_notify"
@@ -1347,7 +1369,399 @@ def test_deferral_does_not_stand_in_for_a_failed_visible_alert(monkeypatch):
         "transport": "cmux",
         "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
         "owner_process": {"pid": os.getpid(), "started_at": "test"},
-    }, {"run-secret": 9})
+    }, {"run-secret": 9}, "active")
 
     assert banners == ["Handoff orchestrator pending"]
     assert method == f"{handoff_watcher.DEFERRED_INPUT}+macos_notification"
+
+
+def test_awaiting_review_types_once_per_event_cycle_then_passive(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
+    )
+    awaiting_review(run, "result body")
+    run_id = run["run"]["run_id"]
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    for seconds in (0, 31, 91):
+        handoff_watcher.poll(
+            state_path,
+            registry_path=registry,
+            notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
+            now=now + datetime.timedelta(seconds=seconds),
+        )
+
+    # The first ring of an event-cycle is typed; every backoff re-ring for the
+    # same events is a passive alert, never another composer prompt.
+    assert calls == [
+        ({run_id: 1}, "active"),
+        ({run_id: 1}, "passive"),
+        ({run_id: 1}, "passive"),
+    ]
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert state["doorbell_through"] == 1
+    assert state["observed_through"] == 1
+    assert state["doorbell_attempts"] == 3
+
+
+def test_blocked_rering_backs_off_exponentially_and_resets_on_new_events(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
+    )
+    blocked(run)
+    run_id = run["run"]["run_id"]
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    def poll_at(seconds):
+        handoff_watcher.poll(
+            state_path,
+            registry_path=registry,
+            notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
+            now=now + datetime.timedelta(seconds=seconds),
+        )
+
+    # 30 -> 60 -> 120 -> 240 -> capped 300: each gap must elapse before the
+    # next ring, and a poll one second early must not ring.
+    poll_at(0)
+    assert len(calls) == 1
+    poll_at(29)
+    assert len(calls) == 1
+    poll_at(30)
+    assert len(calls) == 2
+    poll_at(89)
+    assert len(calls) == 2
+    poll_at(90)
+    assert len(calls) == 3
+    poll_at(209)
+    assert len(calls) == 3
+    poll_at(210)
+    assert len(calls) == 4
+    poll_at(449)
+    assert len(calls) == 4
+    poll_at(450)
+    assert len(calls) == 5
+    poll_at(749)
+    assert len(calls) == 5
+    poll_at(750)
+    assert len(calls) == 6
+    assert calls == [({run_id: 1}, "active")] * 6
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert state["doorbell_attempts"] == 6
+
+    # A strictly newer event restarts the schedule from the base interval.
+    handoff.emit(
+        Path(run["run_dir"]),
+        run["worker"],
+        type="question",
+        body="Additional context for the same decision.",
+        data={
+            "blocking": False,
+            "stage": "implementation",
+            "current_activity": "Still awaiting orchestrator direction",
+            "inbox_cursor": 0,
+            "commitments": [],
+        },
+    )
+    poll_at(751)
+    assert calls[-1] == ({run_id: 2}, "active")
+    state = handoff_watcher.read(state_path)["runs"][run_id]
+    assert state["doorbell_attempts"] == 1
+    poll_at(780)
+    assert len(calls) == 7
+    poll_at(781)
+    assert len(calls) == 8
+
+
+def test_mixed_urgency_merges_into_one_active_call(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = orchestrator_state(tmp_path)
+    blocked_run = registered_run(
+        tmp_path, registry, name="blocked", orchestrator_id=owner["orchestrator_id"],
+    )
+    review_run = registered_run(
+        tmp_path, registry, name="review", orchestrator_id=owner["orchestrator_id"],
+    )
+    blocked(blocked_run)
+    awaiting_review(review_run, "review body")
+    blocked_id = blocked_run["run"]["run_id"]
+    review_id = review_run["run"]["run_id"]
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    for seconds in (0, 31):
+        handoff_watcher.poll(
+            state_path,
+            registry_path=registry,
+            notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
+            now=now + datetime.timedelta(seconds=seconds),
+        )
+
+    # The second poll's review re-ring would be passive on its own, but one
+    # active covered run makes the whole coalesced call active.
+    assert calls == [
+        ({blocked_id: 1, review_id: 1}, "active"),
+        ({blocked_id: 1, review_id: 1}, "active"),
+    ]
+
+
+def test_watch_forwards_retry_seconds_to_poll(tmp_path, monkeypatch):
+    state_path, _ = orchestrator_state(tmp_path)
+    statuses = iter(("alive", "dead"))
+    polls = []
+    monkeypatch.setattr(handoff_watcher.time, "sleep", lambda interval: None)
+    monkeypatch.setattr(
+        handoff_watcher,
+        "poll",
+        lambda *args, **kwargs: polls.append(kwargs),
+    )
+
+    handoff_watcher.watch(
+        state_path,
+        interval=0.01,
+        notifier=lambda value, coverage, urgency: None,
+        owner_probe=lambda owner: next(statuses),
+        retry_seconds=123.0,
+    )
+
+    assert len(polls) == 1
+    assert polls[0]["retry_seconds"] == 123.0
+
+
+def test_concluded_run_stays_quiet_across_final_checkpoints(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
+    )
+    run_dir = Path(run["run_dir"])
+    result = awaiting_review(run)
+    handoff.control_consume(run_dir, run["orchestrator"], through=1)
+    handoff.send(
+        run_dir, run["orchestrator"], type="review",
+        data={"disposition": "accepted"},
+        reply_to=result["message"]["message_id"],
+    )
+    handoff.control_integrate(run_dir, run["orchestrator"], commit="deadbeef")
+    handoff.send(
+        run_dir, run["orchestrator"], type="stop",
+        data={"reason": "Result accepted and integrated; concluding run"},
+    )
+    worker_checkpoint(run, "worker succeeded", state="succeeded", inbox_cursor=3)
+    worker_checkpoint(run, "worker stopped", state="stopped", inbox_cursor=3)
+    run_id = run["run"]["run_id"]
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    for seconds in (0, 31, 62):
+        handoff_watcher.poll(
+            state_path,
+            registry_path=registry,
+            notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
+            now=now + datetime.timedelta(seconds=seconds),
+        )
+
+    # Zero rings across the whole post-decision tail, even though the final
+    # stopped checkpoint is never consumed.
+    assert calls == []
+    notification = handoff_watcher.read(state_path)["runs"][run_id]
+    assert notification["observed_through"] == 3
+    assert notification["dismissed_through"] == 3
+    assert notification["doorbell_pending"] is True
+
+    quiet = handoffctl._orchestrator_pending(state_path, full_context=False)
+    assert quiet["pending"] == []
+    assert [entry["run"]["run_id"] for entry in quiet["quiet"]] == [run_id]
+
+
+def test_concluded_run_with_fatal_tail_keeps_ringing(tmp_path):
+    registry = tmp_path / "registry.json"
+    state_path, owner = orchestrator_state(tmp_path)
+    run = registered_run(
+        tmp_path, registry, name="worker", orchestrator_id=owner["orchestrator_id"],
+    )
+    run_dir = Path(run["run_dir"])
+    awaiting_review(run, "result before the crash")
+    handoff.emit(
+        run_dir,
+        run["worker"],
+        type="error",
+        body="fatal test failure",
+        data={
+            "fatal": True,
+            "category": "test",
+            "stage": "implementation",
+            "inbox_cursor": 0,
+            "commitments": [],
+        },
+    )
+    handoff.send(
+        run_dir, run["orchestrator"], type="stop",
+        data={"reason": "Run died; shutting it down"},
+    )
+    run_id = run["run"]["run_id"]
+    calls = []
+    now = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+
+    for seconds in (0, 31):
+        handoff_watcher.poll(
+            state_path,
+            registry_path=registry,
+            notifier=lambda value, coverage, urgency: calls.append((dict(coverage), urgency)),
+            now=now + datetime.timedelta(seconds=seconds),
+        )
+
+    # A badly-dying run is exempt from auto-quiet: it rings on new events and
+    # keeps re-ringing on the backoff schedule instead of going silent.
+    assert calls == [
+        ({run_id: 2}, "active"),
+        ({run_id: 2}, "passive"),
+    ]
+    notification = handoff_watcher.read(state_path)["runs"][run_id]
+    assert notification["dismissed_through"] == 0
+
+
+def test_run_state_from_a_snapshot_without_doorbell_attempts(tmp_path):
+    state_path, _ = orchestrator_state(tmp_path)
+    value = handoff_watcher.read(state_path)
+    legacy = handoff_watcher._empty_run_state()  # noqa: SLF001 - state fixture
+    del legacy["doorbell_attempts"]
+    value["runs"] = {"run-1": legacy}
+    handoff_watcher._atomic_write(state_path, value)  # noqa: SLF001 - state fixture
+
+    assert handoff_watcher.read(state_path)["runs"]["run-1"] == legacy
+
+
+def test_cmux_passive_doorbell_skips_the_typed_channel(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    calls = []
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def composer_guard(self, handle):
+            pytest.fail("a passive doorbell must not probe the composer")
+
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
+            pytest.fail("a passive doorbell must never type input")
+
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
+            calls.append(("cmux_notify", handle, observed_id))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9}, "passive")
+
+    assert method == "cmux_notify"
+    assert calls == [("cmux_notify", "surface-uuid", orchestrator_id)]
+
+
+def test_cmux_passive_doorbell_falls_back_to_workspace_notification(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    calls = []
+
+    class Cmux:
+        def __init__(self, binary):
+            self.binary = binary
+            self.workspace = None
+
+        def orchestrator_doorbell_input(self, handle, observed_id, *, forced=False):
+            pytest.fail("a passive doorbell must never type input")
+
+        def orchestrator_doorbell(self, handle, observed_id, *, forced=False):
+            raise handoff_launcher.AdapterError("surface alert gone")
+
+        def notify(self, handle, *, title, body):
+            calls.append((self.workspace, handle, title, body))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "CmuxAdapter", Cmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "cmux",
+        "target": {"workspace": "workspace:9", "surface": "surface-uuid"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9}, "passive")
+
+    assert method == "cmux_notify_workspace"
+    assert calls == [(
+        "workspace:9", None, "Handoff orchestrator pending",
+        "Worker updates are ready for orchestrator review.",
+    )]
+
+
+def test_tmux_passive_doorbell_uses_macos_banner_without_typing(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    banners = []
+
+    class Tmux:
+        def __init__(self):
+            pytest.fail("a passive doorbell must never touch the terminal")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Tmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+    monkeypatch.setattr(
+        handoffctl,
+        "_notify_macos",
+        lambda title, body: banners.append((title, body)),
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "tmux",
+        "target": {"handle": "session:3.7"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9}, "passive")
+
+    assert method == "macos_notification"
+    assert banners == [(
+        "Handoff orchestrator pending",
+        "Worker updates are ready for orchestrator review.",
+    )]
+
+
+def test_tmux_passive_doorbell_macos_failure_is_best_effort(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+
+    class Tmux:
+        def __init__(self):
+            pytest.fail("a passive doorbell must never touch the terminal")
+
+    def fail_macos(title, body):
+        raise handoff_launcher.AdapterError("osascript unavailable")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Tmux)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+    monkeypatch.setattr(handoffctl, "_notify_macos", fail_macos)
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "tmux",
+        "target": {"handle": "session:3.7"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9}, "passive")
+
+    assert method == "macos_notification_failed"

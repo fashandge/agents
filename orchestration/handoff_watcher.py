@@ -21,11 +21,17 @@ from agents.orchestration import handoff_registry
 
 STATE_VERSION = 2
 DEFAULT_RETRY_SECONDS = 30.0
-DoorbellNotifier = Callable[[dict[str, Any], dict[str, int]], str | None]
+DOORBELL_RETRY_CAP_SECONDS = 300.0
+DoorbellNotifier = Callable[[dict[str, Any], dict[str, int], str], str | None]
 # A method label containing this marker means the typed channel was withheld
 # because the human was editing a prompt in the orchestrator's own composer.
 DEFERRED_INPUT = "deferred_input"
 """Delivers one coalesced doorbell; returns the channel(s) that accepted it.
+
+The third argument is the doorbell's *urgency*: ``"active"`` means the run
+needs the orchestrator now and the notifier may type into its composer;
+``"passive"`` means the run is only being re-reminded, so the notifier must
+restrict itself to alert channels and never type input.
 
 The returned label (for example ``terminal_input``, a ``+``-joined multi-
 channel result such as ``cmux_input+cmux_notify``, or a fallback such as
@@ -139,10 +145,13 @@ def _run_state(value: Any) -> dict[str, Any]:
         "last_doorbell_at", "control_through", "doorbell_after_cursor",
         "last_doorbell_error",
     }
-    # ``last_doorbell_method``, ``acknowledged_through``, and
-    # ``dismissed_through`` are optional so snapshots written before those
-    # fields existed remain readable.
-    optional = {"last_doorbell_method", "acknowledged_through", "dismissed_through"}
+    # ``last_doorbell_method``, ``acknowledged_through``,
+    # ``dismissed_through``, and ``doorbell_attempts`` are optional so
+    # snapshots written before those fields existed remain readable.
+    optional = {
+        "last_doorbell_method", "acknowledged_through", "dismissed_through",
+        "doorbell_attempts",
+    }
     if not isinstance(value, dict) or not required <= set(value) <= required | optional:
         raise handoff.HandoffError("invalid orchestrator run notification state", 5)
     for field in (
@@ -158,6 +167,9 @@ def _run_state(value: Any) -> dict[str, Any]:
     dismissed = value.get("dismissed_through", 0)
     if isinstance(dismissed, bool) or not isinstance(dismissed, int) or dismissed < 0:
         raise handoff.HandoffError("orchestrator run dismissed_through must be non-negative", 5)
+    attempts = value.get("doorbell_attempts", 0)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        raise handoff.HandoffError("orchestrator run doorbell_attempts must be non-negative", 5)
     if value["doorbell_through"] > value["observed_through"]:
         raise handoff.HandoffError("doorbell cursor exceeds observed cursor", 5)
     if not isinstance(value["doorbell_pending"], bool):
@@ -366,6 +378,7 @@ def _empty_run_state() -> dict[str, Any]:
         "last_doorbell_method": None,
         "acknowledged_through": 0,
         "dismissed_through": 0,
+        "doorbell_attempts": 0,
     }
 
 
@@ -487,7 +500,14 @@ def _retry_due(run_state: dict[str, Any], now: datetime.datetime, retry_seconds:
     last = run_state["last_doorbell_at"]
     if last is None:
         return True
-    return (now - handoff._parse_time(last)).total_seconds() >= retry_seconds  # noqa: SLF001
+    # Each delivered doorbell in the same event-cycle doubles the wait, so a
+    # run the orchestrator is deliberately ignoring backs off instead of
+    # re-ringing every interval.  The schedule restarts on the next cycle.
+    interval = min(
+        retry_seconds * 2 ** max(run_state.get("doorbell_attempts", 0) - 1, 0),
+        DOORBELL_RETRY_CAP_SECONDS,
+    )
+    return (now - handoff._parse_time(last)).total_seconds() >= interval  # noqa: SLF001
 
 
 def poll(
@@ -534,6 +554,26 @@ def poll(
             run_state["observed_through"] = tail
             run_state["control_through"] = control["outbox_cursor"]
             run_state["doorbell_pending"] = tail > control["outbox_cursor"]
+            if run_state["observed_through"] > run_state["doorbell_through"]:
+                # A new event-cycle restarts the backoff schedule.
+                run_state["doorbell_attempts"] = 0
+            concluded = (
+                control["integration"]["state"] != "pending"
+                or control["desired_state"] == "stop"
+            )
+            fatal_tail = status["state"] == "failed" or any(
+                event["type"] == "error" and event["data"].get("fatal")
+                for event in events
+            )
+            if concluded and not fatal_tail:
+                # Keyed on the orchestrator's own decision, not worker state:
+                # once a run is concluded its remaining tail — including the
+                # final "stopped" checkpoint, which arrives after the worker
+                # exits and can never be consumed — goes durably quiet.  A
+                # badly-dying run is exempt and keeps ringing.
+                run_state["dismissed_through"] = max(
+                    run_state.get("dismissed_through", 0), tail,
+                )
             if events and events[-1]["seq"] != tail:
                 raise handoff.HandoffError("worker outbox observation is not contiguous", 5)
             observations[run_id] = (status, events)
@@ -547,6 +587,7 @@ def poll(
         _atomic_write(path, value)
 
     coverage: dict[str, int] = {}
+    active_runs: set[str] = set()
     for run_id, run_state in value["runs"].items():
         if run_id not in owned_ids or not run_state["doorbell_pending"]:
             continue
@@ -578,26 +619,41 @@ def poll(
             # on every interval — even when the orchestrator has no lease to
             # consume with and has already acted on the event.
             continue
+        # Urgency decides whether the notifier may type into the orchestrator
+        # composer.  Typed input happens at most once per event-cycle: new
+        # events are active, while re-reminders for the same events downgrade
+        # to alert-only passive rings on a backoff schedule.  A blocked worker
+        # stays active until answered — it cannot advance without input.
         if blocking:
             should_ring = new_events or _retry_due(run_state, current_time, retry_seconds)
+            urgency = "active"
         elif error_while_working:
             # A nonfatal error observed while the worker remains active is
             # actionable, but it does not become a retrying notification.
             should_ring = True
+            urgency = "active"
         else:
             should_ring = (
                 new_events
                 or partial_consumption
                 or _retry_due(run_state, current_time, retry_seconds)
             )
+            # A moving control cursor means an orchestrator is (or was just)
+            # working the run — exactly when typed input is most disruptive —
+            # so partial consumption is only a passive nudge in case that
+            # orchestrator died mid-consume.
+            urgency = "active" if new_events else "passive"
         if should_ring:
             coverage[run_id] = run_state["observed_through"]
+            if urgency == "active":
+                active_runs.add(run_id)
 
     if coverage:
         notification_error: str | None = None
         delivered_method: str | None = None
+        urgency = "active" if active_runs else "passive"
         try:
-            delivered_method = notifier(value, coverage)
+            delivered_method = notifier(value, coverage, urgency)
         except Exception as exc:  # Push failure never changes protocol truth.
             notification_error = str(exc)
             errors.append({"run_id": ",".join(sorted(coverage)), "error": notification_error})
@@ -617,6 +673,7 @@ def poll(
                 run_state["doorbell_through"] = through
                 run_state["last_doorbell_at"] = attempted_at
                 run_state["doorbell_after_cursor"] = run_state["control_through"]
+                run_state["doorbell_attempts"] = run_state.get("doorbell_attempts", 0) + 1
             run_state["last_doorbell_error"] = notification_error
             run_state["last_doorbell_method"] = (
                 delivered_method if notification_error is None else None
@@ -638,7 +695,7 @@ def poll(
 
 def watch(
     path: Path, *, interval: float = 5.0, notifier: DoorbellNotifier,
-    registry_path: Path | None = None,
+    registry_path: Path | None = None, retry_seconds: float = DEFAULT_RETRY_SECONDS,
     owner_probe: OwnerProcessProbe = owner_process_status,
     on_poll: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
@@ -652,7 +709,10 @@ def watch(
             if status == "dead":
                 return
             if status == "alive":
-                result = poll(path, registry_path=registry_path, notifier=notifier)
+                result = poll(
+                    path, registry_path=registry_path, notifier=notifier,
+                    retry_seconds=retry_seconds,
+                )
                 if on_poll is not None:
                     on_poll(result)
             # Unknown liveness deliberately suppresses doorbells: a transient

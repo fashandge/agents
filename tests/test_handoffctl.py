@@ -572,7 +572,7 @@ def test_cli_orchestrator_dismiss_resolves_registered_run_and_writes_cursor(
     )
     handoff_watcher.poll(
         state,
-        notifier=lambda value, coverage: pytest.fail("working progress must not ring"),
+        notifier=lambda value, coverage, urgency: pytest.fail("working progress must not ring"),
     )
 
     dismissed = run_cli(
@@ -704,6 +704,7 @@ def test_cmux_orchestrator_start_hosts_watcher_in_dedicated_surface(tmp_path, mo
             "command": "exec " + shlex.join([
                 sys.executable, "-m", "agents.orchestration.handoffctl",
                 "watch", "--orchestrator-state", str(state), "--interval", "0.05",
+                "--retry-seconds", "30.0",
             ]),
             "workspace": hosting,
         }]
@@ -1094,3 +1095,355 @@ def test_cli_runs_forget_is_the_escape_hatch_for_a_corrupt_record(tmp_path, monk
     assert handoffctl.main(["runs", "list"]) == 0
     listed = json.loads(capsys.readouterr().out)
     assert [item["run_id"] for item in listed] == [run["run"]["run_id"]]
+
+
+def _emit_result(run, body="weather done"):
+    return handoff.emit(
+        Path(run["run_dir"]), run["worker"], type="result", body=body,
+        data={
+            "head": None, "dirty": False, "stage": "complete", "inbox_cursor": 0,
+            "verification": [], "commitments": [],
+        },
+    )
+
+
+def test_conclude_accepts_integrates_stops_and_releases(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    result = _emit_result(run)
+    handoff.control_release(run_dir, run["orchestrator"])
+    doorbells = []
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            doorbells.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    concluded = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit="deadbeef", no_integrate=False, reason="looks good",
+    )
+
+    assert concluded["takeover"]["type"] == "orchestrator-takeover"
+    assert concluded["disposition"] == "accepted"
+    assert concluded["consumed_through"] == 1
+    assert concluded["review"]["type"] == "review"
+    assert concluded["review"]["reply_to"] == result["message"]["message_id"]
+    assert concluded["review"]["data"] == {"disposition": "accepted"}
+    assert concluded["integration"]["data"] == {
+        "state": "integrated", "commit": "deadbeef", "reason": None,
+    }
+    assert concluded["integration_skipped"] is False
+    assert concluded["stop"]["type"] == "stop"
+    assert concluded["stop"]["data"] == {"reason": "looks good"}
+    assert concluded["stop_already_requested"] is False
+    assert concluded["doorbell_sent"] is True
+    assert concluded["doorbell_error"] is None
+    assert concluded["orchestrator_released"] is True
+    # Exactly one doorbell covers review -> integration -> stop.
+    assert doorbells == [(
+        "weather-worker", run["run"]["run_id"], concluded["stop"]["seq"],
+    )]
+    assert not list(run["private"].glob("orchestrator-conclude-*.token"))
+    control = handoff.control_show(run_dir)
+    assert handoff._parse_time(control["orchestrator_lease_expires_at"]) <= handoff._now()
+    # The worker drains its inbox in order and projects succeeded, then stopped.
+    succeeded = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="done",
+        data={
+            "state": "succeeded", "stage": "complete", "current_activity": "done",
+            "inbox_cursor": concluded["stop"]["seq"], "commitments": [],
+        },
+    )
+    assert succeeded["status"]["state"] == "succeeded"
+    stopped = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="stopped",
+        data={
+            "state": "stopped", "stage": "complete", "current_activity": "stopped",
+            "inbox_cursor": concluded["stop"]["seq"], "commitments": [],
+        },
+    )
+    assert stopped["status"]["state"] == "stopped"
+
+
+def test_conclude_skips_integration_when_result_has_no_head(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    _emit_result(run)
+    handoff.control_release(run_dir, run["orchestrator"])
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            pass
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    concluded = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit=None, no_integrate=False, reason="no commit to record",
+    )
+
+    assert concluded["review"]["type"] == "review"
+    assert concluded["integration"] is None
+    assert concluded["integration_skipped"] is True
+    assert concluded["stop"]["type"] == "stop"
+    assert concluded["doorbell_sent"] is True
+    control = handoff.control_show(run_dir)
+    assert control["integration"]["state"] == "pending"
+    assert control["desired_state"] == "stop"
+
+
+def test_conclude_changes_requested_resumes_worker(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    result = _emit_result(run)
+    handoff.control_release(run_dir, run["orchestrator"])
+    doorbells = []
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            doorbells.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    concluded = handoffctl._conclude_registered(
+        "weather", disposition="changes_requested", body="please redo the fetch",
+        commit=None, no_integrate=False,
+        reason="Result accepted and integrated; concluding run",
+    )
+
+    assert concluded["review"]["type"] == "review"
+    assert concluded["review"]["reply_to"] == result["message"]["message_id"]
+    assert concluded["review"]["data"] == {"disposition": "changes_requested"}
+    assert concluded["review"]["body"] == "please redo the fetch"
+    assert concluded["integration"] is None
+    assert concluded["integration_skipped"] is False
+    assert concluded["stop"] is None
+    assert concluded["doorbell_sent"] is True
+    assert doorbells == [(
+        "weather-worker", run["run"]["run_id"], concluded["review"]["seq"],
+    )]
+    control = handoff.control_show(run_dir)
+    assert control["review_state"] == "changes_requested"
+    assert control["integration"]["state"] == "pending"
+    assert control["desired_state"] == "run"
+    # The worker resumes against the changes-requested review.
+    resumed = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="reworking",
+        data={
+            "state": "working", "stage": "complete", "current_activity": "redoing",
+            "inbox_cursor": concluded["review"]["seq"], "commitments": [],
+        },
+    )
+    assert resumed["status"]["state"] == "working"
+
+
+def test_conclude_validates_flag_combinations(tmp_path, monkeypatch, capsys):
+    registered_run(tmp_path, monkeypatch)
+    body = tmp_path / "review.md"
+    body.write_text("redo it", encoding="utf-8")
+
+    missing_body = handoffctl.main(
+        ["conclude", "--run", "weather", "--disposition", "changes-requested"],
+    )
+    assert missing_body == 2
+    assert "--body-file" in capsys.readouterr().err
+
+    with_commit = handoffctl.main([
+        "conclude", "--run", "weather", "--disposition", "changes-requested",
+        "--body-file", str(body), "--commit", "deadbeef",
+    ])
+    assert with_commit == 2
+    assert "--disposition accepted" in capsys.readouterr().err
+
+    with_no_integrate = handoffctl.main([
+        "conclude", "--run", "weather", "--disposition", "changes-requested",
+        "--body-file", str(body), "--no-integrate",
+    ])
+    assert with_no_integrate == 2
+    assert "--disposition accepted" in capsys.readouterr().err
+
+
+def test_conclude_refuses_an_active_orchestrator_lease(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    _emit_result(run)
+
+    with pytest.raises(handoff.HandoffError, match="lease is active"):
+        handoffctl._conclude_registered(
+            "weather", disposition="accepted", body=None,
+            commit=None, no_integrate=False, reason="too early",
+        )
+
+    assert not list(run["private"].glob("orchestrator-conclude-*.token"))
+
+
+def test_failed_conclude_releases_ephemeral_orchestrator(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    _emit_result(run)
+    handoff.control_release(run_dir, run["orchestrator"])
+
+    def explode(run_dir, token, *, commit):
+        raise handoff.HandoffError("integration exploded", 6)
+
+    monkeypatch.setattr(handoffctl.handoff, "control_integrate", explode)
+
+    with pytest.raises(handoff.HandoffError, match="integration exploded"):
+        handoffctl._conclude_registered(
+            "weather", disposition="accepted", body=None,
+            commit="deadbeef", no_integrate=False, reason="looks good",
+        )
+
+    control = handoff.control_show(run_dir)
+    assert handoff._parse_time(control["orchestrator_lease_expires_at"]) <= handoff._now()
+    assert not list(run["private"].glob("orchestrator-conclude-*.token"))
+
+
+def test_conclude_resumes_after_mid_sequence_crash(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    result = _emit_result(run)
+    handoff.control_consume(run_dir, run["orchestrator"], through=1)
+    review = handoff.send(
+        run_dir, run["orchestrator"], type="review",
+        reply_to=result["message"]["message_id"],
+        data={"disposition": "accepted"},
+    )
+    handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="done",
+        data={
+            "state": "succeeded", "stage": "complete", "current_activity": "done",
+            "inbox_cursor": review["message"]["seq"], "commitments": [],
+        },
+    )
+    # The previous conclude crashed after the review: lease released, review
+    # accepted, integration still pending.
+    handoff.control_release(run_dir, run["orchestrator"])
+    doorbells = []
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            doorbells.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    concluded = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit="deadbeef", no_integrate=False, reason="resuming conclude",
+    )
+
+    assert concluded["review"] is None
+    assert concluded["consumed_through"] == 1
+    assert concluded["integration"]["data"]["state"] == "integrated"
+    assert concluded["integration_skipped"] is False
+    assert concluded["stop"]["type"] == "stop"
+    assert concluded["doorbell_sent"] is True
+    assert concluded["orchestrator_released"] is True
+    assert doorbells == [(
+        "weather-worker", run["run"]["run_id"], concluded["stop"]["seq"],
+    )]
+    assert not list(run["private"].glob("orchestrator-conclude-*.token"))
+    stopped = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="stopped",
+        data={
+            "state": "stopped", "stage": "complete", "current_activity": "stopped",
+            "inbox_cursor": concluded["stop"]["seq"], "commitments": [],
+        },
+    )
+    assert stopped["status"]["state"] == "stopped"
+
+
+def test_remote_conclude_uses_one_structured_ssh_request(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))
+    handoff_registry.register(
+        run_id="remote-run", name="remote-weather", run_dir="/remote/run",
+        run_uri="ssh://oci-box/remote/run", host="oci-box",
+        remote_python="/remote/python", transport="ssh_tmux",
+        session_transport="tmux", handle="remote-worker", agent="claude",
+        model="opus", effort="low", credential_dir=None,
+    )
+    observed = {}
+
+    def fake_ssh(host, remote_argv, *, stdin, timeout):
+        observed.update(host=host, argv=remote_argv, stdin=stdin, timeout=timeout)
+        return subprocess.CompletedProcess(
+            remote_argv, 0,
+            stdout=json.dumps({"stop": {"seq": 4}, "doorbell_sent": True}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run_ssh", fake_ssh)
+
+    result = handoffctl._conclude_registered(
+        "remote-weather", disposition="changes_requested", body="redo it ; $(touch NOPE)",
+        commit=None, no_integrate=False, reason="smoke done",
+    )
+
+    assert result["doorbell_sent"] is True
+    assert observed["host"] == "oci-box"
+    argv = observed["argv"]
+    assert argv[0] == "/remote/python"
+    assert argv[1:3] == ["-m", "agents.orchestration.handoffctl"]
+    assert argv[3:6] == ["conclude", "--run", "remote-run"]
+    assert argv[argv.index("--disposition") + 1] == "changes-requested"
+    # The reason travels as one argv element; the body travels over stdin.
+    assert argv[argv.index("--reason") + 1] == "smoke done"
+    assert argv[argv.index("--body-file") + 1] == "-"
+    assert observed["stdin"] == "redo it ; $(touch NOPE)"
+    assert not (tmp_path / "NOPE").exists()
+
+
+def test_cli_retry_seconds_is_accepted_and_threaded(tmp_path):
+    state = tmp_path / "orchestrator" / "watcher.json"
+
+    watch_args = handoffctl.build_parser().parse_args([
+        "watch", "--orchestrator-state", str(state), "--retry-seconds", "45",
+    ])
+    assert watch_args.retry_seconds == 45.0
+
+    start_args = handoffctl.build_parser().parse_args([
+        "orchestrator", "start", "--state", str(state), "--retry-seconds", "45",
+    ])
+    assert start_args.retry_seconds == 45.0
+
+    command = handoffctl._surface_watcher_command(state, 5.0, 45.0)
+    assert shlex.split(command)[-2:] == ["--retry-seconds", "45.0"]
+
+    invalid = run_cli("watch", "--orchestrator-state", state, "--retry-seconds", "0")
+    assert invalid.returncode == 2
+    assert "--retry-seconds must be positive" in invalid.stderr
+
+
+def test_cmux_doorbell_omits_workspace_flag_when_unresolved(monkeypatch):
+    calls = []
+
+    class Completed:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        return Completed()
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "_run", fake_run)
+    record = {
+        "session_transport": "cmux",
+        "handle": "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+    }
+
+    sent, error = handoffctl._ring_doorbell(record, "run-1", 3)
+
+    assert sent is True
+    assert error is None
+    # _ring_doorbell builds a workspace-less adapter; the cmux CLI resolves the
+    # surface's workspace server-side, so no argv may pin --workspace.
+    assert calls
+    for argv in calls:
+        assert "--workspace" not in argv
+        assert "--surface" in argv
+    assert calls[0][1] == "send"
+    assert calls[1][1] == "send-key"
+    assert calls[2][1] == "read-screen"

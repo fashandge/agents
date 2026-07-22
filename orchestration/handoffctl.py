@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from agents import coding_agents_cli
 from agents.orchestration import handoff
@@ -28,6 +29,7 @@ ORCHESTRATOR_NOTIFICATION_TITLE = handoff_launcher.ORCHESTRATOR_DOORBELL_TITLE
 ORCHESTRATOR_NOTIFICATION_BODY = "Worker updates are ready for orchestrator review."
 DEFERRED_INPUT = handoff_watcher.DEFERRED_INPUT
 SURFACE_WATCHER_READY_TIMEOUT_SECONDS = 20.0
+CONCLUDE_STOP_REASON = "Result accepted and integrated; concluding run"
 WATCHER_MODES = ("auto", "detached", "surface")
 WATCHER_WORKSPACE_TITLE = "handoff-watchers"
 _UUID_RE = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
@@ -197,9 +199,21 @@ def _send_with_doorbell(args: argparse.Namespace) -> dict[str, Any]:
     return {**result, "doorbell_sent": doorbell_sent, "doorbell_error": doorbell_error}
 
 
-def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
+@contextlib.contextmanager
+def _ephemeral_orchestrator(
+    record: dict[str, Any], *, reason: str, token_prefix: str,
+) -> Iterator[tuple[Path, bytes, dict[str, Any]]]:
+    """Take over a released orchestrator lease for one registry operation.
+
+    Resolves the run's credentials from the registry record, takes over the
+    lease with a unique ephemeral token, and yields ``(run_dir, token,
+    takeover)``.  On exit the lease is released (best-effort on failure) and
+    the released token file is unlinked.
+    """
     if record["host"] is not None or record["credential_dir"] is None:
-        raise handoff.HandoffError("dispatch must execute on the run-owning host", 4)
+        raise handoff.HandoffError(
+            "registry one-shot commands must execute on the run-owning host", 4,
+        )
     run_dir = Path(record["run_dir"])
     credential_dir = Path(record["credential_dir"])
     recovery_file = credential_dir / "recovery.token"
@@ -213,25 +227,45 @@ def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
         raise handoff.HandoffError(
             "orchestrator lease is active; use the current managed orchestrator", 4,
         )
-    token_file = credential_dir / f"orchestrator-dispatch-{uuid.uuid4()}.token"
+    token_file = credential_dir / f"{token_prefix}-{uuid.uuid4()}.token"
     takeover = handoff.control_takeover(
-        run_dir, recovery, new_token_file=token_file,
-        reason="One-shot registry dispatch after released orchestrator lease",
+        run_dir, recovery, new_token_file=token_file, reason=reason,
     )
     token = token_file.read_bytes()
     released = False
     completed = False
-    sent: dict[str, Any] | None = None
-    superseded_result: str | None = None
-    answered_question: str | None = None
-    doorbell_sent = False
-    doorbell_error: str | None = None
     try:
+        yield run_dir, token, takeover
+        handoff.control_release(run_dir, token)
+        released = True
+        completed = True
+    finally:
+        if not completed and not released:
+            try:
+                handoff.control_release(run_dir, token)
+                released = True
+            except handoff.HandoffError:
+                pass
+        if released:
+            try:
+                token_file.unlink()
+            except OSError:
+                pass
+
+
+def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
+    with _ephemeral_orchestrator(
+        record,
+        reason="One-shot registry dispatch after released orchestrator lease",
+        token_prefix="orchestrator-dispatch",
+    ) as (run_dir, token, takeover):
         status = handoff.status(run_dir)
         if status["state"] in {"succeeded", "failed", "stopped"}:
             raise handoff.HandoffError(
                 f"worker state {status['state']} cannot accept a new instruction", 4,
             )
+        superseded_result: str | None = None
+        answered_question: str | None = None
         if status["state"] == "awaiting_review":
             outbox = handoff.read(run_dir, "outbox")
             handoff.control_consume(run_dir, token, through=len(outbox))
@@ -257,33 +291,16 @@ def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
         doorbell_sent, doorbell_error = _ring_doorbell(
             record, record["run_id"], sent["message"]["seq"],
         )
-        handoff.control_release(run_dir, token)
-        released = True
-        completed = True
-    finally:
-        if not completed and not released:
-            try:
-                handoff.control_release(run_dir, token)
-                released = True
-            except handoff.HandoffError:
-                pass
-        if released:
-            try:
-                token_file.unlink()
-            except OSError:
-                pass
-    if sent is None:
-        raise AssertionError("dispatch completed without a message")
-    return {
-        "run": handoff_registry.public(record),
-        "takeover": takeover["message"],
-        "message": sent["message"],
-        "superseded_result": superseded_result,
-        "answered_question": answered_question,
-        "doorbell_sent": doorbell_sent,
-        "doorbell_error": doorbell_error,
-        "orchestrator_released": released,
-    }
+        return {
+            "run": handoff_registry.public(record),
+            "takeover": takeover["message"],
+            "message": sent["message"],
+            "superseded_result": superseded_result,
+            "answered_question": answered_question,
+            "doorbell_sent": doorbell_sent,
+            "doorbell_error": doorbell_error,
+            "orchestrator_released": True,
+        }
 
 
 def _dispatch_registered(
@@ -296,6 +313,135 @@ def _dispatch_registered(
     result = _remote_json(record, argv, stdin=body)
     if not isinstance(result, dict):
         raise handoff.HandoffError("remote dispatch returned invalid data", 6)
+    return result
+
+
+def _conclude_local(
+    record: dict[str, Any], *, disposition: str, body: str | None,
+    commit: str | None, no_integrate: bool, reason: str,
+) -> dict[str, Any]:
+    with _ephemeral_orchestrator(
+        record,
+        reason="One-shot registry conclude after released orchestrator lease",
+        token_prefix="orchestrator-conclude",
+    ) as (run_dir, token, takeover):
+        status = handoff.status(run_dir)
+        control = handoff.control_show(run_dir)
+        resumable = (
+            status["state"] == "succeeded"
+            and control["review_state"] == "accepted"
+            and control["integration"]["state"] == "pending"
+        )
+        if status["state"] != "awaiting_review" and not resumable:
+            raise handoff.HandoffError(
+                f"worker state {status['state']} cannot be concluded; "
+                "use dispatch to steer an active run or control abandon to discard it",
+                4,
+            )
+        if resumable and disposition != "accepted":
+            raise handoff.HandoffError(
+                "changes requested after worker success require worker rotation or a new run",
+                4,
+            )
+        outbox = handoff.read(run_dir, "outbox")
+        review_message: dict[str, Any] | None = None
+        integration_message: dict[str, Any] | None = None
+        integration_skipped = False
+        stop_message: dict[str, Any] | None = None
+        stop_already_requested = False
+        last_seq: int | None = None
+        if resumable:
+            # A previous conclude sent the accepted review but never reached
+            # the integration record; resume with integrate + stop only.
+            consumed_through = control["outbox_cursor"]
+            result_id = control["review_result_id"]
+        else:
+            handoff.control_consume(run_dir, token, through=len(outbox))
+            consumed_through = len(outbox)
+            result_id = handoff.control_show(run_dir)["review_result_id"]
+            if result_id is None:
+                raise handoff.HandoffError("awaiting_review run has no current result", 5)
+            review = handoff.send(
+                run_dir, token, type="review",
+                body=body or "",
+                data={"disposition": disposition},
+                reply_to=result_id,
+            )
+            review_message = review["message"]
+            last_seq = review["message"]["seq"]
+        if disposition != "changes_requested":
+            # A changes-requested review resumes the worker, so it stops here.
+            # The accepted path integrates (when a commit is known) and stops.
+            result_message = next(
+                (message for message in outbox if message["message_id"] == result_id),
+                None,
+            )
+            head = result_message["data"].get("head") if result_message is not None else None
+            effective_commit = commit or head
+            if no_integrate or effective_commit is None:
+                integration_skipped = True
+            else:
+                integration = handoff.control_integrate(
+                    run_dir, token, commit=effective_commit,
+                )
+                integration_message = integration["message"]
+                last_seq = integration["message"]["seq"]
+            if handoff.control_show(run_dir)["desired_state"] == "stop":
+                # A prior conclude (or the managed orchestrator) already
+                # requested stop; re-sending it would fail, so treat the
+                # existing request as idempotent success.
+                stop_already_requested = True
+            else:
+                stopped = handoff.send(run_dir, token, type="stop", data={"reason": reason})
+                stop_message = stopped["message"]
+                last_seq = stopped["message"]["seq"]
+        if last_seq is None:
+            last_seq = len(handoff.read(run_dir, "inbox"))
+        # One doorbell covers everything: the worker drains review,
+        # integration, and stop from its inbox in order.
+        doorbell_sent, doorbell_error = _ring_doorbell(
+            record, record["run_id"], last_seq,
+        )
+        return {
+            "run": handoff_registry.public(record),
+            "takeover": takeover["message"],
+            "disposition": disposition,
+            "consumed_through": consumed_through,
+            "review": review_message,
+            "integration": integration_message,
+            "integration_skipped": integration_skipped,
+            "stop": stop_message,
+            "stop_already_requested": stop_already_requested,
+            "doorbell_sent": doorbell_sent,
+            "doorbell_error": doorbell_error,
+            "orchestrator_released": True,
+        }
+
+
+def _conclude_registered(
+    selector: str, *, disposition: str, body: str | None,
+    commit: str | None, no_integrate: bool, reason: str,
+) -> dict[str, Any]:
+    record = handoff_registry.resolve(selector, private=True)
+    if record["host"] is None:
+        return _conclude_local(
+            record, disposition=disposition, body=body,
+            commit=commit, no_integrate=no_integrate, reason=reason,
+        )
+    argv = [
+        "conclude", "--run", record["run_id"],
+        "--disposition", disposition.replace("_", "-"),
+        "--reason", reason,
+    ]
+    if body is not None:
+        argv += ["--body-file", "-"]
+    if commit is not None:
+        argv += ["--commit", commit]
+    if no_integrate:
+        argv += ["--no-integrate"]
+    result = _remote_json(record, argv, stdin=body)
+    if not isinstance(result, dict):
+        raise handoff.HandoffError("remote conclude returned invalid data", 6)
     return result
 
 
@@ -390,7 +536,7 @@ def _composer_guard(adapter: Any, handle: str) -> str:
         return handoff_launcher.COMPOSER_CLEAR
 
 
-def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str:
+def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int], urgency: str) -> str:
     """Deliver one coalesced, opaque orchestrator doorbell.
 
     Returns a ``+``-joined label of every channel that accepted the attempt.
@@ -398,6 +544,12 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str
     zero subprocess exit; for ``cmux_input``, additionally a visible echo of
     the typed text); no channel reports back that the user actually saw the
     alert, and the watcher records it with exactly that meaning.
+
+    ``urgency`` is ``"active"`` or ``"passive"``.  An active doorbell may type
+    into the orchestrator's composer — the only channel that pushes a hosted
+    agent to read its pending outboxes.  A passive doorbell is a re-reminder
+    for already-rung events and must never type input: cmux keeps only the
+    visible-alert channels and tmux degrades to a best-effort macOS banner.
 
     A cmux doorbell attempts two complementary channels: typed input into the
     orchestrator surface, which is the only channel that pushes a hosted agent
@@ -413,6 +565,18 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str
     orchestrator_id = value["orchestrator_id"]
     target = value["target"]
     if value["transport"] == "tmux":
+        if urgency == "passive":
+            # A re-reminder must never type into the orchestrator's terminal.
+            # The banner is best-effort: its failure is reported in the label,
+            # not raised, so a quiet reminder cannot turn into an error storm.
+            try:
+                _notify_macos(
+                    ORCHESTRATOR_NOTIFICATION_TITLE,
+                    ORCHESTRATOR_NOTIFICATION_BODY,
+                )
+                return "macos_notification"
+            except handoff_launcher.AdapterError:
+                return "macos_notification_failed"
         tmux = handoff_launcher.TmuxAdapter()
         guard = _composer_guard(tmux, target["handle"])
         if guard == handoff_launcher.COMPOSER_BUSY:
@@ -427,25 +591,27 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int]) -> str
         adapter.workspace = target["workspace"]
         accepted: list[str] = []
         failures: list[str] = []
-        guard = _composer_guard(adapter, target["surface"])
-        if guard == handoff_launcher.COMPOSER_BUSY:
-            # The human is editing a prompt in this composer right now.  Skip
-            # the typed channel only; the visible alert below still fires, and
-            # the watcher retries the typed channel on its next poll.
-            accepted.append(DEFERRED_INPUT)
-        else:
-            forced = guard == handoff_launcher.COMPOSER_FORCED
-            try:
-                if adapter.orchestrator_doorbell_input(
-                    target["surface"], orchestrator_id, forced=forced,
-                ):
-                    accepted.append("cmux_input_forced" if forced else "cmux_input")
-                else:
-                    failures.append(
-                        "cmux input was accepted but never echoed on the surface",
-                    )
-            except handoff_launcher.AdapterError as input_error:
-                failures.append(f"cmux input failed ({input_error})")
+        if urgency != "passive":
+            guard = _composer_guard(adapter, target["surface"])
+            if guard == handoff_launcher.COMPOSER_BUSY:
+                # The human is editing a prompt in this composer right now.  Skip
+                # the typed channel only; the visible alert below still fires, and
+                # the watcher retries the typed channel on its next poll.
+                accepted.append(DEFERRED_INPUT)
+            else:
+                forced = guard == handoff_launcher.COMPOSER_FORCED
+                try:
+                    if adapter.orchestrator_doorbell_input(
+                        target["surface"], orchestrator_id, forced=forced,
+                    ):
+                        accepted.append("cmux_input_forced" if forced else "cmux_input")
+                    else:
+                        failures.append(
+                            "cmux input was accepted but never echoed on the surface",
+                        )
+                except handoff_launcher.AdapterError as input_error:
+                    failures.append(f"cmux input failed ({input_error})")
+        # A passive doorbell goes straight to the visible alert channels.
         try:
             adapter.orchestrator_doorbell(target["surface"], orchestrator_id)
             accepted.append("cmux_notify")
@@ -674,16 +840,18 @@ def _watcher_tab_name(
     return base
 
 
-def _surface_watcher_command(path: Path, interval: float) -> str:
+def _surface_watcher_command(path: Path, interval: float, retry_seconds: float) -> str:
     return "exec " + shlex.join([
         sys.executable, "-m", "agents.orchestration.handoffctl",
         "watch", "--orchestrator-state", str(path),
         "--interval", str(interval),
+        "--retry-seconds", str(retry_seconds),
     ])
 
 
 def _start_surface_watcher(
-    path: Path, value: dict[str, Any], interval: float, cmux_binary: str,
+    path: Path, value: dict[str, Any], interval: float, retry_seconds: float,
+    cmux_binary: str,
 ) -> dict[str, Any]:
     """Host the watcher in a new in-tree cmux terminal surface.
 
@@ -704,7 +872,7 @@ def _start_surface_watcher(
             value["orchestrator_id"],
         ),
         path.parent,
-        _surface_watcher_command(path, interval),
+        _surface_watcher_command(path, interval, retry_seconds),
         hosting_workspace,
     )
     surface_record = path.parent / "watcher-surface"
@@ -733,6 +901,7 @@ def _start_surface_watcher(
 
 def _start_orchestrator_watcher(
     path: Path, interval: float, *,
+    retry_seconds: float = handoff_watcher.DEFAULT_RETRY_SECONDS,
     mode: str = "auto", cmux_binary: str = handoff_launcher.CMUX_DEFAULT,
 ) -> dict[str, Any]:
     """Start or reuse one singleton watcher for an orchestrator state."""
@@ -768,7 +937,7 @@ def _start_orchestrator_watcher(
         surface_record.unlink(missing_ok=True)
 
         if mode == "surface":
-            return _start_surface_watcher(path, value, interval, cmux_binary)
+            return _start_surface_watcher(path, value, interval, retry_seconds, cmux_binary)
 
         def runner() -> coding_agents_cli.AgentResult:
             # ``run_detached`` forks without exec. Close the daemon's inherited
@@ -782,6 +951,7 @@ def _start_orchestrator_watcher(
                 path,
                 interval=interval,
                 notifier=_notify_orchestrator,
+                retry_seconds=retry_seconds,
             )
             return coding_agents_cli.AgentResult(
                 output="",
@@ -821,11 +991,20 @@ def _orchestrator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
         if record["orchestrator_id"] == value["orchestrator_id"]
     }
     pending: list[dict[str, Any]] = []
+    quiet: list[dict[str, Any]] = []
     acks: dict[str, int] = {}
     for run_id, notification in value["runs"].items():
         if not notification["doorbell_pending"] or run_id not in records:
             continue
         record = records[run_id]
+        if notification["observed_through"] <= notification.get("dismissed_through", 0):
+            # Auto-quieted (concluded) or manually dismissed: the run still
+            # has an unconsumed tail, but the watcher has gone silent on it.
+            quiet.append({
+                "run": handoff_registry.public(record),
+                "notification": dict(notification),
+            })
+            continue
         if full_context:
             detail = _context_registered(run_id)
             acks[run_id] = notification["observed_through"]
@@ -871,6 +1050,7 @@ def _orchestrator_pending(path: Path, *, full_context: bool) -> dict[str, Any]:
         "orchestrator_id": value["orchestrator_id"],
         "mode": "recovery" if full_context else "hot",
         "pending": pending,
+        "quiet": quiet,
     }
 
 
@@ -911,6 +1091,7 @@ def _watch(args: argparse.Namespace) -> int:
             args.orchestrator_state,
             interval=args.interval,
             notifier=_notify_orchestrator,
+            retry_seconds=args.retry_seconds,
             on_poll=_print_orchestrator_poll,
         )
         return 0
@@ -1057,6 +1238,10 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrator_start.add_argument("--state", required=True, type=_absolute)
     orchestrator_start.add_argument("--interval", type=float, default=5.0)
     orchestrator_start.add_argument(
+        "--retry-seconds", type=float, default=handoff_watcher.DEFAULT_RETRY_SECONDS,
+        help="base doorbell retry interval in seconds (grows exponentially, capped at 300)",
+    )
+    orchestrator_start.add_argument(
         "--mode", choices=WATCHER_MODES, default="auto",
         help="watcher hosting: auto picks surface for cmux orchestrators and detached otherwise",
     )
@@ -1085,12 +1270,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--body-file", required=True,
         help="UTF-8 instruction file, or - to read the instruction from stdin",
     )
+    conclude = commands.add_parser(
+        "conclude",
+        help="review, integrate, stop, ring the doorbell, and release in one operation",
+    )
+    conclude.add_argument("--run", required=True, help="registered run selector")
+    conclude.add_argument(
+        "--disposition", choices=("accepted", "changes-requested"), default="accepted",
+        help="review disposition (default: accepted)",
+    )
+    conclude.add_argument(
+        "--body-file",
+        help="UTF-8 review body file, or - to read from stdin; required for changes-requested",
+    )
+    conclude.add_argument(
+        "--commit",
+        help="integration commit; defaults to the latest result's recorded head",
+    )
+    conclude.add_argument(
+        "--no-integrate", action="store_true",
+        help="accepted path: skip the integration record",
+    )
+    conclude.add_argument(
+        "--reason", default=CONCLUDE_STOP_REASON,
+        help="stop reason for the accepted path",
+    )
     watch = commands.add_parser("watch", help="stream new outbox events from registered runs")
     watch.add_argument(
         "--run", action="append", default=[],
         help="registered run selector; repeat for multiple runs, omit for all",
     )
     watch.add_argument("--interval", type=float, default=5.0, help="poll interval in seconds")
+    watch.add_argument(
+        "--retry-seconds", type=float, default=handoff_watcher.DEFAULT_RETRY_SECONDS,
+        help="base doorbell retry interval in seconds (grows exponentially, capped at 300)",
+    )
     watch.add_argument(
         "--orchestrator-state", "--coordinator-state", dest="orchestrator_state",
         type=_absolute,
@@ -1186,8 +1400,11 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
         if args.orchestrator_command == "start":
             if args.interval <= 0:
                 raise handoff.HandoffError("--interval must be positive", 2)
+            if args.retry_seconds <= 0:
+                raise handoff.HandoffError("--retry-seconds must be positive", 2)
             return _start_orchestrator_watcher(
                 args.state, args.interval,
+                retry_seconds=args.retry_seconds,
                 mode=args.mode, cmux_binary=args.cmux_binary,
             )
         if args.orchestrator_command == "show": return handoff_watcher.read(args.state)
@@ -1198,6 +1415,22 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
     if args.command == "context": return _context_registered(args.run)
     if args.command == "dispatch":
         return _dispatch_registered(args.run, _read_text(args.body_file))
+    if args.command == "conclude":
+        disposition = args.disposition.replace("-", "_")
+        if disposition == "changes_requested":
+            if args.body_file is None:
+                raise handoff.HandoffError(
+                    "--disposition changes-requested requires --body-file", 2,
+                )
+            if args.commit is not None or args.no_integrate:
+                raise handoff.HandoffError(
+                    "--commit and --no-integrate require --disposition accepted", 2,
+                )
+        body = _read_text(args.body_file) if args.body_file is not None else None
+        return _conclude_registered(
+            args.run, disposition=disposition, body=body,
+            commit=args.commit, no_integrate=args.no_integrate, reason=args.reason,
+        )
     if args.command == "ready": return handoff.ready(args.run_dir, _token(args, "worker"))
     if args.command == "send": return _send_with_doorbell(args)
     if args.command == "emit":
@@ -1247,6 +1480,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "watch":
             if args.interval <= 0:
                 raise handoff.HandoffError("--interval must be positive", 2)
+            if args.retry_seconds <= 0:
+                raise handoff.HandoffError("--retry-seconds must be positive", 2)
             if args.timeout is not None and args.timeout < 0:
                 raise handoff.HandoffError("--timeout must be non-negative", 2)
             if args.orchestrator_state is not None and (

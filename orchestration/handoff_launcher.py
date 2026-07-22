@@ -438,23 +438,26 @@ class CmuxAdapter:
         self._type(handle, terminal_command)
         return handle
 
+    def _workspace_argv(self) -> list[str]:
+        # Without a resolved workspace the flag is omitted and the cmux CLI
+        # resolves the surface's workspace server-side from --surface alone.
+        return ["--workspace", self.workspace] if self.workspace else []
+
     def _type(self, handle: str, text: str) -> None:
-        if not self.workspace:
-            raise AdapterError("cmux workspace was not resolved before sending input")
-        _run([self.binary, "send", "--workspace", self.workspace, "--surface", handle, text])
-        _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
+        workspace = self._workspace_argv()
+        _run([self.binary, "send", *workspace, "--surface", handle, text])
+        _run([self.binary, "send-key", *workspace, "--surface", handle, "enter"])
 
     def _type_tui(self, handle: str, text: str, probe: str | None = None) -> None:
         # Same paste-coalescing hazard as TmuxAdapter._type_tui: settle before
         # the submit, then retry once if the text still sits in the composer.
-        if not self.workspace:
-            raise AdapterError("cmux workspace was not resolved before sending input")
-        _run([self.binary, "send", "--workspace", self.workspace, "--surface", handle, text])
+        workspace = self._workspace_argv()
+        _run([self.binary, "send", *workspace, "--surface", handle, text])
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
-        _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
+        _run([self.binary, "send-key", *workspace, "--surface", handle, "enter"])
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
         if _tui_submit_pending(self.capture(handle), probe or text):
-            _run([self.binary, "send-key", "--workspace", self.workspace, "--surface", handle, "enter"])
+            _run([self.binary, "send-key", *workspace, "--surface", handle, "enter"])
 
     def probe(self, handle: str, expected_agent: str) -> bool:
         surfaces = _run(
@@ -475,10 +478,8 @@ class CmuxAdapter:
         return handle.lower() in lowered and expected_agent.lower() in lowered
 
     def capture(self, handle: str) -> str:
-        if not self.workspace:
-            raise AdapterError("cmux workspace was not resolved before capturing output")
         return _run([
-            self.binary, "read-screen", "--workspace", self.workspace,
+            self.binary, "read-screen", *self._workspace_argv(),
             "--surface", handle, "--scrollback",
         ]).stdout
 
@@ -568,11 +569,11 @@ class CmuxAdapter:
 
     def notify(self, handle: str | None, *, title: str, body: str) -> None:
         """Raise a native cmux alert when terminal input is unavailable."""
-        if not self.workspace:
-            raise AdapterError("cmux workspace was not resolved before notifying")
+        if not self.workspace and handle is None:
+            raise AdapterError("cmux notify requires a workspace or a surface handle")
         command = [
             self.binary, "notify", "--title", title, "--body", body,
-            "--workspace", self.workspace,
+            *self._workspace_argv(),
         ]
         if handle is not None:
             command.extend(["--surface", handle])
