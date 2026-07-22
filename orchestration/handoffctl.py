@@ -1322,7 +1322,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-doorbell", action="store_true",
         help="append only; skip the best-effort terminal doorbell for a registered run",
     )
-    emit = commands.add_parser("emit"); _add_message(emit)
+    emit = commands.add_parser(
+        "emit", epilog=handoff.EMIT_DATA_SCHEMAS, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    _add_message(emit)
 
     control = commands.add_parser("control")
     controls = control.add_subparsers(dest="control_command", required=True)

@@ -466,10 +466,22 @@ def _validate_attachment(value: Any) -> None:
             _fail("attachment snapshot must be under attachments/")
 
 
+VERIFICATION_ITEM_SCHEMA = '{"command": str, "exit_code": int|null, "summary": str}'
+
+EMIT_DATA_SCHEMAS = f"""Data schemas for `emit --type <kind> --data-file data.json` (fields are exact — missing or unknown fields are rejected; cursors are non-negative integers):
+- checkpoint: {{"state": "working"|"succeeded"|"stopped", "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
+- question: {{"blocking": bool, "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
+- result: {{"head": str|null, "dirty": bool, "stage": str, "inbox_cursor": int, "verification": [{VERIFICATION_ITEM_SCHEMA}], "commitments": [str]}}
+- error: {{"fatal": bool, "category": str, "stage": str, "inbox_cursor": int, "commitments": [str]}} (non-empty body required)
+The body file carries the human-readable content (the answer, evidence, workspace state)."""
+
+
 def _validate_verification(value: Any) -> None:
     if not isinstance(value, list):
-        _fail("verification must be a list")
+        _fail(f"verification must be a list of {VERIFICATION_ITEM_SCHEMA} objects")
     for entry in value:
+        if not isinstance(entry, dict):
+            _fail(f"verification item must be an object {VERIFICATION_ITEM_SCHEMA}")
         entry = _fields(entry, {"command", "exit_code", "summary"}, "verification item")
         _string(entry["command"], "verification.command")
         _string(entry["summary"], "verification.summary")
@@ -697,6 +709,8 @@ def _standing_instructions() -> str:
 - Process inbox records in sequence and advance `inbox_cursor` only after the instruction and any durable reminder it creates are recorded.
 - Treat a `supersede` message tied to the current result as a new instruction that replaces the pending review; consume it, checkpoint back to `working`, and publish a fresh result when done.
 - Use `handoffctl emit` for checkpoints, questions, results, and errors. Checkpoints durably update `status.json` and `progress.md`.
+
+{EMIT_DATA_SCHEMAS}
 - Assume the orchestrator knows the kickoff but not your live progress. Every blocking question must be self-contained: state the current stage and completed work, concrete evidence, the exact conflict, the decision or authority needed, your recommended resolution, the consequences of the available options, and actions intentionally deferred. Do not rely on earlier checkpoints to supply this context.
 - End the turn after a blocking question. On completion publish an exact result and await review; report `succeeded` only after consuming an accepted review. After a successful result publication, `handoffctl` attempts a best-effort cmux notification for cmux-launched workers; the durable result remains authoritative if notification delivery fails.
 - A dirty Git workspace does not block work or result publication. Preserve unrelated pre-existing changes and report the current `HEAD` and dirty state truthfully in every result.
