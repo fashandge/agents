@@ -17,6 +17,7 @@ from typing import Any, Iterator
 
 from agents import coding_agents_cli
 from agents.orchestration import handoff
+from agents.orchestration import handoff_clean
 from agents.orchestration import handoff_launcher
 from agents.orchestration import handoff_registry
 from agents.orchestration import handoff_watcher
@@ -1170,40 +1171,42 @@ def build_parser() -> argparse.ArgumentParser:
     run_adopt = run_commands.add_parser("adopt", help="explicitly assign an unowned run")
     run_adopt.add_argument("--run", required=True, help="registered run selector")
     run_adopt.add_argument("--orchestrator-state", "--coordinator-state", dest="orchestrator_state", required=True, type=_absolute)
-    run_forget = run_commands.add_parser(
-        "forget", help="remove one terminal run's registry record (never the run itself, unless --delete-run-dir)",
+    run_clean = run_commands.add_parser(
+        "clean",
+        help="clean up finished runs: leftover sessions, registry records, optionally run dirs",
     )
-    run_forget.add_argument("--run", required=True, help="run ID, unique prefix, name, handle, or URI")
-    run_forget.add_argument(
-        "--force", action="store_true",
-        help="remove the record even when the run may still be live",
+    run_clean.add_argument(
+        "--run",
+        help="clean just this run (ID, unique prefix, name, handle, or URI); executes immediately",
     )
-    run_forget.add_argument(
-        "--delete-run-dir", action="store_true",
-        help="also delete the run directory (journals, status, control; never the credential directory)",
-    )
-    run_prune = run_commands.add_parser(
-        "prune", help="remove registry records for finished runs in bulk (never the runs themselves, unless --delete-run-dir)",
-    )
-    run_prune.add_argument(
+    run_clean.add_argument(
         "--older-than", type=float, metavar="DAYS",
-        help="only records registered more than DAYS ago",
+        help="bulk: only records registered more than DAYS ago",
     )
-    run_prune.add_argument(
-        "--terminal-only", action=argparse.BooleanOptionalAction, default=True,
-        help="skip records whose runs may still be live (default; --no-terminal-only overrides)",
+    run_clean.add_argument("--host", help="bulk: only records for this remote host")
+    clean_scope = run_clean.add_mutually_exclusive_group()
+    clean_scope.add_argument(
+        "--watcher-state", type=_absolute,
+        help="bulk: only workers of the orchestrator session in this watcher state file",
     )
-    run_prune.add_argument("--host", help="only records for this remote host")
-    run_prune.add_argument(
+    clean_scope.add_argument(
+        "--orchestrator",
+        help="bulk: only workers spawned by this orchestrator id",
+    )
+    run_clean.add_argument(
+        "--force", action="store_true",
+        help="clean runs not known to be terminal too (a live run's session is killed only with --force)",
+    )
+    run_clean.add_argument(
         "--delete-run-dir", action="store_true",
-        help="also delete each removed run's directory (never the credential directory)",
+        help="also delete each cleaned run's directory (journals, status, control; never the credential directory)",
     )
-    confirmation = run_prune.add_mutually_exclusive_group()
+    confirmation = run_clean.add_mutually_exclusive_group()
     confirmation.add_argument(
-        "--dry-run", action="store_true", help="print the removal plan and change nothing",
+        "--dry-run", action="store_true", help="bulk: print the cleanup plan and change nothing",
     )
     confirmation.add_argument(
-        "--yes", action="store_true", help="confirm a real prune",
+        "--yes", action="store_true", help="bulk: confirm a real cleanup",
     )
     run_commands.add_parser(
         "doctor", help="report per-record registry validity without failing the whole read",
@@ -1376,26 +1379,36 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
             return handoff_registry.public(handoff_registry.adopt(
                 record["run_id"], orchestrator["orchestrator_id"],
             ))
-        if args.runs_command == "forget":
-            result = handoff_registry.forget(
-                args.run, force=args.force, delete_run_dir=args.delete_run_dir,
-            )
-            if isinstance(result["removed"], dict):
-                result["removed"] = handoff_registry.public(result["removed"])
-            return result
-        if args.runs_command == "prune":
-            if not args.dry_run and not args.yes:
+        if args.runs_command == "clean":
+            if args.run is not None:
+                if args.dry_run or args.yes:
+                    raise handoff.HandoffError(
+                        "--dry-run/--yes apply only to bulk clean (without --run)", 2,
+                    )
+                if (
+                    args.older_than is not None or args.host is not None
+                    or args.watcher_state is not None or args.orchestrator is not None
+                ):
+                    raise handoff.HandoffError(
+                        "--run cannot be combined with bulk filters "
+                        "(--older-than/--host/--watcher-state/--orchestrator)",
+                        2,
+                    )
+            elif not args.dry_run and not args.yes:
                 raise handoff.HandoffError(
-                    "prune removes registry records; pass --yes to confirm or --dry-run to preview",
+                    "clean removes registry records and leftover worker sessions; "
+                    "pass --yes to confirm or --dry-run to preview",
                     2,
                 )
-            result = handoff_registry.prune(
-                older_than=args.older_than, terminal_only=args.terminal_only,
-                host=args.host, dry_run=args.dry_run, delete_run_dir=args.delete_run_dir,
+            orchestrator_id = args.orchestrator
+            if args.watcher_state is not None:
+                orchestrator_id = handoff_watcher.read(args.watcher_state)["orchestrator_id"]
+            return handoff_clean.clean(
+                selector=args.run, older_than=args.older_than, host=args.host,
+                orchestrator_id=orchestrator_id, force=args.force,
+                delete_run_dir=args.delete_run_dir,
+                dry_run=args.run is None and args.dry_run,
             )
-            for entry in result["removed"]:
-                entry["record"] = handoff_registry.public(entry["record"])
-            return result
         if args.runs_command == "doctor": return handoff_registry.validate_records()
     if args.command in {"orchestrator", "coordinator"}:  # "coordinator" is the hidden compat alias.
         if args.orchestrator_command == "register": return _register_orchestrator(args)

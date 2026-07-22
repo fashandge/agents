@@ -262,9 +262,12 @@ def _assess_terminal(record: dict[str, Any]) -> tuple[bool, str | None]:
 
     Returns ``(terminal, note)``.  ``note`` explains an inferred verdict: why
     a dangling pointer counts as terminal, or why liveness cannot be ruled
-    out.  Only a positively terminal status projection or a missing/unreadable
-    run directory counts as terminal; anything else is treated as possibly
-    live so a removal never silently orphans a running worker.
+    out.  A positively terminal status projection, an orchestrator-concluded
+    run (``control.json`` ``desired_state`` is ``"stop"`` — a concluded
+    worker stays resident and never emits its terminal checkpoint, so status
+    alone would never count it finished), or a missing/unreadable run
+    directory counts as terminal; anything else is treated as possibly live
+    so a removal never silently orphans a running worker.
     """
     if record["host"] is not None:
         return False, f"run is remote (host {record['host']!r}); liveness cannot be verified from this host"
@@ -277,6 +280,12 @@ def _assess_terminal(record: dict[str, Any]) -> tuple[bool, str | None]:
         return False, f"run status is unreadable ({exc}); the run may still be live"
     if state in TERMINAL_STATES:
         return True, None
+    try:
+        desired = handoff.control_show(run_dir)["desired_state"]
+    except handoff.HandoffError:
+        desired = None
+    if desired == "stop":
+        return True, "orchestrator concluded the run (desired_state is stop)"
     return False, f"worker state {state!r} is not terminal"
 
 
@@ -287,7 +296,7 @@ def _read_lenient_unlocked(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     error for every invalid record.  Top-level corruption — an unreadable
     file, a wrong shape, an unsupported version — remains fatal, exactly as
     on the strict read path; only individual records are tolerated, so
-    ``runs forget`` stays usable as the escape hatch when one bad record
+    ``runs clean --run`` stays usable as the escape hatch when one bad record
     breaks every strict registry read.
     """
     if not path.exists():
@@ -376,160 +385,12 @@ def _delete_run_dir(record: dict[str, Any], *, dry_run: bool = False) -> tuple[b
     return True, None
 
 
-def forget(
-    selector: str, *, path: Path | None = None, force: bool = False,
-    delete_run_dir: bool = False,
-) -> dict[str, Any]:
-    """Remove one registry record; by default never touches the run itself.
-
-    The run directory, journals, and credential files stay exactly where they
-    are — the run remains fully inspectable by absolute ``--run-dir`` — unless
-    ``delete_run_dir`` is given, which also removes the run directory (never
-    the separate credential directory) once the record passes the same
-    terminal check.  Refuses a run that is not known to be terminal unless
-    ``force`` is given: dropping the registry record of a live run orphans a
-    running worker.  The registry is read leniently so a corrupt record — the
-    reason this command exists — can be found and removed while every strict
-    read still fails.
-    """
-    if not isinstance(selector, str) or not selector:
-        raise handoff.HandoffError("run selector must be non-empty", 2)
-    registry_path = Path(path or default_path())
-    with _locked(registry_path, exclusive=True):
-        registry, invalid = _read_lenient_unlocked(registry_path)
-        key, record, error = _resolve_lenient(registry, invalid, selector)
-        if error is not None and not force and _is_pre_rename_record(record):
-            # Migration restores this record intact, so send the operator there
-            # rather than letting the escape hatch delete recoverable state.
-            handoff._pre_orchestrator_rename("coordinator_id", registry_path)  # noqa: SLF001
-        if error is not None:
-            # A corrupt record gets the same conservative liveness check its
-            # raw fields allow; without a usable run_dir there is nothing a
-            # live worker could still be reached through.
-            run_dir = record.get("run_dir") if isinstance(record, dict) else None
-            if isinstance(run_dir, str) and run_dir:
-                host = record.get("host")
-                terminal, note = _assess_terminal({
-                    "host": host if isinstance(host, str) else None,
-                    "run_dir": run_dir,
-                })
-            else:
-                terminal, note = True, "the record has no usable run_dir"
-            note = f"record is invalid ({error}); {note}"
-        else:
-            terminal, note = _assess_terminal(record)
-        if not terminal and not force:
-            raise handoff.HandoffError(
-                f"refusing to forget handoff run {key}: {note}; "
-                "use --force to remove the record anyway",
-                4,
-            )
-        deleted, delete_note = False, None
-        if delete_run_dir:
-            # Delete before dropping the record so a refusal leaves the run
-            # fully registered and retryable.
-            deleted, delete_note = _delete_run_dir(record if isinstance(record, dict) else {})
-        del registry["runs"][key]
-        _write_unlocked(registry_path, registry)
-    if not terminal:
-        note = f"removed with --force despite: {note}"
-    return {
-        "removed": record, "note": note,
-        "run_dir_deleted": deleted, "run_dir_note": delete_note,
-    }
-
-
-def prune(
-    *, path: Path | None = None, older_than: float | None = None,
-    terminal_only: bool = True, host: str | None = None, dry_run: bool = False,
-    delete_run_dir: bool = False,
-) -> dict[str, Any]:
-    """Remove registry records for finished runs in bulk; registry-only by default.
-
-    Filters select candidates by ``registered_at`` age (``older_than`` days)
-    and ``host``.  A candidate that is not known to be terminal is skipped
-    with its reason reported; ``terminal_only=False`` overrides that refusal
-    the way ``forget --force`` does for one record.  Invalid records are
-    never bulk-removed: they are reported as skipped so they can be removed
-    deliberately with ``runs forget``.  ``dry_run`` computes the same plan
-    under a shared lock and changes nothing.  With ``delete_run_dir`` each
-    removed run's directory is deleted as well (never the separate credential
-    directory); a run whose directory fails the deletion checks is skipped
-    with the reason and keeps its registry record.
-    """
-    if older_than is not None and older_than < 0:
-        raise handoff.HandoffError("--older-than must be non-negative", 2)
-    registry_path = Path(path or default_path())
-    with _locked(registry_path, exclusive=not dry_run):
-        registry, invalid = _read_lenient_unlocked(registry_path)
-        cutoff = None
-        if older_than is not None:
-            cutoff = handoff._now() - datetime.timedelta(days=older_than)  # noqa: SLF001 - same-package timestamp parser
-        removed: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        for key, error in invalid.items():
-            raw = registry["runs"][key]
-            if _is_pre_rename_record(raw):
-                reason = (
-                    "record predates the orchestrator rename; run "
-                    "scripts/migrate_handoff_state_orchestrator.py to restore it "
-                    "instead of removing it"
-                )
-            else:
-                reason = f"record is invalid ({error}); remove it deliberately with runs forget"
-            skipped.append({
-                "run_id": key,
-                "name": raw.get("name") if isinstance(raw, dict) else None,
-                "reason": reason,
-            })
-        valid = [record for key, record in registry["runs"].items() if key not in invalid]
-        for record in sorted(valid, key=lambda item: item["registered_at"]):
-            if host is not None and record["host"] != host:
-                continue
-            if cutoff is not None and handoff._parse_time(record["registered_at"]) >= cutoff:  # noqa: SLF001
-                continue
-            terminal, note = _assess_terminal(record)
-            if not terminal and terminal_only:
-                skipped.append({
-                    "run_id": record["run_id"], "name": record["name"], "reason": note,
-                })
-                continue
-            if not terminal:
-                note = f"not known to be terminal ({note}); included by --no-terminal-only"
-            removed.append({"record": dict(record), "note": note})
-        if removed and delete_run_dir:
-            planned = []
-            for entry in removed:
-                try:
-                    deleted, delete_note = _delete_run_dir(entry["record"], dry_run=dry_run)
-                except handoff.HandoffError as exc:
-                    if dry_run:
-                        entry["run_dir_deleted"] = False
-                        entry["run_dir_note"] = str(exc)
-                        planned.append(entry)
-                    else:
-                        skipped.append({
-                            "run_id": entry["record"]["run_id"],
-                            "name": entry["record"]["name"],
-                            "reason": str(exc),
-                        })
-                    continue
-                entry["run_dir_deleted"] = deleted
-                entry["run_dir_note"] = delete_note
-                planned.append(entry)
-            removed = planned
-        if removed and not dry_run:
-            for entry in removed:
-                del registry["runs"][entry["record"]["run_id"]]
-            _write_unlocked(registry_path, registry)
-    return {"dry_run": dry_run, "removed": removed, "skipped": skipped}
-
-
 def validate_records(*, path: Path | None = None) -> dict[str, Any]:
     """Report per-record validity instead of failing the whole read.
 
     Strict validation on the normal read paths is unchanged; this is the
-    diagnostic view that names the records ``runs forget`` can then remove.
+    diagnostic view that names the records ``runs clean --run`` can then
+    remove.
     """
     registry_path = Path(path or default_path())
     with _locked(registry_path, exclusive=False):
