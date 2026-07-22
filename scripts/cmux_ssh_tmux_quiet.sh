@@ -3,8 +3,13 @@
 # as a mirror workspace grouped directly under the calling workspace, with
 # minimal visual noise.
 #
-#   Path A (host already connected): per-session `cmux rpc remote.tmux.attach`
-#     revives/creates the mirror views with NO new window at all.
+#   Path A (host already connected): `cmux rpc remote.tmux.mirror` creates
+#     the mirror views in the CURRENT window (no new window), then the wanted
+#     sessions are placed and any fresh stray mirrors this call created are
+#     closed — closing a mirror workspace only detaches its control-mode
+#     client, the REMOTE tmux session survives (verified on cmux 0.64.20,
+#     2026-07-22). `remote.tmux.attach` is NOT used: since the attach/mirror
+#     split it is control-mode protocol only and never materializes a view.
 #   Path B (cold connection): `cmux ssh-tmux --no-focus`, then: move every
 #     mirrored workspace under the calling workspace. Only when the reported
 #     window is genuinely NEW (absent from a pre-call window snapshot and not
@@ -73,14 +78,18 @@ place() {
   anchor=$ws_uuid
 }
 
-# --- Path A: connection already up -> silent per-session RPC attach ---------
-# Per-session attach is the ONLY way to mirror just this run's workers: cmux
-# ssh-tmux (Path B) has no session filter and mirrors the WHOLE host, so every
-# stale session on the box becomes a stray workspace. A warm-connection attach
-# can ack before its workspace materializes; a single quick check then wrongly
-# falls back to the whole-host path (observed 2026-07-21, leaving strays). So
-# poll for each wanted view, re-issuing attach for the still-missing ones, and
-# fall back only after the full window genuinely fails to produce a view.
+# --- Path A: connection already up -> whole-host mirror + stray prune -------
+# cmux 0.64.20 split view creation out of remote.tmux.attach: attach acks
+# (`attached: true`) and receives control-mode events, but NEVER creates a
+# workspace (verified 2026-07-22: 33s wait, no view). View creation is
+# `remote.tmux.mirror` — whole-host with NO session filter (a `session`
+# param is silently ignored), but it places the views in the current window
+# instead of creating a new one, so none of Path B's window minimize/close
+# dance applies. Stray control: snapshot workspaces before the mirror and
+# close only the workspaces THIS call created that are not wanted — closing
+# a mirror workspace merely detaches its control-mode client (verified
+# 2026-07-22: remote session alive and unattached afterwards). Pre-existing
+# workspaces are never closed: another orchestrator may be viewing them.
 if sessions_json=$("$cmux_bin" rpc remote.tmux.sessions "{\"host\":\"$host\"}" 2>/dev/null); then
   typeset -a remote_sessions want
   remote_sessions=("${(@f)$(print -r -- "$sessions_json" | grep -oE '"name" *: *"[^"]+"' | sed -E 's/.*: *"([^"]+)"/\1/')}")
@@ -89,19 +98,17 @@ if sessions_json=$("$cmux_bin" rpc remote.tmux.sessions "{\"host\":\"$host\"}" 2
     wanted "$session" && want+=("$session")
   done
 
+  pre_ws=$("$cmux_bin" --id-format uuids list-workspaces 2>/dev/null | grep -oiE "$UUID_RE" || true)
+  "$cmux_bin" rpc remote.tmux.mirror "{\"host\":\"$host\"}" >/dev/null
+
   typeset -A placed_uuid
-  attach_deadline=$((SECONDS + 15))
+  mirror_deadline=$((SECONDS + 15))
   while true; do
-    for session in "${want[@]}"; do
-      [[ -n "${placed_uuid[$session]:-}" ]] && continue
-      "$cmux_bin" rpc remote.tmux.attach "{\"host\":\"$host\",\"session\":\"$session\"}" >/dev/null 2>&1 || true
-    done
-    sleep 1
     all_present=true
+    ws_listing=$("$cmux_bin" --id-format uuids list-workspaces 2>/dev/null || true)
     for session in "${want[@]}"; do
       [[ -n "${placed_uuid[$session]:-}" ]] && continue
-      line=$("$cmux_bin" --id-format uuids list-workspaces 2>/dev/null \
-        | grep -iE " $session( +\[selected\])?\$" | head -1 || true)
+      line=$(print -r -- "$ws_listing" | grep -iE " $session( +\[selected\])?\$" | head -1 || true)
       ws_uuid=$(uuid_of "${line:-}" || true)
       if [[ -n "$ws_uuid" ]]; then
         placed_uuid[$session]=$ws_uuid
@@ -110,23 +117,36 @@ if sessions_json=$("$cmux_bin" rpc remote.tmux.sessions "{\"host\":\"$host\"}" 2
       fi
     done
     [[ "$all_present" == true ]] && break
-    (( SECONDS >= attach_deadline )) && break
+    (( SECONDS >= mirror_deadline )) && break
+    sleep 1
   done
 
-  rpc_views_complete=true
+  mirror_views_complete=true
   for session in "${want[@]}"; do
-    if [[ -n "${placed_uuid[$session]:-}" ]]; then
-      place "$session" "${placed_uuid[$session]}"
-    else
-      rpc_views_complete=false
-      echo "workspace ? $session (RPC attach returned without a view)"
+    if [[ -z "${placed_uuid[$session]:-}" ]]; then
+      mirror_views_complete=false
+      echo "workspace ? $session (mirror returned no view)"
     fi
   done
-  if [[ "$rpc_views_complete" == true ]]; then
-    echo "mode rpc-attach (no window created)"
+  if [[ "$mirror_views_complete" == true ]]; then
+    # Place the wanted sessions; close ONLY the fresh strays this mirror
+    # call created. Pre-existing non-wanted workspaces are left alone.
+    "$cmux_bin" --id-format uuids list-workspaces 2>/dev/null | while read -r line; do
+      ws_uuid=$(uuid_of "$line")
+      [[ -n "$ws_uuid" ]] || continue
+      ws_name=$(echo "$line" | sed -E 's/^\*? *[^ ]+ +//; s/ +\[selected\].*$//')
+      if wanted "$ws_name"; then
+        place "$ws_name" "$ws_uuid"
+      elif ! grep -qiF "$ws_uuid" <<<"$pre_ws"; then
+        if CMUX_QUIET=1 "$cmux_bin" workspace close --workspace "$ws_uuid" >/dev/null 2>&1; then
+          echo "stray mirror $ws_uuid $ws_name (closed view; remote session untouched)"
+        fi
+      fi
+    done
+    echo "mode mirror (no window created)"
     exit 0
   fi
-  echo "RPC attach did not materialize every requested view; falling back to ssh-tmux"
+  echo "mirror did not materialize every requested view; falling back to ssh-tmux"
 fi
 
 # --- Path B: cold connection -> ssh-tmux window flow ------------------------
