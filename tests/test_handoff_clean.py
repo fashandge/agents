@@ -883,3 +883,27 @@ def test_probe_program_counts_a_missing_run_dir_as_terminal(tmp_path):
     assert probe["run_dir_present"] is False
     assert probe["state"] is None
     assert probe["terminal"] is True
+
+
+def test_probe_program_dead_filter_deletes_nonterminal_run_dir(tmp_path):
+    run_dir = tmp_path / "dead-nonterminal-run"
+    run_dir.mkdir()
+    # Deletion has a narrow path-safety guard independent of protocol
+    # readability.  Keep status.json present while deliberately leaving the
+    # run nonterminal/unreadable to isolate positive session absence.
+    (run_dir / "status.json").write_text("{}", encoding="utf-8")
+
+    result = _run_probe_program("kill", [{
+        "run_id": "dead-nonterminal",
+        "handle": "no-such-handoff-session",
+        "run_dir": str(run_dir),
+        "facts": ["dead"],
+        "delete_run_dir": True,
+        "force": False,
+    }])[0]
+
+    assert result["session_alive"] is False
+    assert result["terminal"] is False
+    assert result["selected"] is True
+    assert result["run_dir_deleted"] is True
+    assert not run_dir.exists()

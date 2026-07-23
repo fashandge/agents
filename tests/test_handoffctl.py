@@ -1459,6 +1459,37 @@ def test_conclude_stop_retry_after_lost_response_reuses_finished_sequence(tmp_pa
     assert handoff_registry.resolve("weather")["finished_at"] is not None
 
 
+def test_dispatch_refuses_a_finished_marked_run(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    handoff_registry.mark_finished(run["run"]["run_id"])
+    handoff.control_release(run_dir, run["orchestrator"])
+
+    with pytest.raises(handoff.HandoffError, match="run is finished") as caught:
+        handoffctl._dispatch_registered("weather", "more work")
+
+    assert caught.value.exit_code == 4
+    assert not list(run["private"].glob("orchestrator-dispatch-*.token"))
+    assert all(message["type"] != "steer" for message in handoff.read(run_dir, "inbox"))
+
+
+def test_nonstop_conclude_refuses_a_finished_marked_run(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    handoff_registry.mark_finished(run["run"]["run_id"])
+    handoff.control_release(run_dir, run["orchestrator"])
+
+    with pytest.raises(handoff.HandoffError, match="run is already finished") as caught:
+        handoffctl._conclude_registered(
+            "weather", disposition="accepted", body=None,
+            commit=None, no_integrate=False, final_stop=False,
+        )
+
+    assert caught.value.exit_code == 4
+    assert not list(run["private"].glob("orchestrator-conclude-*.token"))
+    assert all(message["type"] != "review" for message in handoff.read(run_dir, "inbox"))
+
+
 def test_conclude_skips_integration_when_result_has_no_head(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])

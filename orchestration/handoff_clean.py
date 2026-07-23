@@ -102,7 +102,12 @@ for r in runs:
         "dead": e["session_alive"] is False,
     }
     e["selected"] = not requested_facts or any(facts[name] for name in requested_facts)
-    if mode == "kill" and e["selected"] and (terminal or r.get("force")):
+    # Match the caller's local gate: a transport-confirmed absent session is
+    # independently reapable even when no journal/marker terminal fact exists.
+    # This matters for --dead --delete-run-dir; otherwise the caller drops its
+    # proxy while this owning-host probe silently leaves the requested run dir.
+    reapable = terminal or e["session_alive"] is False or r.get("force")
+    if mode == "kill" and e["selected"] and reapable:
         if e["session_alive"]:
             kr = subprocess.run(
                 ["tmux", "kill-session", "-t", r["handle"]],
