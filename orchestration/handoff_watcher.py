@@ -153,10 +153,13 @@ def _run_state(value: Any) -> dict[str, Any]:
     # ``last_doorbell_method``, ``acknowledged_through``,
     # ``dismissed_through``, ``doorbell_attempts``, and ``last_typed_error``
     # are optional so snapshots written before those fields existed remain
-    # readable.
+    # readable.  ``fatal_epoch`` is the writer_epoch of the last fatal error
+    # event this watcher observed; missing means none observed (or a snapshot
+    # from before the field existed — legacy ``status state == "failed"``
+    # covers that window instead).
     optional = {
         "last_doorbell_method", "acknowledged_through", "dismissed_through",
-        "doorbell_attempts", "last_typed_error",
+        "doorbell_attempts", "last_typed_error", "fatal_epoch",
     }
     if not isinstance(value, dict) or not required <= set(value) <= required | optional:
         raise handoff.HandoffError("invalid orchestrator run notification state", 5)
@@ -176,6 +179,11 @@ def _run_state(value: Any) -> dict[str, Any]:
     attempts = value.get("doorbell_attempts", 0)
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
         raise handoff.HandoffError("orchestrator run doorbell_attempts must be non-negative", 5)
+    fatal_epoch = value.get("fatal_epoch")
+    if fatal_epoch is not None and (
+        isinstance(fatal_epoch, bool) or not isinstance(fatal_epoch, int) or fatal_epoch <= 0
+    ):
+        raise handoff.HandoffError("orchestrator run fatal_epoch must be null or positive", 5)
     if value["doorbell_through"] > value["observed_through"]:
         raise handoff.HandoffError("doorbell cursor exceeds observed cursor", 5)
     if not isinstance(value["doorbell_pending"], bool):
@@ -568,24 +576,29 @@ def poll(
             if run_state["observed_through"] > run_state["doorbell_through"]:
                 # A new event-cycle restarts the backoff schedule.
                 run_state["doorbell_attempts"] = 0
-            concluded = (
-                (
-                    control["integration"]["state"] != "pending"
-                    and control["desired_state"] != "pause"
-                )
-                or control["desired_state"] == "stop"
+            concluded = record.get("finished_at") is not None
+            new_fatal = [
+                event for event in events
+                if event["type"] == "error" and event["data"].get("fatal")
+            ]
+            if new_fatal:
+                # Persist the observed fatal writer_epoch, then derive fatality
+                # from it on every later poll: the epoch compare self-
+                # invalidates on worker-relaunched (the epoch bump falsifies it
+                # with no explicit clear), so this stays a pure derivation.
+                run_state["fatal_epoch"] = new_fatal[-1]["writer_epoch"]
+            fatal = (
+                # Legacy self-report, kept as read tolerance: a run whose fatal
+                # event was already observed through by a pre-upgrade watcher
+                # has no stored fatal_epoch and is never re-fetched.
+                status["state"] == "failed"
+                or run_state.get("fatal_epoch") == control["worker_epoch"]
             )
-            fatal_tail = status["state"] == "failed" or any(
-                event["type"] == "error" and event["data"].get("fatal")
-                for event in events
-            )
-            if concluded and not fatal_tail:
-                # Keyed on the orchestrator's own decision, not worker state:
-                # once a run is concluded its remaining tail — including the
-                # final "stopped" checkpoint, which arrives after the worker
-                # exits and can never be consumed — goes durably quiet.  A
-                # badly-dying run is exempt and keeps ringing.  A paused run
-                # (desired_state "pause") is NOT concluded: it stays quiet on
+            if concluded and not fatal:
+                # Keyed on the orchestrator's explicit finished marker, not
+                # worker state: once a run is finished its remaining tail goes
+                # durably quiet.  A badly-dying run is exempt and keeps
+                # ringing.  A paused run is NOT concluded: it stays quiet on
                 # its own because "paused" is not a ringing state, and it must
                 # re-ring when the worker resumes and emits a new result.
                 run_state["dismissed_through"] = max(
@@ -593,7 +606,7 @@ def poll(
                 )
             if events and events[-1]["seq"] != tail:
                 raise handoff.HandoffError("worker outbox observation is not contiguous", 5)
-            observations[run_id] = (status, events)
+            observations[run_id] = (status, events, fatal)
             changed = changed or run_state != previous
         except handoff.HandoffError as exc:
             errors.append({"run_id": run_id, "error": str(exc)})
@@ -611,7 +624,7 @@ def poll(
         observation = observations.get(run_id)
         if observation is None:
             continue
-        status, events = observation
+        status, events, fatal = observation
         if run_state["observed_through"] <= run_state.get("dismissed_through", 0):
             continue
         new_events = run_state["observed_through"] > run_state["doorbell_through"]
@@ -621,7 +634,7 @@ def poll(
         )
         state = status["state"]
         blocking = state == "blocked" and bool(status["blocked_on"])
-        ring_once = state in {"awaiting_review", "failed"}
+        ring_once = state == "awaiting_review" or fatal
         error_while_working = state in {"starting", "working"} and any(
             event["type"] == "error" for event in events
         )

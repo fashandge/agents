@@ -19,7 +19,10 @@ from agents.orchestration import handoff
 REGISTRY_VERSION = 1
 REGISTRY_ENV = "HANDOFF_REGISTRY_FILE"
 PRIVATE_FIELDS = {"credential_dir"}
-TERMINAL_STATES = {"succeeded", "failed", "stopped"}
+# Legacy worker self-reports, kept as read tolerance for pre-collapse run
+# dirs.  Terminality for current runs comes from the finished marker, the
+# derived fatal fact, or a dangling run directory — never from a state name.
+TERMINAL_STATES = {"failed", "stopped"}
 
 
 def default_path() -> Path:
@@ -62,12 +65,17 @@ def _validate_record(record: Any, *, path: Path | None = None) -> dict[str, Any]
         "run_id", "name", "run_dir", "run_uri", "host", "remote_python",
         "transport", "session_transport", "handle", "agent", "model", "effort",
         "credential_dir", "orchestrator_id", "observed_outbox_cursor", "registered_at",
+        "finished_at",
     }
-    legacy_required = required - {"orchestrator_id"}
-    if set(record) == legacy_required:
-        # Registry v1 predated detached orchestrator ownership.  Existing
-        # records remain deliberately unowned until an explicit adoption.
-        record = {**record, "orchestrator_id": None}
+    if set(record) != required:
+        # Records written before a field existed remain readable: registry v1
+        # predated detached orchestrator ownership (``orchestrator_id`` stays
+        # null until an explicit adoption) and the finished marker.
+        record = {
+            **record,
+            "orchestrator_id": record.get("orchestrator_id"),
+            "finished_at": record.get("finished_at"),
+        }
     if set(record) != required:
         raise handoff.HandoffError("registry record has invalid fields", 5)
     for field in (
@@ -88,6 +96,13 @@ def _validate_record(record: Any, *, path: Path | None = None) -> dict[str, Any]
             raise handoff.HandoffError(
                 "registry orchestrator_id must be a lowercase canonical UUIDv4", 5,
             )
+    if record["finished_at"] is not None:
+        if not isinstance(record["finished_at"], str):
+            raise handoff.HandoffError("registry finished_at must be null or a timestamp", 5)
+        try:
+            handoff._parse_time(record["finished_at"])  # noqa: SLF001 - same-protocol timestamp
+        except handoff.HandoffError as exc:
+            raise handoff.HandoffError("registry finished_at must be null or a timestamp", 5) from exc
     cursor = record["observed_outbox_cursor"]
     if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
         raise handoff.HandoffError("registry observed_outbox_cursor must be non-negative", 5)
@@ -190,6 +205,7 @@ def register(
                 previous["orchestrator_id"] if previous else orchestrator_id
             ),
             "observed_outbox_cursor": previous["observed_outbox_cursor"] if previous else 0,
+            "finished_at": previous["finished_at"] if previous else None,
             "registered_at": previous["registered_at"] if previous else _timestamp(),
         })
         registry["runs"][run_id] = record
@@ -257,23 +273,49 @@ def update_observed(run_id: str, through: int, *, path: Path | None = None) -> d
         return dict(record)
 
 
+def mark_finished(run_id: str, *, path: Path | None = None, at: str | None = None) -> dict[str, Any]:
+    """Write the orchestrator's durable finished marker for a run.
+
+    The marker is the explicit run-termination fact: ``conclude --stop`` and
+    ``stop`` write it as the final step of their sequence, cleanup and the
+    watcher key on it, and ``dispatch``/non-stop ``conclude`` refuse a run
+    that carries it.  Idempotent: an existing marker is kept (first finish
+    wins) and reported as ``finished_already`` so a crash-retry after a lost
+    response still succeeds.  Returns the record plus ``finished_already``.
+    """
+    registry_path = Path(path or default_path())
+    with _locked(registry_path, exclusive=True):
+        registry = _read_unlocked(registry_path)
+        if run_id not in registry["runs"]:
+            raise handoff.HandoffError(f"unknown handoff run: {run_id}", 4)
+        record = registry["runs"][run_id]
+        already = record["finished_at"] is not None
+        if not already:
+            record["finished_at"] = at or _timestamp()
+            _write_unlocked(registry_path, registry)
+        return {**record, "finished_already": already}
+
+
 def _assess_terminal(record: dict[str, Any]) -> tuple[bool, str | None]:
     """Decide whether a registered run is known to be over.
 
     Returns ``(terminal, note)``.  ``note`` explains an inferred verdict: why
     a dangling pointer counts as terminal, or why liveness cannot be ruled
-    out.  A positively terminal status projection, an orchestrator-concluded
-    run (``control.json`` ``desired_state`` is ``"stop"`` — a concluded
-    worker stays resident and never emits its terminal checkpoint, so status
-    alone would never count it finished), or a missing/unreadable run
-    directory counts as terminal; anything else is treated as possibly live
-    so a removal never silently orphans a running worker.
+    out.  Terminal facts: the orchestrator's finished marker, the derived
+    fatal fact (a fatal error in the live worker epoch's outbox), a
+    missing/unreadable run directory (a dangling pointer), and — as permanent
+    read tolerance for pre-collapse run dirs — a legacy terminal status
+    projection or legacy ``desired_state == "stop"``.  Anything else is
+    treated as possibly live so a removal never silently orphans a running
+    worker.
     """
     if record["host"] is not None:
         return False, f"run is remote (host {record['host']!r}); liveness cannot be verified from this host"
     run_dir = Path(record["run_dir"])
     if not run_dir.is_dir():
         return True, "run directory is missing or unreadable; record is a dangling pointer"
+    if record.get("finished_at"):
+        return True, "orchestrator marked the run finished"
     try:
         state = handoff.status(run_dir)["state"]
     except handoff.HandoffError as exc:
@@ -281,11 +323,16 @@ def _assess_terminal(record: dict[str, Any]) -> tuple[bool, str | None]:
     if state in TERMINAL_STATES:
         return True, None
     try:
-        desired = handoff.control_show(run_dir)["desired_state"]
+        if handoff.is_fatal(run_dir):
+            return True, "worker reported a fatal error"
+    except handoff.HandoffError:
+        pass
+    try:
+        desired = handoff.control_show(run_dir).get("desired_state")
     except handoff.HandoffError:
         desired = None
     if desired == "stop":
-        return True, "orchestrator concluded the run (desired_state is stop)"
+        return True, "orchestrator concluded the run (legacy desired_state is stop)"
     return False, f"worker state {state!r} is not terminal"
 
 

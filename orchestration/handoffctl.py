@@ -30,9 +30,6 @@ ORCHESTRATOR_NOTIFICATION_TITLE = handoff_launcher.ORCHESTRATOR_DOORBELL_TITLE
 ORCHESTRATOR_NOTIFICATION_BODY = "Worker updates are ready for orchestrator review."
 DEFERRED_INPUT = handoff_watcher.DEFERRED_INPUT
 SURFACE_WATCHER_READY_TIMEOUT_SECONDS = 20.0
-CONCLUDE_STOP_REASON = "Result accepted and integrated; concluding run"
-CONCLUDE_PAUSE_REASON = "Result accepted and integrated; pausing worker (resumable)"
-STOP_REASON = "Final stop requested by orchestrator"
 WATCHER_MODES = ("auto", "detached", "surface")
 WATCHER_WORKSPACE_TITLE = "handoff-watchers"
 _UUID_RE = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
@@ -262,10 +259,14 @@ def _dispatch_local(record: dict[str, Any], body: str) -> dict[str, Any]:
         reason="One-shot registry dispatch after released orchestrator lease",
         token_prefix="orchestrator-dispatch",
     ) as (run_dir, token, takeover):
-        status = handoff.status(run_dir)
-        if status["state"] in {"succeeded", "failed", "stopped"}:
+        if record.get("finished_at"):
             raise handoff.HandoffError(
-                f"worker state {status['state']} cannot accept a new instruction", 4,
+                "run is finished; start a new run for more work", 4,
+            )
+        status = handoff.status(run_dir)
+        if status["state"] == "stopped" or handoff.is_fatal(run_dir):
+            raise handoff.HandoffError(
+                "worker epoch is terminal; it cannot accept a new instruction", 4,
             )
         superseded_result: str | None = None
         answered_question: str | None = None
@@ -321,7 +322,7 @@ def _dispatch_registered(
 
 def _conclude_local(
     record: dict[str, Any], *, disposition: str, body: str | None,
-    commit: str | None, no_integrate: bool, reason: str, final_stop: bool,
+    commit: str | None, no_integrate: bool, final_stop: bool,
 ) -> dict[str, Any]:
     with _ephemeral_orchestrator(
         record,
@@ -331,13 +332,54 @@ def _conclude_local(
         status = handoff.status(run_dir)
         control = handoff.control_show(run_dir)
         outbox = handoff.read(run_dir, "outbox")
+        if record.get("finished_at"):
+            if not final_stop:
+                raise handoff.HandoffError(
+                    "run is already finished; start a new run for more work", 4,
+                )
+            # Idempotent success: the marker is written LAST, so its presence
+            # proves the review (and integration) records are durable.  Report
+            # the accepted review back so a caller that lost the original
+            # response — SSH teardown, a decode error, a crash before the
+            # mirror write — recovers by simply retrying the conclude.
+            inbox = handoff.read(run_dir, "inbox")
+            review_message = next(
+                (
+                    message for message in reversed(inbox)
+                    if message["type"] == "review"
+                    and message["reply_to"] == control["review_result_id"]
+                ),
+                None,
+            )
+            integration_message = next(
+                (
+                    message for message in reversed(inbox)
+                    if message["type"] == "integration"
+                    and (review_message is None or message["seq"] > review_message["seq"])
+                ),
+                None,
+            )
+            return {
+                "run": handoff_registry.public(record),
+                "takeover": takeover["message"],
+                "disposition": disposition,
+                "consumed_through": control["outbox_cursor"],
+                "review": review_message,
+                "integration": integration_message,
+                "integration_skipped": control["integration"]["state"] == "pending",
+                "finished": True,
+                "finished_already": True,
+                "doorbell_sent": False,
+                "doorbell_error": None,
+                "orchestrator_released": True,
+            }
         resumable = (
-            status["state"] == "succeeded"
+            status["state"] in {"awaiting_review", "paused", "succeeded"}
             and control["review_state"] == "accepted"
             and control["integration"]["state"] == "pending"
         )
-        resume_lifecycle = (
-            status["state"] in {"awaiting_review", "succeeded"}
+        resume_integrated = (
+            status["state"] in {"awaiting_review", "paused", "succeeded"}
             and control["review_state"] == "accepted"
             and control["review_result_id"] is not None
             and control["integration"]["state"] != "pending"
@@ -346,30 +388,26 @@ def _conclude_local(
                 for message in outbox[control["outbox_cursor"]:]
             )
         )
-        if status["state"] != "awaiting_review" and not resumable and not resume_lifecycle:
+        if status["state"] != "awaiting_review" and not resumable and not resume_integrated:
             raise handoff.HandoffError(
                 f"worker state {status['state']} cannot be concluded; "
                 "use dispatch to steer an active run or control abandon to discard it",
                 4,
             )
-        if (resumable or resume_lifecycle) and disposition != "accepted":
+        if (resumable or resume_integrated) and disposition != "accepted":
             raise handoff.HandoffError(
-                "changes requested after worker success require worker rotation or a new run",
+                "changes requested after an accepted review require worker rotation or a new run",
                 4,
             )
         review_message: dict[str, Any] | None = None
         integration_message: dict[str, Any] | None = None
         integration_skipped = False
-        stop_message: dict[str, Any] | None = None
-        stop_already_requested = False
-        pause_message: dict[str, Any] | None = None
-        pause_already_requested = False
         last_seq: int | None = None
-        if resumable or resume_lifecycle:
+        if resumable or resume_integrated:
             # A previous conclude sent the accepted review but crashed before
             # completing the sequence; resume with the records that are still
-            # missing (integration for resumable, only the pause/stop
-            # lifecycle message for resume_lifecycle).
+            # missing (integration for resumable, only the finished marker for
+            # resume_integrated).
             consumed_through = control["outbox_cursor"]
             result_id = control["review_result_id"]
         else:
@@ -388,17 +426,17 @@ def _conclude_local(
             last_seq = review["message"]["seq"]
         if disposition != "changes_requested":
             # A changes-requested review resumes the worker, so it stops here.
-            # The accepted path integrates (when a commit is known) and then
-            # pauses the resumable worker by default, or stops it with --stop.
+            # The accepted path integrates (when a commit is known) and then —
+            # only with --stop — marks the run finished.
             result_message = next(
                 (message for message in outbox if message["message_id"] == result_id),
                 None,
             )
             head = result_message["data"].get("head") if result_message is not None else None
             effective_commit = commit or head
-            if resume_lifecycle:
+            if resume_integrated:
                 # The integration record landed before the crash; only the
-                # lifecycle message is still owed to the worker.
+                # finished marker is still owed (and only for --stop).
                 pass
             elif no_integrate or effective_commit is None:
                 integration_skipped = True
@@ -408,33 +446,16 @@ def _conclude_local(
                 )
                 integration_message = integration["message"]
                 last_seq = integration["message"]["seq"]
-            desired = handoff.control_show(run_dir)["desired_state"]
-            if final_stop:
-                if desired == "stop":
-                    # A prior conclude (or the managed orchestrator) already
-                    # requested stop; re-sending it would fail, so treat the
-                    # existing request as idempotent success.
-                    stop_already_requested = True
-                else:
-                    stopped = handoff.send(run_dir, token, type="stop", data={"reason": reason})
-                    stop_message = stopped["message"]
-                    last_seq = stopped["message"]["seq"]
-            else:
-                if desired == "pause":
-                    # A prior conclude already requested pause; re-sending it
-                    # would fail, so treat the existing request as idempotent
-                    # success.
-                    pause_already_requested = True
-                elif desired == "stop":
-                    stop_already_requested = True
-                else:
-                    paused = handoff.send(run_dir, token, type="pause", data={"reason": reason})
-                    pause_message = paused["message"]
-                    last_seq = paused["message"]["seq"]
+        finished_at: str | None = None
+        if final_stop:
+            # The marker is the FINAL step of the conclude sequence, written
+            # only after the review and integration records are durable, so
+            # finished_already on a retry implies the sequence completed.
+            finished_at = handoff_registry.mark_finished(record["run_id"])["finished_at"]
         if last_seq is None:
             last_seq = len(handoff.read(run_dir, "inbox"))
-        # One doorbell covers everything: the worker drains review,
-        # integration, and pause/stop from its inbox in order.
+        # One doorbell covers everything: the worker drains review and
+        # integration from its inbox in order and then idles paused.
         doorbell_sent, doorbell_error = _ring_doorbell(
             record, record["run_id"], last_seq,
         )
@@ -446,10 +467,8 @@ def _conclude_local(
             "review": review_message,
             "integration": integration_message,
             "integration_skipped": integration_skipped,
-            "stop": stop_message,
-            "stop_already_requested": stop_already_requested,
-            "pause": pause_message,
-            "pause_already_requested": pause_already_requested,
+            "finished": finished_at is not None,
+            "finished_already": False,
             "doorbell_sent": doorbell_sent,
             "doorbell_error": doorbell_error,
             "orchestrator_released": True,
@@ -458,19 +477,18 @@ def _conclude_local(
 
 def _conclude_registered(
     selector: str, *, disposition: str, body: str | None,
-    commit: str | None, no_integrate: bool, reason: str, final_stop: bool,
+    commit: str | None, no_integrate: bool, final_stop: bool,
 ) -> dict[str, Any]:
     record = handoff_registry.resolve(selector, private=True)
     if record["host"] is None:
         return _conclude_local(
             record, disposition=disposition, body=body,
-            commit=commit, no_integrate=no_integrate, reason=reason,
+            commit=commit, no_integrate=no_integrate,
             final_stop=final_stop,
         )
     argv = [
         "conclude", "--run", record["run_id"],
         "--disposition", disposition.replace("_", "-"),
-        "--reason", reason,
     ]
     if final_stop:
         argv += ["--stop"]
@@ -483,45 +501,55 @@ def _conclude_registered(
     result = _remote_json(record, argv, stdin=body)
     if not isinstance(result, dict):
         raise handoff.HandoffError("remote conclude returned invalid data", 6)
+    if result.get("finished"):
+        # Mirror the owning host's finished marker into the orchestrator-side
+        # record: the watcher reads only local state, and cleanup keys on it.
+        # An idempotent remote retry (finished_already) rewrites the mirror —
+        # that retry exists precisely for a lost first response.
+        handoff_registry.mark_finished(record["run_id"])
     return result
 
 
-def _stop_local(record: dict[str, Any], *, reason: str) -> dict[str, Any]:
+def _stop_local(record: dict[str, Any]) -> dict[str, Any]:
     with _ephemeral_orchestrator(
         record,
         reason="One-shot registry stop after released orchestrator lease",
         token_prefix="orchestrator-stop",
     ) as (run_dir, token, takeover):
-        status = handoff.status(run_dir)
-        if status["state"] in {"succeeded", "failed", "stopped"}:
-            raise handoff.HandoffError(
-                f"worker state {status['state']} is terminal; nothing left to stop", 4,
-            )
-        if handoff.control_show(run_dir)["desired_state"] == "stop":
-            raise handoff.HandoffError("stop was already requested", 4)
-        stopped = handoff.send(run_dir, token, type="stop", data={"reason": reason})
-        doorbell_sent, doorbell_error = _ring_doorbell(
-            record, record["run_id"], stopped["message"]["seq"],
-        )
+        if record.get("finished_at"):
+            # Idempotent success: the run is already marked finished.
+            finished_already = True
+        else:
+            status = handoff.status(run_dir)
+            if status["state"] == "stopped" or handoff.is_fatal(run_dir):
+                raise handoff.HandoffError(
+                    "worker epoch is terminal; nothing left to stop", 4,
+                )
+            handoff_registry.mark_finished(record["run_id"])
+            finished_already = False
         return {
             "run": handoff_registry.public(record),
             "takeover": takeover["message"],
-            "stop": stopped["message"],
-            "doorbell_sent": doorbell_sent,
-            "doorbell_error": doorbell_error,
+            "finished": True,
+            "finished_already": finished_already,
+            "doorbell_sent": False,
+            "doorbell_error": None,
             "orchestrator_released": True,
         }
 
 
-def _stop_registered(selector: str, *, reason: str) -> dict[str, Any]:
+def _stop_registered(selector: str) -> dict[str, Any]:
     record = handoff_registry.resolve(selector, private=True)
     if record["host"] is None:
-        return _stop_local(record, reason=reason)
+        return _stop_local(record)
     result = _remote_json(
-        record, ["stop", "--run", record["run_id"], "--reason", reason],
+        record, ["stop", "--run", record["run_id"]],
     )
     if not isinstance(result, dict):
         raise handoff.HandoffError("remote stop returned invalid data", 6)
+    if result.get("finished"):
+        # See _conclude_registered: mirror the owning host's marker locally.
+        handoff_registry.mark_finished(record["run_id"])
     return result
 
 
@@ -1309,6 +1337,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="bulk: only records registered more than DAYS ago",
     )
     run_clean.add_argument("--host", help="bulk: only records for this remote host")
+    run_clean.add_argument(
+        "--dead", action="store_true",
+        help="fact filter (composable): only runs whose transport answered session-absent",
+    )
+    run_clean.add_argument(
+        "--fatal", action="store_true",
+        help="fact filter (composable): only runs whose worker declared a fatal error",
+    )
+    run_clean.add_argument(
+        "--finished", action="store_true",
+        help="fact filter (composable): only runs the orchestrator marked finished",
+    )
     clean_scope = run_clean.add_mutually_exclusive_group()
     clean_scope.add_argument(
         "--watcher-state", type=_absolute,
@@ -1407,7 +1447,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     conclude = commands.add_parser(
         "conclude",
-        help="review, integrate, pause (or --stop), ring the doorbell, and release in one operation",
+        help="review, integrate, optionally mark finished (--stop), ring the doorbell, and release in one operation",
     )
     conclude.add_argument("--run", required=True, help="registered run selector")
     conclude.add_argument(
@@ -1428,21 +1468,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     conclude.add_argument(
         "--stop", action="store_true",
-        help="accepted path: send a final stop instead of the default resumable pause",
-    )
-    conclude.add_argument(
-        "--reason",
-        help="pause/stop reason for the accepted path (default depends on --stop)",
+        help="accepted path: mark the run finished (idempotent); the worker idles paused and cleanup reaps it",
     )
     stop = commands.add_parser(
         "stop",
-        help="request a graceful final stop for a registered run, ring the doorbell, and release",
+        help="mark a registered run finished (idempotent) and release",
     )
     stop.add_argument("--run", required=True, help="registered run selector")
-    stop.add_argument(
-        "--reason", default=STOP_REASON,
-        help="stop reason recorded in the inbox message",
-    )
     watch = commands.add_parser("watch", help="stream new outbox events from registered runs")
     watch.add_argument(
         "--run", action="append", default=[],
@@ -1533,10 +1565,11 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
                 if (
                     args.older_than is not None or args.host is not None
                     or args.watcher_state is not None or args.orchestrator is not None
+                    or args.dead or args.fatal or args.finished
                 ):
                     raise handoff.HandoffError(
                         "--run cannot be combined with bulk filters "
-                        "(--older-than/--host/--watcher-state/--orchestrator)",
+                        "(--older-than/--host/--watcher-state/--orchestrator/--dead/--fatal/--finished)",
                         2,
                     )
             elif not args.dry_run and not args.yes:
@@ -1550,7 +1583,9 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
                 orchestrator_id = handoff_watcher.read(args.watcher_state)["orchestrator_id"]
             return handoff_clean.clean(
                 selector=args.run, older_than=args.older_than, host=args.host,
-                orchestrator_id=orchestrator_id, force=args.force,
+                orchestrator_id=orchestrator_id,
+                dead=args.dead, fatal=args.fatal, finished=args.finished,
+                force=args.force,
                 delete_run_dir=args.delete_run_dir,
                 dry_run=args.run is None and args.dry_run,
             )
@@ -1592,16 +1627,13 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any] | list[Any]:
                     "--stop requires --disposition accepted", 2,
                 )
         body = _read_text(args.body_file) if args.body_file is not None else None
-        reason = args.reason
-        if reason is None:
-            reason = CONCLUDE_STOP_REASON if args.stop else CONCLUDE_PAUSE_REASON
         return _conclude_registered(
             args.run, disposition=disposition, body=body,
-            commit=args.commit, no_integrate=args.no_integrate, reason=reason,
+            commit=args.commit, no_integrate=args.no_integrate,
             final_stop=args.stop,
         )
     if args.command == "stop":
-        return _stop_registered(args.run, reason=args.reason)
+        return _stop_registered(args.run)
     if args.command == "ready": return handoff.ready(args.run_dir, _token(args, "worker"))
     if args.command == "send": return _send_with_doorbell(args)
     if args.command == "emit":

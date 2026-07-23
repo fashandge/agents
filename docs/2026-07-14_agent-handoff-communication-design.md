@@ -5,6 +5,16 @@ Date: 2026-07-14 · Revised: 2026-07-18 · Status: DESIGN v1.4
 launchers, and detached orchestrator watching; hook, concrete native-app messaging,
 and multi-worker roster adapters remain staged follow-ups)
 
+> **Historical lifecycle note (2026-07-22):** This document retains the
+> original state/message vocabulary for design history. The implemented
+> lifecycle now has five writable worker states (`starting`, `working`,
+> `blocked`, `awaiting_review`, `paused`), derives fatality from the live
+> worker epoch's outbox, and records run completion with the registry
+> `finished_at` marker. See `docs/architecture.md` and
+> `docs/plans/2026-07-22_handoff-state-simplification/plan.md`. Legacy
+> `succeeded`/`stopped`/`failed`, `pause`/`stop`, and `desired_state` remain
+> permanently readable but are not writable by new runs.
+
 ## 1. Requirements and scope
 
 An orchestrator (an agent session or a human) hands tasks to worker sessions and

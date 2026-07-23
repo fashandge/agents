@@ -256,8 +256,8 @@ def test_result_acceptance_success_and_integration_are_distinct(run):
         run_dir, run["orchestrator"], type="review",
         reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
     )
-    succeeded = checkpoint(run, review["message"]["seq"], state="succeeded")
-    assert succeeded["status"]["state"] == "succeeded"
+    paused = checkpoint(run, review["message"]["seq"], state="paused")
+    assert paused["status"]["state"] == "paused"
     assert review["control"]["review_state"] == "accepted"
     assert review["control"]["integration"]["state"] == "pending"
     integrated = handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
@@ -283,19 +283,18 @@ def test_pause_checkpoints_pause_and_resume_through_working(run):
     checkpoint(run, 0)
     _, review = _publish_accepted_result(run)
     handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
-    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
-    assert pause["control"]["desired_state"] == "pause"
 
-    paused = checkpoint(run, pause["message"]["seq"], state="paused")
+    # A bare accepted review — no lifecycle message — idles the worker.
+    paused = checkpoint(run, review["message"]["seq"], state="paused")
     assert paused["status"]["state"] == "paused"
 
     # A paused worker cannot publish a result without resuming first.
-    with pytest.raises(handoff.HandoffError, match="resume working or stop") as caught:
+    with pytest.raises(handoff.HandoffError, match="result is not valid in the current state") as caught:
         handoff.emit(
             run_dir, run["worker"], type="result", body="early",
             data={
                 "head": None, "dirty": True, "stage": "done",
-                "inbox_cursor": pause["message"]["seq"], "verification": [], "commitments": [],
+                "inbox_cursor": review["message"]["seq"], "verification": [], "commitments": [],
             },
         )
     assert caught.value.exit_code == 4
@@ -307,65 +306,127 @@ def test_pause_checkpoints_pause_and_resume_through_working(run):
     assert handoff.doctor(run_dir)["ok"]
 
 
-def test_paused_resume_requires_an_instruction_newer_than_the_pause(run):
+def test_paused_resume_requires_an_instruction_newer_than_the_accepted_review(run):
     run_dir = Path(run["run_dir"])
     checkpoint(run, 0)
     _, review = _publish_accepted_result(run)
-    handoff.send(run_dir, run["orchestrator"], type="steer", body="pre-pause steer")
     handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
-    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
-    paused = checkpoint(run, pause["message"]["seq"], state="paused")
+    paused = checkpoint(run, review["message"]["seq"], state="paused")
     assert paused["status"]["state"] == "paused"
 
-    # The steer predates the pause, so it cannot authorize a resume.
-    with pytest.raises(handoff.HandoffError, match="newer steer, answer, or supersede") as caught:
-        checkpoint(run, pause["message"]["seq"])
+    # Nothing newer than the accepted review has arrived, so the worker
+    # cannot resume.
+    with pytest.raises(handoff.HandoffError, match="newer than the accepted review") as caught:
+        checkpoint(run, review["message"]["seq"])
     assert caught.value.exit_code == 4
 
     steer = handoff.send(run_dir, run["orchestrator"], type="steer", body="fresh work")
     assert checkpoint(run, steer["message"]["seq"])["status"]["state"] == "working"
 
 
-def test_pause_lifecycle_rules_second_pause_pause_after_stop_and_stop_after_pause(run):
+def _legacy_inbox_record(run, kind, seq, data, body="legacy"):
+    """Append a retired-vocabulary inbox record the way pre-collapse code wrote it."""
+    run_dir = Path(run["run_dir"])
+    message = handoff._new_message(  # noqa: SLF001 - builds a historical record
+        seq, str(uuid.uuid4()), 1, kind, None, body, data, [],
+    )
+    handoff._validate_message(message, "inbox", expected_seq=seq)  # noqa: SLF001
+    handoff._append(run_dir / "inbox.jsonl", message)  # noqa: SLF001
+    control = handoff.control_show(run_dir)
+    handoff._apply_inbox(control, message)  # noqa: SLF001
+    if kind in {"pause", "stop"}:
+        # Pre-collapse control snapshots projected lifecycle messages into
+        # desired_state.  Its presence also identifies a frozen legacy worker
+        # contract for write-tolerant legacy checkpoint emissions.
+        control["desired_state"] = kind
+    handoff._atomic_json(run_dir / "control.json", control)  # noqa: SLF001
+    return message
+
+
+def test_legacy_pause_stop_journals_and_checkpoints_still_read(run):
+    """Read tolerance is permanent: a pre-collapse run dir — pause/stop inbox
+    records, succeeded/stopped checkpoints, a legacy desired_state key and a
+    legacy terminal status snapshot — must load, status, and doctor cleanly."""
     run_dir = Path(run["run_dir"])
     checkpoint(run, 0)
     _, review = _publish_accepted_result(run)
     handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
-    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
-    paused = checkpoint(run, pause["message"]["seq"], state="paused")
-    assert paused["status"]["state"] == "paused"
+    _legacy_inbox_record(run, "pause", 3, {"reason": "idle"})
+    _legacy_inbox_record(run, "stop", 4, {"reason": "concluded"})
+    # Legacy worker emissions remain valid for frozen pre-collapse contracts
+    # and map onto paused.
+    succeeded = checkpoint(run, review["message"]["seq"], state="succeeded")
+    assert succeeded["status"]["state"] == "paused"
+    stopped = checkpoint(run, 4, state="stopped")
+    assert stopped["status"]["state"] == "paused"
+    # Hand-age the snapshots into their pre-collapse shapes.
+    control = handoff.control_show(run_dir)
+    control["desired_state"] = "stop"
+    handoff._atomic_json(run_dir / "control.json", control)  # noqa: SLF001
+    status = handoff.status(run_dir)
+    status["state"] = "stopped"
+    handoff._atomic_json(run_dir / "status.json", status)  # noqa: SLF001
 
-    with pytest.raises(handoff.HandoffError, match="pause was already requested") as caught:
-        handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "again"})
-    assert caught.value.exit_code == 4
-
-    # Stop after pause is allowed, and the paused worker stops directly.
-    stop = handoff.send(run_dir, run["orchestrator"], type="stop", data={"reason": "wrap up"})
-    assert stop["control"]["desired_state"] == "stop"
-    stopped = checkpoint(run, stop["message"]["seq"], state="stopped")
-    assert stopped["status"]["state"] == "stopped"
-
-    with pytest.raises(handoff.HandoffError, match="cannot pause after stop") as caught:
-        handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "too late"})
-    assert caught.value.exit_code == 4
+    assert handoff.status(run_dir)["state"] == "stopped"
+    assert handoff.control_show(run_dir)["desired_state"] == "stop"
     assert handoff.doctor(run_dir)["ok"]
 
 
-def test_succeeded_worker_can_pause_instead_of_stopping(run):
+def test_legacy_stopped_mid_work_run_passes_the_doctor_replay(run):
+    """A worker stopped mid-work has no accepted review, so its mapped paused
+    projection must replay under legacy acceptance, not the new entry rule."""
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    _legacy_inbox_record(run, "stop", 1, {"reason": "concluded"})
+    stopped = checkpoint(run, 1, state="stopped")
+    assert stopped["status"]["state"] == "paused"
+    status = handoff.status(run_dir)
+    status["state"] = "stopped"
+    handoff._atomic_json(run_dir / "status.json", status)  # noqa: SLF001
+    assert handoff.doctor(run_dir)["ok"]
+
+
+def test_succeeded_checkpoint_maps_onto_paused_and_resumes(run):
     run_dir = Path(run["run_dir"])
     checkpoint(run, 0)
     _, review = _publish_accepted_result(run)
-    succeeded = checkpoint(run, review["message"]["seq"], state="succeeded")
-    assert succeeded["status"]["state"] == "succeeded"
     handoff.control_integrate(run_dir, run["orchestrator"], commit="integration-commit")
-    pause = handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
-
-    # The lifecycle message arrived after the succeeded checkpoint; the worker
-    # still reaches the resumable paused state.
-    paused = checkpoint(run, pause["message"]["seq"], state="paused")
-    assert paused["status"]["state"] == "paused"
+    control = handoff.control_show(run_dir)
+    control["desired_state"] = "pause"
+    handoff._atomic_json(run_dir / "control.json", control)  # noqa: SLF001
+    succeeded = checkpoint(run, review["message"]["seq"], state="succeeded")
+    assert succeeded["status"]["state"] == "paused"
     steer = handoff.send(run_dir, run["orchestrator"], type="steer", body="fresh work")
     assert checkpoint(run, steer["message"]["seq"])["status"]["state"] == "working"
+
+
+def test_new_run_rejects_retired_checkpoint_state(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    _, review = _publish_accepted_result(run)
+
+    with pytest.raises(handoff.HandoffError, match="retired checkpoint state") as caught:
+        checkpoint(run, review["message"]["seq"], state="succeeded")
+
+    assert caught.value.exit_code == 4
+    assert "desired_state" not in handoff.control_show(run_dir)
+
+
+def test_migrated_frozen_contract_can_emit_retired_checkpoint_state(run):
+    run_dir = Path(run["run_dir"])
+    checkpoint(run, 0)
+    _, review = _publish_accepted_result(run)
+    kickoff = run_dir / "kickoff.md"
+    kickoff.write_text(
+        kickoff.read_text(encoding="utf-8")
+        + '\n- checkpoint: {"state": "working"|"succeeded"|"stopped"|"paused"}\n',
+        encoding="utf-8",
+    )
+
+    projected = checkpoint(run, review["message"]["seq"], state="succeeded")
+
+    assert projected["status"]["state"] == "paused"
+    assert "desired_state" not in handoff.control_show(run_dir)
 
 
 def test_supersede_resumes_awaiting_review_and_binds_fresh_result(run):
@@ -432,7 +493,7 @@ def test_only_latest_review_disposition_authorizes_worker_transition(run):
         reply_to=result["message"]["message_id"], data={"disposition": "changes_requested"},
     )
     with pytest.raises(handoff.HandoffError, match="accepted review"):
-        checkpoint(run, changed["message"]["seq"], state="succeeded")
+        checkpoint(run, changed["message"]["seq"], state="paused")
     assert checkpoint(run, changed["message"]["seq"])["status"]["state"] == "working"
 
 

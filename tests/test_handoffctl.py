@@ -76,6 +76,14 @@ def registered_run(tmp_path, monkeypatch):
         handle="weather-worker", agent="claude", model="opus", effort="low",
         credential_dir=str(private),
     )
+    # These registry fixtures model a live tmux worker unless a test
+    # explicitly overrides the transport probe.  A positive nonzero
+    # has-session result now means "dead" and is independently reapable.
+    monkeypatch.setattr(
+        handoffctl.handoff_launcher,
+        "_run",
+        lambda argv, check=True: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
     return {
         **initialized,
         "private": private,
@@ -359,23 +367,11 @@ def test_fast_dispatch_answers_blocking_question(tmp_path, monkeypatch):
 def test_failed_dispatch_releases_ephemeral_orchestrator(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])
-    result = handoff.emit(
-        run_dir, run["worker"], type="result", body="done",
-        data={
-            "head": None, "dirty": False, "stage": "complete", "inbox_cursor": 0,
-            "verification": [], "commitments": [],
-        },
-    )
-    handoff.control_consume(run_dir, run["orchestrator"], through=1)
-    review = handoff.send(
-        run_dir, run["orchestrator"], type="review",
-        reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
-    )
     handoff.emit(
-        run_dir, run["worker"], type="checkpoint", body="done",
+        run_dir, run["worker"], type="error", body="fatal test failure",
         data={
-            "state": "succeeded", "stage": "complete", "current_activity": "done",
-            "inbox_cursor": review["message"]["seq"], "commitments": [],
+            "fatal": True, "category": "test", "stage": "lookup",
+            "inbox_cursor": 0, "commitments": [],
         },
     )
     handoff.control_release(run_dir, run["orchestrator"])
@@ -1149,7 +1145,7 @@ def fail_registered_run(run):
             "inbox_cursor": 0, "commitments": [],
         },
     )
-    assert handoff.status(Path(run["run_dir"]))["state"] == "failed"
+    assert handoff.is_fatal(Path(run["run_dir"])) is True
 
 
 def test_cli_runs_clean_single_removes_terminal_record_and_preserves_run(tmp_path, monkeypatch, capsys):
@@ -1162,11 +1158,11 @@ def test_cli_runs_clean_single_removes_terminal_record_and_preserves_run(tmp_pat
     entry = output["cleaned"][0]
     assert entry["run_id"] == run["run"]["run_id"]
     assert "credential_dir" not in entry["record"]
-    assert entry["note"] is None
+    assert entry["note"] == "worker reported a fatal error"
     assert entry["record_removed"] is True
     assert handoff_registry.list_records() == []
     # Registry-only: the run directory and credential files are untouched.
-    assert handoff.status(Path(run["run_dir"]))["state"] == "failed"
+    assert handoff.is_fatal(Path(run["run_dir"])) is True
     assert (run["private"] / "recovery.token").exists()
     assert (run["private"] / "worker.token").exists()
 
@@ -1213,7 +1209,7 @@ def test_cli_runs_clean_bulk_requires_confirmation_and_dry_run_changes_nothing(
     assert [entry["run_id"] for entry in result["cleaned"]] == [run["run"]["run_id"]]
     assert result["cleaned"][0]["record_removed"] is True
     assert handoff_registry.list_records() == []
-    assert handoff.status(Path(run["run_dir"]))["state"] == "failed"
+    assert handoff.is_fatal(Path(run["run_dir"])) is True
     assert (run["private"] / "recovery.token").exists()
 
 
@@ -1324,7 +1320,7 @@ def _emit_result(run, body="weather done"):
     )
 
 
-def test_conclude_accepts_integrates_pauses_and_releases(tmp_path, monkeypatch):
+def test_conclude_accepts_integrates_and_leaves_worker_to_pause(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])
     result = _emit_result(run)
@@ -1339,8 +1335,7 @@ def test_conclude_accepts_integrates_pauses_and_releases(tmp_path, monkeypatch):
 
     concluded = handoffctl._conclude_registered(
         "weather", disposition="accepted", body=None,
-        commit="deadbeef", no_integrate=False, reason="looks good",
-        final_stop=False,
+        commit="deadbeef", no_integrate=False, final_stop=False,
     )
 
     assert concluded["takeover"]["type"] == "orchestrator-takeover"
@@ -1353,21 +1348,18 @@ def test_conclude_accepts_integrates_pauses_and_releases(tmp_path, monkeypatch):
         "state": "integrated", "commit": "deadbeef", "reason": None,
     }
     assert concluded["integration_skipped"] is False
-    assert concluded["stop"] is None
-    assert concluded["stop_already_requested"] is False
-    assert concluded["pause"]["type"] == "pause"
-    assert concluded["pause"]["data"] == {"reason": "looks good"}
-    assert concluded["pause_already_requested"] is False
+    assert concluded["finished"] is False
+    assert concluded["finished_already"] is False
     assert concluded["doorbell_sent"] is True
     assert concluded["doorbell_error"] is None
     assert concluded["orchestrator_released"] is True
-    # Exactly one doorbell covers review -> integration -> pause.
+    # Exactly one doorbell covers review -> integration.
     assert doorbells == [(
-        "weather-worker", run["run"]["run_id"], concluded["pause"]["seq"],
+        "weather-worker", run["run"]["run_id"], concluded["integration"]["seq"],
     )]
     assert not list(run["private"].glob("orchestrator-conclude-*.token"))
     control = handoff.control_show(run_dir)
-    assert control["desired_state"] == "pause"
+    assert "desired_state" not in control
     assert handoff._parse_time(control["orchestrator_lease_expires_at"]) <= handoff._now()
     # The worker drains its inbox in order and projects paused, idling
     # resumably instead of exiting.
@@ -1375,14 +1367,14 @@ def test_conclude_accepts_integrates_pauses_and_releases(tmp_path, monkeypatch):
         run_dir, run["worker"], type="checkpoint", body="paused",
         data={
             "state": "paused", "stage": "complete", "current_activity": "paused",
-            "inbox_cursor": concluded["pause"]["seq"], "commitments": [],
+            "inbox_cursor": concluded["integration"]["seq"], "commitments": [],
         },
     )
     assert paused["status"]["state"] == "paused"
     assert handoff.doctor(run_dir)["ok"]
 
 
-def test_conclude_stop_integrates_stops_and_releases(tmp_path, monkeypatch):
+def test_conclude_stop_integrates_and_marks_finished(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])
     result = _emit_result(run)
@@ -1397,8 +1389,7 @@ def test_conclude_stop_integrates_stops_and_releases(tmp_path, monkeypatch):
 
     concluded = handoffctl._conclude_registered(
         "weather", disposition="accepted", body=None,
-        commit="deadbeef", no_integrate=False, reason="looks good",
-        final_stop=True,
+        commit="deadbeef", no_integrate=False, final_stop=True,
     )
 
     assert concluded["takeover"]["type"] == "orchestrator-takeover"
@@ -1411,38 +1402,61 @@ def test_conclude_stop_integrates_stops_and_releases(tmp_path, monkeypatch):
         "state": "integrated", "commit": "deadbeef", "reason": None,
     }
     assert concluded["integration_skipped"] is False
-    assert concluded["stop"]["type"] == "stop"
-    assert concluded["stop"]["data"] == {"reason": "looks good"}
-    assert concluded["stop_already_requested"] is False
-    assert concluded["pause"] is None
-    assert concluded["pause_already_requested"] is False
+    assert concluded["finished"] is True
+    assert concluded["finished_already"] is False
     assert concluded["doorbell_sent"] is True
     assert concluded["doorbell_error"] is None
     assert concluded["orchestrator_released"] is True
-    # Exactly one doorbell covers review -> integration -> stop.
+    # Exactly one doorbell covers review -> integration; termination is the
+    # registry marker rather than a worker lifecycle message.
     assert doorbells == [(
-        "weather-worker", run["run"]["run_id"], concluded["stop"]["seq"],
+        "weather-worker", run["run"]["run_id"], concluded["integration"]["seq"],
     )]
     assert not list(run["private"].glob("orchestrator-conclude-*.token"))
     control = handoff.control_show(run_dir)
+    assert "desired_state" not in control
     assert handoff._parse_time(control["orchestrator_lease_expires_at"]) <= handoff._now()
-    # The worker drains its inbox in order and projects succeeded, then stopped.
-    succeeded = handoff.emit(
-        run_dir, run["worker"], type="checkpoint", body="done",
+    assert handoff_registry.resolve("weather")["finished_at"] is not None
+    paused = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="paused",
         data={
-            "state": "succeeded", "stage": "complete", "current_activity": "done",
-            "inbox_cursor": concluded["stop"]["seq"], "commitments": [],
+            "state": "paused", "stage": "complete", "current_activity": "paused",
+            "inbox_cursor": concluded["integration"]["seq"], "commitments": [],
         },
     )
-    assert succeeded["status"]["state"] == "succeeded"
-    stopped = handoff.emit(
-        run_dir, run["worker"], type="checkpoint", body="stopped",
-        data={
-            "state": "stopped", "stage": "complete", "current_activity": "stopped",
-            "inbox_cursor": concluded["stop"]["seq"], "commitments": [],
-        },
+    assert paused["status"]["state"] == "paused"
+
+
+def test_conclude_stop_retry_after_lost_response_reuses_finished_sequence(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    result = _emit_result(run)
+    handoff.control_release(run_dir, run["orchestrator"])
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            pass
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    first = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit="deadbeef", no_integrate=False, final_stop=True,
     )
-    assert stopped["status"]["state"] == "stopped"
+    # Simulate the caller losing the successful response and retrying the
+    # exact operation.  The marker was written last, so it proves that the
+    # accepted review/integration sequence is already durable.
+    second = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit="deadbeef", no_integrate=False, final_stop=True,
+    )
+
+    assert first["finished_already"] is False
+    assert second["finished_already"] is True
+    assert second["review"]["message_id"] == first["review"]["message_id"]
+    assert second["review"]["reply_to"] == result["message"]["message_id"]
+    assert second["integration"]["message_id"] == first["integration"]["message_id"]
+    assert handoff_registry.resolve("weather")["finished_at"] is not None
 
 
 def test_conclude_skips_integration_when_result_has_no_head(tmp_path, monkeypatch):
@@ -1459,19 +1473,17 @@ def test_conclude_skips_integration_when_result_has_no_head(tmp_path, monkeypatc
 
     concluded = handoffctl._conclude_registered(
         "weather", disposition="accepted", body=None,
-        commit=None, no_integrate=False, reason="no commit to record",
-        final_stop=False,
+        commit=None, no_integrate=False, final_stop=False,
     )
 
     assert concluded["review"]["type"] == "review"
     assert concluded["integration"] is None
     assert concluded["integration_skipped"] is True
-    assert concluded["stop"] is None
-    assert concluded["pause"]["type"] == "pause"
+    assert concluded["finished"] is False
     assert concluded["doorbell_sent"] is True
     control = handoff.control_show(run_dir)
     assert control["integration"]["state"] == "pending"
-    assert control["desired_state"] == "pause"
+    assert "desired_state" not in control
 
 
 def test_conclude_changes_requested_resumes_worker(tmp_path, monkeypatch):
@@ -1490,7 +1502,6 @@ def test_conclude_changes_requested_resumes_worker(tmp_path, monkeypatch):
     concluded = handoffctl._conclude_registered(
         "weather", disposition="changes_requested", body="please redo the fetch",
         commit=None, no_integrate=False,
-        reason="Result accepted and integrated; concluding run",
         final_stop=False,
     )
 
@@ -1500,7 +1511,7 @@ def test_conclude_changes_requested_resumes_worker(tmp_path, monkeypatch):
     assert concluded["review"]["body"] == "please redo the fetch"
     assert concluded["integration"] is None
     assert concluded["integration_skipped"] is False
-    assert concluded["stop"] is None
+    assert concluded["finished"] is False
     assert concluded["doorbell_sent"] is True
     assert doorbells == [(
         "weather-worker", run["run"]["run_id"], concluded["review"]["seq"],
@@ -1508,7 +1519,7 @@ def test_conclude_changes_requested_resumes_worker(tmp_path, monkeypatch):
     control = handoff.control_show(run_dir)
     assert control["review_state"] == "changes_requested"
     assert control["integration"]["state"] == "pending"
-    assert control["desired_state"] == "run"
+    assert "desired_state" not in control
     # The worker resumes against the changes-requested review.
     resumed = handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="reworking",
@@ -1553,7 +1564,7 @@ def test_conclude_refuses_an_active_orchestrator_lease(tmp_path, monkeypatch):
     with pytest.raises(handoff.HandoffError, match="lease is active"):
         handoffctl._conclude_registered(
             "weather", disposition="accepted", body=None,
-            commit=None, no_integrate=False, reason="too early",
+            commit=None, no_integrate=False,
             final_stop=False,
         )
 
@@ -1574,7 +1585,7 @@ def test_failed_conclude_releases_ephemeral_orchestrator(tmp_path, monkeypatch):
     with pytest.raises(handoff.HandoffError, match="integration exploded"):
         handoffctl._conclude_registered(
             "weather", disposition="accepted", body=None,
-            commit="deadbeef", no_integrate=False, reason="looks good",
+            commit="deadbeef", no_integrate=False,
             final_stop=False,
         )
 
@@ -1596,7 +1607,7 @@ def test_conclude_resumes_after_mid_sequence_crash(tmp_path, monkeypatch):
     handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="done",
         data={
-            "state": "succeeded", "stage": "complete", "current_activity": "done",
+            "state": "paused", "stage": "complete", "current_activity": "paused",
             "inbox_cursor": review["message"]["seq"], "commitments": [],
         },
     )
@@ -1613,7 +1624,7 @@ def test_conclude_resumes_after_mid_sequence_crash(tmp_path, monkeypatch):
 
     concluded = handoffctl._conclude_registered(
         "weather", disposition="accepted", body=None,
-        commit="deadbeef", no_integrate=False, reason="resuming conclude",
+        commit="deadbeef", no_integrate=False,
         final_stop=False,
     )
 
@@ -1621,26 +1632,25 @@ def test_conclude_resumes_after_mid_sequence_crash(tmp_path, monkeypatch):
     assert concluded["consumed_through"] == 1
     assert concluded["integration"]["data"]["state"] == "integrated"
     assert concluded["integration_skipped"] is False
-    assert concluded["stop"] is None
-    assert concluded["pause"]["type"] == "pause"
+    assert concluded["finished"] is False
     assert concluded["doorbell_sent"] is True
     assert concluded["orchestrator_released"] is True
     assert doorbells == [(
-        "weather-worker", run["run"]["run_id"], concluded["pause"]["seq"],
+        "weather-worker", run["run"]["run_id"], concluded["integration"]["seq"],
     )]
     assert not list(run["private"].glob("orchestrator-conclude-*.token"))
-    # The succeeded worker drains integration + pause and idles resumably.
+    # The paused worker drains the integration record and remains idle.
     paused = handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="paused",
         data={
             "state": "paused", "stage": "complete", "current_activity": "paused",
-            "inbox_cursor": concluded["pause"]["seq"], "commitments": [],
+            "inbox_cursor": concluded["integration"]["seq"], "commitments": [],
         },
     )
     assert paused["status"]["state"] == "paused"
 
 
-def test_conclude_resumes_a_crash_between_integration_and_pause(tmp_path, monkeypatch):
+def test_conclude_resumes_a_crash_after_integration(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])
     result = _emit_result(run)
@@ -1652,7 +1662,7 @@ def test_conclude_resumes_a_crash_between_integration_and_pause(tmp_path, monkey
     )
     handoff.control_integrate(run_dir, run["orchestrator"], commit="deadbeef")
     # The previous conclude crashed after the integration record but before
-    # the lifecycle message: review accepted, integration recorded, no pause.
+    # returning/ringing: review accepted and integration recorded.
     handoff.control_release(run_dir, run["orchestrator"])
     doorbells = []
 
@@ -1664,28 +1674,25 @@ def test_conclude_resumes_a_crash_between_integration_and_pause(tmp_path, monkey
 
     concluded = handoffctl._conclude_registered(
         "weather", disposition="accepted", body=None,
-        commit="deadbeef", no_integrate=False, reason="resuming conclude",
+        commit="deadbeef", no_integrate=False,
         final_stop=False,
     )
 
     assert concluded["review"] is None
     assert concluded["integration"] is None
     assert concluded["integration_skipped"] is False
-    assert concluded["stop"] is None
-    assert concluded["pause"]["type"] == "pause"
-    assert concluded["pause_already_requested"] is False
+    assert concluded["finished"] is False
     assert concluded["doorbell_sent"] is True
-    assert doorbells == [(
-        "weather-worker", run["run"]["run_id"], concluded["pause"]["seq"],
-    )]
+    inbox_tail = len(handoff.read(run_dir, "inbox"))
+    assert doorbells == [("weather-worker", run["run"]["run_id"], inbox_tail)]
     control = handoff.control_show(run_dir)
-    assert control["desired_state"] == "pause"
-    # The worker drains review, integration, and pause in order and idles.
+    assert "desired_state" not in control
+    # The worker drains review, integration, and takeover in order and idles.
     paused = handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="paused",
         data={
             "state": "paused", "stage": "complete", "current_activity": "paused",
-            "inbox_cursor": concluded["pause"]["seq"], "commitments": [],
+            "inbox_cursor": inbox_tail, "commitments": [],
         },
     )
     assert paused["status"]["state"] == "paused"
@@ -1708,7 +1715,7 @@ def test_remote_conclude_uses_one_structured_ssh_request(tmp_path, monkeypatch):
         observed.update(host=host, argv=remote_argv, stdin=stdin, timeout=timeout)
         return subprocess.CompletedProcess(
             remote_argv, 0,
-            stdout=json.dumps({"pause": {"seq": 4}, "doorbell_sent": True}),
+            stdout=json.dumps({"finished": False, "doorbell_sent": True}),
             stderr="",
         )
 
@@ -1716,7 +1723,7 @@ def test_remote_conclude_uses_one_structured_ssh_request(tmp_path, monkeypatch):
 
     result = handoffctl._conclude_registered(
         "remote-weather", disposition="changes_requested", body="redo it ; $(touch NOPE)",
-        commit=None, no_integrate=False, reason="smoke done",
+        commit=None, no_integrate=False,
         final_stop=False,
     )
 
@@ -1727,8 +1734,9 @@ def test_remote_conclude_uses_one_structured_ssh_request(tmp_path, monkeypatch):
     assert argv[1:3] == ["-m", "agents.orchestration.handoffctl"]
     assert argv[3:6] == ["conclude", "--run", "remote-run"]
     assert argv[argv.index("--disposition") + 1] == "changes-requested"
-    # The reason travels as one argv element; the body travels over stdin.
-    assert argv[argv.index("--reason") + 1] == "smoke done"
+    # The review body travels over stdin; lifecycle reasons/messages no longer
+    # exist in the collapsed protocol.
+    assert "--reason" not in argv
     assert argv[argv.index("--body-file") + 1] == "-"
     assert "--stop" not in argv
     assert observed["stdin"] == "redo it ; $(touch NOPE)"
@@ -1751,7 +1759,10 @@ def test_remote_conclude_stop_flag_uses_one_structured_ssh_request(tmp_path, mon
         observed.update(host=host, argv=remote_argv, stdin=stdin, timeout=timeout)
         return subprocess.CompletedProcess(
             remote_argv, 0,
-            stdout=json.dumps({"stop": {"seq": 4}, "doorbell_sent": True}),
+            stdout=json.dumps({
+                "finished": True, "finished_already": False,
+                "doorbell_sent": True,
+            }),
             stderr="",
         )
 
@@ -1759,7 +1770,7 @@ def test_remote_conclude_stop_flag_uses_one_structured_ssh_request(tmp_path, mon
 
     result = handoffctl._conclude_registered(
         "remote-weather", disposition="accepted", body=None,
-        commit="deadbeef", no_integrate=False, reason="smoke done",
+        commit="deadbeef", no_integrate=False,
         final_stop=True,
     )
 
@@ -1769,9 +1780,10 @@ def test_remote_conclude_stop_flag_uses_one_structured_ssh_request(tmp_path, mon
     assert argv[1:3] == ["-m", "agents.orchestration.handoffctl"]
     assert argv[3:6] == ["conclude", "--run", "remote-run"]
     assert "--stop" in argv
-    assert argv[argv.index("--reason") + 1] == "smoke done"
+    assert "--reason" not in argv
     assert argv[argv.index("--commit") + 1] == "deadbeef"
     assert observed["stdin"] is None
+    assert handoff_registry.resolve("remote-weather")["finished_at"] is not None
 
 
 def test_conclude_pause_resume_and_reconclude_cycle(tmp_path, monkeypatch):
@@ -1789,22 +1801,21 @@ def test_conclude_pause_resume_and_reconclude_cycle(tmp_path, monkeypatch):
 
     concluded = handoffctl._conclude_registered(
         "weather", disposition="accepted", body=None,
-        commit="deadbeef", no_integrate=False, reason="pause one",
+        commit="deadbeef", no_integrate=False,
         final_stop=False,
     )
 
-    assert concluded["stop"] is None
-    assert concluded["pause"]["type"] == "pause"
+    assert concluded["finished"] is False
     control = handoff.control_show(run_dir)
-    assert control["desired_state"] == "pause"
+    assert "desired_state" not in control
     inbox_types = [message["type"] for message in handoff.read(run_dir, "inbox")]
-    assert inbox_types == ["orchestrator-takeover", "review", "integration", "pause"]
+    assert inbox_types == ["orchestrator-takeover", "review", "integration"]
 
     paused = handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="paused",
         data={
             "state": "paused", "stage": "complete", "current_activity": "paused",
-            "inbox_cursor": concluded["pause"]["seq"], "commitments": [],
+            "inbox_cursor": concluded["integration"]["seq"], "commitments": [],
         },
     )
     assert paused["status"]["state"] == "paused"
@@ -1833,19 +1844,16 @@ def test_conclude_pause_resume_and_reconclude_cycle(tmp_path, monkeypatch):
 
     reconcluded = handoffctl._conclude_registered(
         "weather", disposition="accepted", body=None,
-        commit="cafebabe", no_integrate=False, reason="pause two",
+        commit="cafebabe", no_integrate=False,
         final_stop=False,
     )
 
     assert reconcluded["review"]["reply_to"] == second["message"]["message_id"]
     assert reconcluded["integration"]["data"]["commit"] == "cafebabe"
-    # The pause from the first conclude is still in effect; re-sending it
-    # would fail, so the second conclude reports it as already requested.
-    assert reconcluded["pause"] is None
-    assert reconcluded["pause_already_requested"] is True
-    assert handoff.control_show(run_dir)["desired_state"] == "pause"
+    assert reconcluded["finished"] is False
+    assert "desired_state" not in handoff.control_show(run_dir)
 
-    # The worker pauses again on the strength of the original pause message.
+    # The worker pauses again on the strength of the new accepted review.
     repaused = handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="paused again",
         data={
@@ -1854,6 +1862,132 @@ def test_conclude_pause_resume_and_reconclude_cycle(tmp_path, monkeypatch):
         },
     )
     assert repaused["status"]["state"] == "paused"
+
+    # A third dispatch still reaches the live, idle worker.
+    third = handoffctl._dispatch_registered("weather", "once more")
+    assert third["message"]["type"] == "steer"
+    assert handoff.doctor(run_dir)["ok"]
+
+
+def test_dispatch_recovers_a_wedged_succeeded_run(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    result = _emit_result(run)
+    handoff.control_consume(run_dir, run["orchestrator"], through=1)
+    review = handoff.send(
+        run_dir, run["orchestrator"], type="review",
+        reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
+    )
+    handoff.control_integrate(run_dir, run["orchestrator"], commit="deadbeef")
+    control = handoff.control_show(run_dir)
+    control["desired_state"] = "pause"
+    handoff._atomic_json(run_dir / "control.json", control)  # noqa: SLF001
+    # The 2026-07-22 incident state: the worker reported success without a
+    # lifecycle message, leaving a stale desired_state that made the live,
+    # idle worker unreachable by dispatch and reap-eligible by runs clean.
+    parked = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="done",
+        data={
+            "state": "succeeded", "stage": "complete", "current_activity": "done",
+            "inbox_cursor": review["message"]["seq"], "commitments": [],
+        },
+    )
+    assert parked["status"]["state"] == "paused"
+    status = handoff.status(run_dir)
+    status["state"] = "succeeded"
+    handoff._atomic_json(run_dir / "status.json", status)  # noqa: SLF001
+    handoff.control_release(run_dir, run["orchestrator"])
+    doorbells = []
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            doorbells.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    dispatched = handoffctl._dispatch_registered("weather", "keep going")
+    assert dispatched["message"]["type"] == "steer"
+    assert dispatched["doorbell_sent"] is True
+    resumed = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="resumed",
+        data={
+            "state": "working", "stage": "lookup", "current_activity": "working",
+            "inbox_cursor": dispatched["message"]["seq"], "commitments": [],
+        },
+    )
+    assert resumed["status"]["state"] == "working"
+    assert handoff.doctor(run_dir)["ok"]
+
+
+def test_conclude_pause_resume_multi_message_window(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    _emit_result(run)
+    handoff.control_release(run_dir, run["orchestrator"])
+    doorbells = []
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            doorbells.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    concluded = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit="deadbeef", no_integrate=False,
+        final_stop=False,
+    )
+    paused = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="paused",
+        data={
+            "state": "paused", "stage": "complete", "current_activity": "paused",
+            "inbox_cursor": concluded["integration"]["seq"], "commitments": [],
+        },
+    )
+    assert paused["status"]["state"] == "paused"
+
+    # Every message in the resumed window — the first steer, the blocking
+    # question's answer, and a later steer — must pass the integration guard.
+    dispatched = handoffctl._dispatch_registered("weather", "refresh the forecast")
+    assert dispatched["message"]["type"] == "steer"
+    resumed = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="resumed",
+        data={
+            "state": "working", "stage": "lookup", "current_activity": "refreshing",
+            "inbox_cursor": dispatched["message"]["seq"], "commitments": [],
+        },
+    )
+    assert resumed["status"]["state"] == "working"
+    question = handoff.emit(
+        run_dir, run["worker"], type="question", body="which source?",
+        data={
+            "blocking": True, "stage": "lookup", "current_activity": "awaiting direction",
+            "inbox_cursor": dispatched["message"]["seq"], "commitments": [],
+        },
+    )
+    assert question["status"]["state"] == "blocked"
+    answered = handoffctl._dispatch_registered("weather", "use the met office")
+    assert answered["message"]["type"] == "answer"
+    assert answered["answered_question"] == question["message"]["message_id"]
+    resumed = handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="resumed",
+        data={
+            "state": "working", "stage": "lookup", "current_activity": "refreshing",
+            "inbox_cursor": answered["message"]["seq"], "commitments": [],
+        },
+    )
+    assert resumed["status"]["state"] == "working"
+    followup = handoffctl._dispatch_registered("weather", "include tomorrow")
+    assert followup["message"]["type"] == "steer"
+    second = handoff.emit(
+        run_dir, run["worker"], type="result", body="fresh weather",
+        data={
+            "head": None, "dirty": False, "stage": "complete",
+            "inbox_cursor": followup["message"]["seq"],
+            "verification": [], "commitments": [],
+        },
+    )
+    assert second["status"]["state"] == "awaiting_review"
     assert handoff.doctor(run_dir)["ok"]
 
 
@@ -1866,12 +2000,11 @@ def test_stop_requests_final_stop_for_a_paused_run(tmp_path, monkeypatch):
         run_dir, run["orchestrator"], type="review",
         reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
     )
-    handoff.send(run_dir, run["orchestrator"], type="pause", data={"reason": "idle"})
     handoff.emit(
         run_dir, run["worker"], type="checkpoint", body="paused",
         data={
             "state": "paused", "stage": "complete", "current_activity": "paused",
-            "inbox_cursor": review["message"]["seq"] + 1, "commitments": [],
+            "inbox_cursor": review["message"]["seq"], "commitments": [],
         },
     )
     handoff.control_release(run_dir, run["orchestrator"])
@@ -1883,34 +2016,25 @@ def test_stop_requests_final_stop_for_a_paused_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
 
-    stopped = handoffctl._stop_registered("weather", reason="wrap up")
+    stopped = handoffctl._stop_registered("weather")
 
     assert stopped["takeover"]["type"] == "orchestrator-takeover"
-    assert stopped["stop"]["type"] == "stop"
-    assert stopped["stop"]["data"] == {"reason": "wrap up"}
-    assert stopped["doorbell_sent"] is True
+    assert stopped["finished"] is True
+    assert stopped["finished_already"] is False
+    assert stopped["doorbell_sent"] is False
     assert stopped["doorbell_error"] is None
     assert stopped["orchestrator_released"] is True
-    assert doorbells == [(
-        "weather-worker", run["run"]["run_id"], stopped["stop"]["seq"],
-    )]
+    assert doorbells == []
     assert not list(run["private"].glob("orchestrator-stop-*.token"))
     control = handoff.control_show(run_dir)
-    assert control["desired_state"] == "stop"
+    assert "desired_state" not in control
     assert handoff._parse_time(control["orchestrator_lease_expires_at"]) <= handoff._now()
-    # The paused worker stops directly, without succeeded first.
-    final = handoff.emit(
-        run_dir, run["worker"], type="checkpoint", body="stopped",
-        data={
-            "state": "stopped", "stage": "complete", "current_activity": "stopped",
-            "inbox_cursor": stopped["stop"]["seq"], "commitments": [],
-        },
-    )
-    assert final["status"]["state"] == "stopped"
+    assert handoff_registry.resolve("weather")["finished_at"] is not None
+    assert handoff.status(run_dir)["state"] == "paused"
     assert handoff.doctor(run_dir)["ok"]
 
 
-def test_stop_refuses_already_stopped_and_terminal_runs(tmp_path, monkeypatch):
+def test_stop_is_idempotent_for_an_already_finished_run(tmp_path, monkeypatch):
     run = registered_run(tmp_path, monkeypatch)
     run_dir = Path(run["run_dir"])
     handoff.control_release(run_dir, run["orchestrator"])
@@ -1921,17 +2045,22 @@ def test_stop_refuses_already_stopped_and_terminal_runs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
 
-    first = handoffctl._stop_registered("weather", reason="first")
-    assert first["stop"]["type"] == "stop"
+    first = handoffctl._stop_registered("weather")
+    assert first["finished"] is True
+    assert first["finished_already"] is False
 
-    with pytest.raises(handoff.HandoffError, match="stop was already requested"):
-        handoffctl._stop_registered("weather", reason="again")
+    second = handoffctl._stop_registered("weather")
+    assert second["finished"] is True
+    assert second["finished_already"] is True
     assert not list(run["private"].glob("orchestrator-stop-*.token"))
 
-    # A terminally failed worker has nothing left to stop.
+
+def test_stop_refuses_a_fatal_worker_epoch(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
     fail_registered_run(run)
+    handoff.control_release(Path(run["run_dir"]), run["orchestrator"])
     with pytest.raises(handoff.HandoffError, match="terminal"):
-        handoffctl._stop_registered("weather", reason="too late")
+        handoffctl._stop_registered("weather")
     assert not list(run["private"].glob("orchestrator-stop-*.token"))
 
 
@@ -1951,23 +2080,26 @@ def test_remote_stop_uses_one_structured_ssh_request(tmp_path, monkeypatch):
         observed.update(host=host, argv=remote_argv, stdin=stdin, timeout=timeout)
         return subprocess.CompletedProcess(
             remote_argv, 0,
-            stdout=json.dumps({"stop": {"seq": 4}, "doorbell_sent": True}),
+            stdout=json.dumps({
+                "finished": True, "finished_already": False,
+                "doorbell_sent": False,
+            }),
             stderr="",
         )
 
     monkeypatch.setattr(handoffctl.handoff_launcher, "_run_ssh", fake_ssh)
 
-    result = handoffctl._stop_registered("remote-weather", reason="wrap up ; $(touch NOPE)")
+    result = handoffctl._stop_registered("remote-weather")
 
-    assert result["doorbell_sent"] is True
+    assert result["finished"] is True
     assert observed["host"] == "oci-box"
     argv = observed["argv"]
     assert argv[0] == "/remote/python"
     assert argv[1:3] == ["-m", "agents.orchestration.handoffctl"]
     assert argv[3:6] == ["stop", "--run", "remote-run"]
-    assert argv[argv.index("--reason") + 1] == "wrap up ; $(touch NOPE)"
+    assert "--reason" not in argv
     assert observed["stdin"] is None
-    assert not (tmp_path / "NOPE").exists()
+    assert handoff_registry.resolve("remote-weather")["finished_at"] is not None
 
 
 def test_cli_conclude_defaults_to_pause_and_stop_finishes(tmp_path, monkeypatch, capsys):
@@ -1984,24 +2116,21 @@ def test_cli_conclude_defaults_to_pause_and_stop_finishes(tmp_path, monkeypatch,
 
     assert handoffctl.main(["conclude", "--run", "weather"]) == 0
     concluded = json.loads(capsys.readouterr().out)
-    assert concluded["pause"]["type"] == "pause"
-    assert concluded["pause"]["data"] == {"reason": handoffctl.CONCLUDE_PAUSE_REASON}
-    assert concluded["stop"] is None
-    assert handoff.control_show(run_dir)["desired_state"] == "pause"
+    assert concluded["finished"] is False
+    assert "desired_state" not in handoff.control_show(run_dir)
 
-    # A repeated conclude is idempotent about the pause.
+    # A repeated conclude safely resumes the already-durable sequence.
     assert handoffctl.main(["conclude", "--run", "weather"]) == 0
     reconcluded = json.loads(capsys.readouterr().out)
-    assert reconcluded["pause"] is None
-    assert reconcluded["pause_already_requested"] is True
+    assert reconcluded["finished"] is False
 
     assert handoffctl.main(["stop", "--run", "weather"]) == 0
     stopped = json.loads(capsys.readouterr().out)
-    assert stopped["stop"]["type"] == "stop"
-    assert handoff.control_show(run_dir)["desired_state"] == "stop"
+    assert stopped["finished"] is True
+    assert handoff_registry.resolve("weather")["finished_at"] is not None
 
 
-def test_cli_conclude_stop_flag_and_stop_refuses_a_stopped_run(tmp_path, monkeypatch, capsys):
+def test_cli_conclude_stop_flag_and_stop_is_idempotent(tmp_path, monkeypatch, capsys):
     run = registered_run(tmp_path, monkeypatch)
     _emit_result(run)
     handoff.control_release(Path(run["run_dir"]), run["orchestrator"])
@@ -2014,9 +2143,8 @@ def test_cli_conclude_stop_flag_and_stop_refuses_a_stopped_run(tmp_path, monkeyp
 
     assert handoffctl.main(["conclude", "--run", "weather", "--stop"]) == 0
     concluded = json.loads(capsys.readouterr().out)
-    assert concluded["stop"]["type"] == "stop"
-    assert concluded["stop"]["data"] == {"reason": handoffctl.CONCLUDE_STOP_REASON}
-    assert concluded["pause"] is None
+    assert concluded["finished"] is True
+    assert concluded["finished_already"] is False
 
     # --stop requires the accepted disposition.
     body = tmp_path / "review.md"
@@ -2027,9 +2155,10 @@ def test_cli_conclude_stop_flag_and_stop_refuses_a_stopped_run(tmp_path, monkeyp
     ]) == 2
     assert "--disposition accepted" in capsys.readouterr().err
 
-    # The stop was already requested, so the standalone stop refuses.
-    assert handoffctl.main(["stop", "--run", "weather"]) == 4
-    assert "stop was already requested" in capsys.readouterr().err
+    # A lost-response retry through standalone stop is idempotent success.
+    assert handoffctl.main(["stop", "--run", "weather"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["finished_already"] is True
 
 
 def test_cli_retry_seconds_is_accepted_and_threaded(tmp_path):

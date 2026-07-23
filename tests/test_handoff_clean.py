@@ -83,12 +83,15 @@ def fail_run(run):
             "inbox_cursor": 0, "commitments": [],
         },
     )
-    assert handoff.status(run["run_dir"])["state"] == "failed"
+    assert handoff.is_fatal(Path(run["run_dir"])) is True
 
 
 def stop_run(run):
-    orchestrator = (run["private"] / "orchestrator.token").read_bytes()
-    handoff.send(run["run_dir"], orchestrator, type="stop", body="concluded", data={"reason": "accepted"})
+    # Construct a pre-collapse control snapshot.  Legacy desired_state stays
+    # readable and terminal for cleanup, but current code cannot write it.
+    control = handoff.control_show(Path(run["run_dir"]))
+    control["desired_state"] = "stop"
+    handoff._atomic_json(Path(run["run_dir"]) / "control.json", control)  # noqa: SLF001
     assert handoff.control_show(run["run_dir"])["desired_state"] == "stop"
 
 
@@ -108,16 +111,15 @@ def pause_run(run):
         run_dir, orchestrator, type="review",
         reply_to=result["message"]["message_id"], data={"disposition": "accepted"},
     )
-    handoff.send(run_dir, orchestrator, type="pause", data={"reason": "idle"})
     handoff.emit(
         run_dir, worker, type="checkpoint", body="paused",
         data={
             "state": "paused", "stage": "complete", "current_activity": "paused",
-            "inbox_cursor": review["message"]["seq"] + 1, "commitments": [],
+            "inbox_cursor": review["message"]["seq"], "commitments": [],
         },
     )
     assert handoff.status(run_dir)["state"] == "paused"
-    assert handoff.control_show(run_dir)["desired_state"] == "pause"
+    assert "desired_state" not in handoff.control_show(run_dir)
 
 
 def corrupt_record(registry, key="run-broken", **extra):
@@ -160,20 +162,21 @@ def test_clean_single_terminal_run_removes_record_and_preserves_run(tmp_path, mo
     registry = tmp_path / "registry.json"
     run = live_run(tmp_path, registry)
     fail_run(run)
-    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux())
+    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux("worker-run-live"))
 
     result = handoff_clean.clean(selector="run-one", path=registry)
 
     entry = result["cleaned"][0]
     assert entry["run_id"] == "run-one"
-    assert entry["note"] is None
+    assert entry["note"] == "worker reported a fatal error"
     assert entry["session"] == "none"
     assert entry["record_removed"] is True
     assert "credential_dir" not in entry["record"]
     assert result["dry_run"] is False
     assert handoff_registry.list_records(path=registry) == []
     # The run directory and credential files are untouched.
-    assert handoff.status(run["run_dir"])["state"] == "failed"
+    assert handoff.status(run["run_dir"])["state"] == "starting"
+    assert handoff.is_fatal(Path(run["run_dir"])) is True
     assert (run["private"] / "recovery.token").exists()
     assert (run["private"] / "worker.token").exists()
 
@@ -196,7 +199,7 @@ def test_clean_bulk_dry_run_changes_nothing_and_reports_skips(tmp_path, monkeypa
     fail_run(terminal)
     live_run(tmp_path, registry, run_id="run-live")
     record(registry, run_id="run-dangling")
-    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux())
+    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux("worker-run-live"))
     before = registry.read_text()
 
     result = handoff_clean.clean(path=registry, dry_run=True)
@@ -204,7 +207,7 @@ def test_clean_bulk_dry_run_changes_nothing_and_reports_skips(tmp_path, monkeypa
     assert result["dry_run"] is True
     cleaned = {entry["run_id"]: entry for entry in result["cleaned"]}
     assert set(cleaned) == {"run-terminal", "run-dangling"}
-    assert cleaned["run-terminal"]["note"] is None
+    assert cleaned["run-terminal"]["note"] == "worker reported a fatal error"
     assert cleaned["run-terminal"]["record_removed"] is False
     assert "dangling" in cleaned["run-dangling"]["note"]
     assert [skip["run_id"] for skip in result["skipped"]] == ["run-live"]
@@ -217,7 +220,7 @@ def test_clean_bulk_removes_terminal_records_and_preserves_run_files(tmp_path, m
     terminal = live_run(tmp_path, registry, run_id="run-terminal")
     fail_run(terminal)
     live_run(tmp_path, registry, run_id="run-live")
-    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux())
+    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux("worker-run-live"))
 
     result = handoff_clean.clean(path=registry)
 
@@ -225,14 +228,15 @@ def test_clean_bulk_removes_terminal_records_and_preserves_run_files(tmp_path, m
     assert [entry["run_id"] for entry in result["cleaned"]] == ["run-terminal"]
     assert [skip["run_id"] for skip in result["skipped"]] == ["run-live"]
     assert [item["run_id"] for item in handoff_registry.list_records(path=registry)] == ["run-live"]
-    assert handoff.status(terminal["run_dir"])["state"] == "failed"
+    assert handoff.status(terminal["run_dir"])["state"] == "starting"
+    assert handoff.is_fatal(Path(terminal["run_dir"])) is True
     assert (terminal["private"] / "recovery.token").exists()
 
 
 def test_clean_bulk_force_includes_live_records_with_a_note(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     run = live_run(tmp_path, registry, run_id="run-live")
-    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux())
+    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux("worker-run-live"))
 
     result = handoff_clean.clean(path=registry, force=True)
 
@@ -265,12 +269,12 @@ def test_clean_desired_state_stop_counts_as_terminal(tmp_path, monkeypatch):
 
 
 def test_clean_skips_a_paused_run_until_forced(tmp_path, monkeypatch):
-    """A paused worker idles resumably; desired_state pause is not terminal, so
+    """A paused worker idles resumably and is not terminal, so
     cleanup must leave the run (and its resident session) alone unless forced."""
     registry = tmp_path / "registry.json"
     run = live_run(tmp_path, registry)
     pause_run(run)
-    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux())
+    monkeypatch.setattr(handoff_launcher, "_run", FakeTmux("worker-run-one"))
 
     result = handoff_clean.clean(path=registry)
 
@@ -297,6 +301,31 @@ def test_clean_dangling_run_dir_is_terminal(tmp_path, monkeypatch):
     assert result["cleaned"][0]["run_id"] == "run-one"
     assert "dangling" in result["cleaned"][0]["note"]
     assert handoff_registry.list_records(path=registry) == []
+
+
+@pytest.mark.parametrize("fact", ["fatal", "finished", "dead"])
+def test_clean_fact_filters_select_and_reap_only_matching_runs(tmp_path, monkeypatch, fact):
+    registry = tmp_path / "registry.json"
+    fatal_run = live_run(tmp_path, registry, run_id="run-fatal")
+    fail_run(fatal_run)
+    live_run(tmp_path, registry, run_id="run-finished")
+    handoff_registry.mark_finished("run-finished", path=registry)
+    live_run(tmp_path, registry, run_id="run-dead")
+    # A missing session is a positive transport fact.  The other two sessions
+    # remain live so each selective cleanup demonstrates its own predicate.
+    tmux = FakeTmux("worker-run-fatal", "worker-run-finished")
+    monkeypatch.setattr(handoff_launcher, "_run", tmux)
+
+    result = handoff_clean.clean(path=registry, **{fact: True})
+
+    assert [entry["run_id"] for entry in result["cleaned"]] == [f"run-{fact}"]
+    assert result["scope"]["facts"] == [fact]
+    assert {skip["run_id"] for skip in result["skipped"]} == {
+        "run-fatal", "run-finished", "run-dead",
+    } - {f"run-{fact}"}
+    assert {item["run_id"] for item in handoff_registry.list_records(path=registry)} == {
+        "run-fatal", "run-finished", "run-dead",
+    } - {f"run-{fact}"}
 
 
 # --- Local session killing ----------------------------------------------------
@@ -346,6 +375,23 @@ def test_clean_dry_run_reports_a_live_terminal_session_without_killing(tmp_path,
     assert len(handoff_registry.list_records(path=registry)) == 1
 
 
+def test_clean_tmux_unreachable_skips_instead_of_presuming_absence(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    run = live_run(tmp_path, registry)
+    fail_run(run)
+
+    def unreachable(argv, *, check=True):
+        raise handoff_launcher.AdapterError("tmux binary unavailable")
+
+    monkeypatch.setattr(handoff_launcher, "_run", unreachable)
+
+    result = handoff_clean.clean(selector="run-one", path=registry)
+
+    assert result["cleaned"] == []
+    assert "liveness is unknown" in result["skipped"][0]["reason"]
+    assert handoff_registry.resolve("run-one", path=registry)["run_id"] == "run-one"
+
+
 # --- cmux surface closing ------------------------------------------------------
 
 TARGET = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -387,7 +433,7 @@ def test_clean_closes_cmux_surface_with_layout_verification(tmp_path, monkeypatc
     assert handoff_registry.list_records(path=registry) == []
 
 
-def test_clean_cmux_unreachable_counts_as_no_session(tmp_path, monkeypatch):
+def test_clean_cmux_unreachable_skips_instead_of_presuming_absence(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     run = live_run(tmp_path, registry, session_transport="cmux", handle=TARGET)
     fail_run(run)
@@ -399,10 +445,9 @@ def test_clean_cmux_unreachable_counts_as_no_session(tmp_path, monkeypatch):
 
     result = handoff_clean.clean(selector="run-one", path=registry)
 
-    entry = result["cleaned"][0]
-    assert entry["session"] == "none"
-    assert "unreachable" in entry["session_note"]
-    assert handoff_registry.list_records(path=registry) == []
+    assert result["cleaned"] == []
+    assert "liveness is unknown" in result["skipped"][0]["reason"]
+    assert handoff_registry.resolve("run-one", path=registry)["run_id"] == "run-one"
 
 
 def test_clean_cmux_layout_change_beyond_target_is_a_loud_error(tmp_path, monkeypatch):
@@ -675,6 +720,34 @@ def test_clean_remote_kill_mode_kills_and_removes_records(tmp_path, monkeypatch)
     assert entry["host"] == "oci-box"
     assert [skip["run_id"] for skip in result["skipped"]] == ["run-live"]
     assert [item["run_id"] for item in handoff_registry.list_records(path=registry)] == ["run-live"]
+
+
+def test_clean_remote_fact_filter_is_forwarded_before_any_kill(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    remote_record(registry, "run-finished")
+    remote_record(registry, "run-fatal")
+    seen = {}
+    monkeypatch.setattr(handoff_launcher, "_run_ssh", fake_ssh_returning([
+        {
+            "run_id": "run-finished", "handle": "remote-run-finished",
+            "run_dir": "/state/run-finished", "run_dir_present": True,
+            "state": "paused", "session_alive": True, "terminal": True,
+            "finished": True, "fatal": False, "selected": True, "killed": True,
+        },
+        {
+            "run_id": "run-fatal", "handle": "remote-run-fatal",
+            "run_dir": "/state/run-fatal", "run_dir_present": True,
+            "state": "working", "session_alive": True, "terminal": True,
+            "finished": False, "fatal": True, "selected": False,
+        },
+    ], seen))
+
+    result = handoff_clean.clean(path=registry, finished=True)
+
+    assert all(item["facts"] == ["finished"] for item in seen["payload"])
+    assert [entry["run_id"] for entry in result["cleaned"]] == ["run-finished"]
+    assert [skip["run_id"] for skip in result["skipped"]] == ["run-fatal"]
+    assert handoff_registry.resolve("run-fatal", path=registry)["run_id"] == "run-fatal"
 
 
 def test_clean_remote_terminal_without_session_still_cleans_the_record(tmp_path, monkeypatch):

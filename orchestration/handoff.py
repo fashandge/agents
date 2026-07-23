@@ -46,11 +46,23 @@ INBOX_TYPES = {
     "integration", "orchestrator-takeover", "worker-relaunched", "stop", "pause",
 }
 SYSTEM_INBOX_TYPES = {"integration", "orchestrator-takeover", "worker-relaunched"}
+# ``stop``/``pause`` are retired from the *writable* vocabulary but stay in
+# INBOX_TYPES permanently: append-only journals make historical records
+# readable forever, and a skewed older remote host may still emit them.
+SENDABLE_TYPES = INBOX_TYPES - SYSTEM_INBOX_TYPES - {"stop", "pause"}
+# Messages that deliver work (or changed inputs) to the worker epoch.
+WORK_MESSAGE_TYPES = {"steer", "answer", "supersede", "input-changed", "base-changed"}
 OUTBOX_TYPES = {"checkpoint", "question", "result", "error"}
 WORKER_STATES = {
     "starting", "working", "blocked", "awaiting_review", "succeeded",
     "failed", "stopped", "paused",
 }
+# ``succeeded``/``stopped``/``failed`` are retired from the *writable* state
+# vocabulary (new runs use only starting/working/blocked/awaiting_review/
+# paused, and fatality is derived from the outbox rather than a state).  They
+# stay in WORKER_STATES permanently on the read path: legacy status snapshots
+# persist indefinitely, and handoff_watcher validates remote statuses against
+# this set, so a skewed older remote host must remain readable, never an error.
 UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -68,9 +80,13 @@ CONTROL_FIELDS = {
     "protocol_version", "run_id", "revision", "orchestrator_epoch",
     "orchestrator_token_sha256", "recovery_token_sha256",
     "orchestrator_lease_expires_at", "worker_epoch", "worker_token_sha256",
-    "desired_state", "review_state", "review_result_id", "last_command_seq",
+    "review_state", "review_result_id", "last_command_seq",
     "outbox_cursor", "integration", "updated_at",
 }
+# Legacy control.json files may still carry ``desired_state`` (retired in
+# favor of the registry finished marker).  It is accepted and ignored on the
+# read path, permanently — see the validation policy in _validate_control.
+LEGACY_CONTROL_FIELDS = {"desired_state"}
 MESSAGE_FIELDS = {
     "protocol_version", "seq", "message_id", "writer_epoch", "ts", "type",
     "reply_to", "body", "data", "attachments",
@@ -406,7 +422,12 @@ def _validate_control(value: Any, *, path: Path | None = None) -> None:
         ):
             if old in value and new not in value:
                 _pre_orchestrator_rename(old, path)
-    value = _fields(value, CONTROL_FIELDS, "control")
+    fields = set(CONTROL_FIELDS)
+    if isinstance(value, dict) and "desired_state" in value:
+        # Legacy key: accepted (and ignored) so historical control snapshots
+        # keep validating; nothing reads it anymore.
+        fields |= LEGACY_CONTROL_FIELDS
+    value = _fields(value, fields, "control")
     if value["protocol_version"] != 1:
         _fail("unsupported protocol version")
     _uuid4(value["run_id"], "run_id")
@@ -416,7 +437,7 @@ def _validate_control(value: Any, *, path: Path | None = None) -> None:
         if not isinstance(value[field], str) or not HEX_RE.fullmatch(value[field]):
             _fail(f"invalid {field}")
     _parse_time(value["orchestrator_lease_expires_at"])
-    if value["desired_state"] not in {"run", "stop", "pause"}:
+    if "desired_state" in value and value["desired_state"] not in {"run", "stop", "pause"}:
         _fail("invalid desired_state")
     if value["review_state"] not in {"pending", "changes_requested", "superseded", "accepted"}:
         _fail("invalid review_state")
@@ -469,7 +490,7 @@ def _validate_attachment(value: Any) -> None:
 VERIFICATION_ITEM_SCHEMA = '{"command": str, "exit_code": int|null, "summary": str}'
 
 EMIT_DATA_SCHEMAS = f"""Data schemas for `emit --type <kind> --data-file data.json` (fields are exact — missing or unknown fields are rejected; cursors are non-negative integers):
-- checkpoint: {{"state": "working"|"succeeded"|"stopped"|"paused", "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
+- checkpoint: {{"state": "working"|"paused", "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
 - question: {{"blocking": bool, "stage": str, "current_activity": str, "inbox_cursor": int, "commitments": [str]}}
 - result: {{"head": str|null, "dirty": bool, "stage": str, "inbox_cursor": int, "verification": [{VERIFICATION_ITEM_SCHEMA}], "commitments": [str]}}
 - error: {{"fatal": bool, "category": str, "stage": str, "inbox_cursor": int, "commitments": [str]}} (non-empty body required)
@@ -715,8 +736,8 @@ def _standing_instructions() -> str:
 
 {EMIT_DATA_SCHEMAS}
 - Assume the orchestrator knows the kickoff but not your live progress. Every blocking question must be self-contained: state the current stage and completed work, concrete evidence, the exact conflict, the decision or authority needed, your recommended resolution, the consequences of the available options, and actions intentionally deferred. Do not rely on earlier checkpoints to supply this context.
-- End the turn after a blocking question. On completion publish an exact result and await review; report `succeeded` only after consuming an accepted review. After a successful result publication, `handoffctl` attempts a best-effort cmux notification for cmux-launched workers; the durable result remains authoritative if notification delivery fails.
-- After consuming an accepted review, follow the lifecycle message that accompanies it. A `stop` means emit `succeeded` then `stopped` checkpoints and exit. A `pause` means emit a `paused` checkpoint (directly, even if you already reported `succeeded`) and idle awaiting further instructions — a doorbell will arrive with the next one. Resume from paused only after consuming a `steer`, `answer`, or `supersede` newer than the `pause`: checkpoint back to `working` and continue. A `stop` consumed while paused means emit `stopped` directly, without `succeeded` first.
+- End the turn after a blocking question. On completion publish an exact result and await review. After a successful result publication, `handoffctl` attempts a best-effort cmux notification for cmux-launched workers; the durable result remains authoritative if notification delivery fails.
+- After consuming an accepted review, emit a `paused` checkpoint and idle awaiting further instructions — a doorbell will arrive with the next one. Resume from paused only after consuming a `steer`, `answer`, `supersede`, `input-changed`, or `base-changed` newer than the accepted review: checkpoint back to `working` and continue. There is no lifecycle message and no exit checkpoint: the run ends when the orchestrator marks it finished and reaps the session.
 - A dirty Git workspace does not block work or result publication. Preserve unrelated pre-existing changes and report the current `HEAD` and dirty state truthfully in every result.
 - Put cross-stage commitments in checkpoint data so they survive context compaction.
 
@@ -820,7 +841,7 @@ def initialize(
             "orchestrator_epoch": 1, "orchestrator_token_sha256": _token_hash(orchestrator),
             "recovery_token_sha256": _token_hash(recovery), "orchestrator_lease_expires_at": lease,
             "worker_epoch": 1, "worker_token_sha256": _token_hash(worker_token),
-            "desired_state": "run", "review_state": "pending", "review_result_id": None,
+            "review_state": "pending", "review_result_id": None,
             "last_command_seq": 0, "outbox_cursor": 0,
             "integration": {"state": "pending", "commit": None, "reason": None}, "updated_at": created,
         }
@@ -983,16 +1004,14 @@ def _apply_inbox(control: dict[str, Any], message: dict[str, Any]) -> None:
     elif kind == "supersede":
         control["review_state"] = "superseded"
         control["review_result_id"] = message["reply_to"]
-    elif kind == "stop":
-        control["desired_state"] = "stop"
-    elif kind == "pause":
-        control["desired_state"] = "pause"
     elif kind == "integration":
         control["integration"] = dict(message["data"])
     elif kind == "orchestrator-takeover":
         control["orchestrator_epoch"] = message["data"]["new_epoch"]
     elif kind == "worker-relaunched":
         control["worker_epoch"] = message["data"]["new_epoch"]
+    # Legacy "stop"/"pause" records project nothing: the registry finished
+    # marker replaced the desired_state projection they fed.
     control["last_command_seq"] = message["seq"]
 
 
@@ -1002,7 +1021,7 @@ def send(
     attachments: list[str] | None = None, snapshot_attachments: bool = False,
 ) -> dict[str, Any]:
     run_dir = _run_dir(run_dir)
-    if type not in INBOX_TYPES or type in SYSTEM_INBOX_TYPES:
+    if type not in SENDABLE_TYPES:
         _fail("generic send does not accept this message type")
     data = {} if data is None else data
     body = _string(body, "body", max_bytes=MAX_BODY)
@@ -1014,12 +1033,10 @@ def send(
         _authorize(control, token, "orchestrator", lease=True)
         inbox = _journal_unlocked(run_dir / "inbox.jsonl", "inbox")
         outbox = _journal(run_dir, "outbox")
-        if (
-            control["integration"]["state"] != "pending"
-            and type not in {"stop", "pause"}
-            and control["desired_state"] != "pause"
-        ):
-            _fail("integration decision is terminal", 4)
+        # Deliverability rule: work messages are deliverable whenever the
+        # worker epoch is live, regardless of the integration record.  The
+        # per-result review terminality below is the guard that actually
+        # protects the integration invariant.
         if type == "answer" and _resolve_reply(outbox, reply_to, "question") is None:
             _fail("answer reply_to must name an outbox question", 4)
         if type in {"review", "supersede"}:
@@ -1032,15 +1049,12 @@ def send(
                 _fail("supersede requires an awaiting_review worker", 4)
             if type == "review" and control["review_state"] == "superseded":
                 _fail("superseded result cannot be reviewed", 4)
-            if type == "review" and worker_status["state"] == "succeeded" and data["disposition"] == "changes_requested":
-                _fail("changes requested after worker success require worker rotation or a new run", 4)
-        if type == "stop" and control["desired_state"] == "stop":
-            _fail("stop was already requested", 4)
-        if type == "pause":
-            if control["desired_state"] == "pause":
-                _fail("pause was already requested", 4)
-            if control["desired_state"] == "stop":
-                _fail("cannot pause after stop was requested", 4)
+            if (
+                type == "review"
+                and worker_status["state"] in {"paused", "succeeded"}
+                and data["disposition"] == "changes_requested"
+            ):
+                _fail("changes requested after an accepted review require worker rotation or a new run", 4)
         existing = _resolve_reply(inbox, message_id)
         declarations = [_relative_path(item) for item in (attachments or [])]
         if existing:
@@ -1100,6 +1114,28 @@ def _last_result(outbox: list[dict[str, Any]], epoch: int) -> dict[str, Any] | N
     return results[-1] if results else None
 
 
+def _derived_fatal(outbox: list[dict[str, Any]], worker_epoch: int) -> bool:
+    """Whether the given worker epoch ended on a durable fatal error.
+
+    The fatal fact is derived from the outbox, never stored: epoch-scoped by
+    construction, so a ``worker-relaunched`` epoch bump falsifies it with no
+    explicit clear.
+    """
+    return any(
+        message["type"] == "error"
+        and message["data"].get("fatal")
+        and message["writer_epoch"] == worker_epoch
+        for message in outbox
+    )
+
+
+def is_fatal(run_dir: Path) -> bool:
+    """Whether the run's live worker epoch ended on a durable fatal error."""
+    run_dir = _run_dir(run_dir)
+    control = _load_json(run_dir / "control.json", _validate_control)
+    return _derived_fatal(_journal(run_dir, "outbox"), control["worker_epoch"])
+
+
 def _matching_review(inbox: list[dict[str, Any]], result_id: str, disposition: str) -> bool:
     reviews = [
         message for message in inbox
@@ -1123,21 +1159,25 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
     stage = data["stage"]
     activity = status_value["current_activity"]
     blocked_on = list(status_value["blocked_on"])
-    if old_state in {"failed", "stopped"}:
+    if _derived_fatal(outbox_before, status_value["worker_epoch"]):
+        # A fatal error ends the worker epoch: nothing further may be emitted
+        # until worker-relaunched rotates the epoch.  Keyed on the durable
+        # outbox fact, never on a cached state name.
         _fail("worker epoch is terminal", 4)
-    if old_state == "succeeded" and not (kind == "checkpoint" and data["state"] in {"succeeded", "stopped", "paused"}):
-        _fail("succeeded worker can only remain succeeded, pause, or stop", 4)
-    if old_state == "paused" and not (kind == "checkpoint" and data["state"] in {"working", "stopped"}):
-        _fail("paused worker can only resume working or stop", 4)
+    # Legacy self-reported terminal states normalize onto ``paused`` for
+    # transition purposes: succeeded and stopped were both "parked after an
+    # orchestrator decision", and a legacy failed epoch is caught by the
+    # derived-fatal guard above (its fatal error sits in the journal).
+    old = "paused" if old_state in {"succeeded", "stopped"} else old_state
     if kind == "checkpoint":
         target = data["state"]
         activity = data["current_activity"]
         if target == "working":
-            if old_state in {"starting", "working"}:
+            if old in {"starting", "working"}:
                 new_state = "working"
-            elif old_state == "blocked" and not unresolved:
+            elif old == "blocked" and not unresolved:
                 new_state = "working"; blocked_on = []
-            elif old_state == "awaiting_review":
+            elif old == "awaiting_review":
                 result = _last_result(outbox_before, status_value["worker_epoch"])
                 changed = result is not None and _matching_review(prefix, result["message_id"], "changes_requested")
                 superseded = result is not None and any(
@@ -1147,55 +1187,67 @@ def _project_worker(status_value: dict[str, Any], message: dict[str, Any], inbox
                 if not changed and not superseded:
                     _fail("awaiting_review can resume only after matching changes_requested or supersede", 4)
                 new_state = "working"
-            elif old_state == "paused":
-                pause_seq = max(
-                    (item["seq"] for item in prefix if item["type"] == "pause"),
+            elif old == "paused":
+                # Resume on any work message newer than the accepted review
+                # that idled the worker.  A legacy run parked by a mid-work
+                # ``stop`` has no such review and stays parked.
+                result = _last_result(outbox_before, status_value["worker_epoch"])
+                idling_seq = max(
+                    (
+                        item["seq"] for item in prefix
+                        if result is not None
+                        and item["type"] == "review"
+                        and item["reply_to"] == result["message_id"]
+                        and item["data"]["disposition"] == "accepted"
+                    ),
                     default=None,
                 )
-                resumed = pause_seq is not None and any(
-                    item["type"] in {"steer", "answer", "supersede"} and item["seq"] > pause_seq
+                resumed = idling_seq is not None and any(
+                    item["type"] in WORK_MESSAGE_TYPES and item["seq"] > idling_seq
                     for item in prefix
                 )
                 if not resumed:
-                    _fail("paused can resume only after a newer steer, answer, or supersede", 4)
+                    _fail("paused can resume only after a work message newer than the accepted review", 4)
                 new_state = "working"
             else:
                 _fail(f"invalid checkpoint transition {old_state} -> working", 4)
+        elif target == "paused":
+            if old not in {"awaiting_review", "paused"}:
+                _fail("paused requires awaiting_review", 4)
+            result = _last_result(outbox_before, status_value["worker_epoch"])
+            if result is None or not _matching_review(prefix, result["message_id"], "accepted"):
+                _fail("paused requires a consumed matching accepted review", 4)
+            new_state = "paused"; blocked_on = []
         elif target == "succeeded":
-            if old_state not in {"awaiting_review", "succeeded"}:
+            # Legacy emission, accepted for frozen pre-collapse contracts and
+            # historical journals; it maps onto paused.
+            if old not in {"awaiting_review", "paused"}:
                 _fail("succeeded requires awaiting_review", 4)
             result = _last_result(outbox_before, status_value["worker_epoch"])
             if result is None or not _matching_review(prefix, result["message_id"], "accepted"):
                 _fail("succeeded requires a consumed matching accepted review", 4)
-            new_state = "succeeded"
+            new_state = "paused"; blocked_on = []
         elif target == "stopped":
-            if control["desired_state"] != "stop" or not any(item["type"] == "stop" for item in prefix):
+            # Legacy emission: it acknowledged a consumed orchestrator stop,
+            # which only legacy journals contain.  It maps onto paused.
+            if not any(item["type"] == "stop" for item in prefix):
                 _fail("stopped requires a consumed orchestrator stop", 4)
-            new_state = "stopped"; blocked_on = []
-        elif target == "paused":
-            if old_state not in {"awaiting_review", "succeeded"}:
-                _fail("paused requires awaiting_review or succeeded", 4)
-            result = _last_result(outbox_before, status_value["worker_epoch"])
-            if result is None or not _matching_review(prefix, result["message_id"], "accepted"):
-                _fail("paused requires a consumed matching accepted review", 4)
-            if not any(item["type"] == "pause" for item in prefix):
-                _fail("paused requires a consumed orchestrator pause", 4)
             new_state = "paused"; blocked_on = []
     elif kind == "question":
         activity = data["current_activity"]
         if data["blocking"]:
-            if old_state not in {"starting", "working"}:
+            if old not in {"starting", "working"}:
                 _fail("blocking question is not valid in the current state", 4)
             new_state = "blocked"; blocked_on.append(message["message_id"])
     elif kind == "result":
-        if old_state not in {"starting", "working", "blocked"} or unresolved:
+        if old not in {"starting", "working", "blocked"} or unresolved:
             _fail("result is not valid in the current state", 4)
         new_state = "awaiting_review"; blocked_on = []
         activity = "Awaiting orchestrator review"
     elif kind == "error" and data["fatal"]:
-        if old_state == "succeeded":
-            _fail("succeeded epoch cannot fail", 4)
-        new_state = "failed"; blocked_on = []
+        # Fatality is derived from the journal, not stored as a state: the
+        # projected state stays whatever it was.
+        blocked_on = []
         activity = message["body"]
     result_status = dict(status_value)
     result_status.update({
@@ -1239,6 +1291,28 @@ def _append_progress(run_dir: Path, message: dict[str, Any], state: str) -> None
         os.close(fd)
 
 
+def _legacy_checkpoint_contract(run_dir: Path) -> bool:
+    """Whether this run froze a pre-collapse worker checkpoint schema.
+
+    Migration removes ``control.desired_state``, so that retired cache cannot
+    remain the only skew marker.  The generated kickoff is immutable protocol
+    evidence: old contracts contain a checkpoint schema line naming both
+    ``succeeded`` and ``stopped``; current contracts do not.  Match one schema
+    line rather than arbitrary kickoff prose so a user task discussing those
+    words does not accidentally enable legacy writes.
+    """
+    try:
+        lines = (run_dir / "kickoff.md").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return any(
+        line.startswith("- checkpoint:")
+        and '"succeeded"' in line
+        and '"stopped"' in line
+        for line in lines
+    )
+
+
 def emit(
     run_dir: Path, token: bytes, *, type: str, body: str = "", data: dict[str, Any] | None = None,
     reply_to: str | None = None, message_id: str | None = None,
@@ -1258,6 +1332,17 @@ def emit(
     with _lock(run_dir, "orchestrator", shared=True), _lock(run_dir, "worker"):
         control = _load_json(run_dir / "control.json", _validate_control)
         _authorize(control, token, "worker")
+        if (
+            type == "checkpoint"
+            and data["state"] in {"succeeded", "stopped"}
+            and "desired_state" not in control
+            and not _legacy_checkpoint_contract(run_dir)
+        ):
+            # Retired checkpoint states stay readable forever and remain
+            # writable only for pre-collapse runs whose frozen worker
+            # contract still names them.  New runs omit the legacy
+            # desired_state field and must use working/paused exclusively.
+            _fail("new runs cannot emit a retired checkpoint state", 4)
         status_value = _load_json(run_dir / "status.json", _validate_status)
         if status_value["worker_epoch"] != control["worker_epoch"]:
             _fail("worker snapshot epoch does not match control", 4)
@@ -1537,7 +1622,6 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
         if control["outbox_cursor"] > len(outbox): issues.append(_issue("cursor", run_dir / "control.json", "outbox_cursor exceeds outbox tail"))
         if control["last_command_seq"] < len(inbox): issues.append(_issue("projection-lag", run_dir / "control.json", "control projection trails inbox"))
         if control["last_command_seq"] == len(inbox):
-            expected_desired = "run"
             expected_orchestrator_epoch = 1
             expected_worker_epoch = 1
             expected_integration = {"state": "pending", "commit": None, "reason": None}
@@ -1545,8 +1629,6 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
                 if message["type"] == "orchestrator-takeover": expected_orchestrator_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "worker-relaunched": expected_worker_epoch = message["data"]["new_epoch"]
                 elif message["type"] == "integration": expected_integration = dict(message["data"])
-                elif message["type"] == "stop": expected_desired = "stop"
-                elif message["type"] == "pause": expected_desired = "pause"
             consumed_results = [message for message in outbox[:control["outbox_cursor"]] if message["type"] == "result"]
             expected_result = consumed_results[-1]["message_id"] if consumed_results else None
             expected_review = "pending"
@@ -1562,7 +1644,7 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
                         else latest["data"]["disposition"]
                     )
             semantic = {
-                "desired_state": expected_desired, "orchestrator_epoch": expected_orchestrator_epoch,
+                "orchestrator_epoch": expected_orchestrator_epoch,
                 "worker_epoch": expected_worker_epoch, "review_state": expected_review,
                 "review_result_id": expected_result, "integration": expected_integration,
             }
@@ -1578,8 +1660,23 @@ def _doctor_report(run_dir: Path) -> dict[str, Any]:
                 replayed = _initial_status(run["run_id"], run["created_at"])
                 for message in outbox:
                     replayed = _project_worker(replayed, message, inbox, outbox[:message["seq"]-1], control)
-                comparable = STATUS_FIELDS - {"updated_at"}
-                if any(replayed[field] != status_value[field] for field in comparable):
+                comparable = STATUS_FIELDS - {"updated_at", "state"}
+                mismatched = any(replayed[field] != status_value[field] for field in comparable)
+                # Legacy terminal self-reports compare through their collapsed
+                # meaning: succeeded/stopped both map onto paused, and a legacy
+                # failed matches any state the replay reached before the fatal
+                # error (fatality is derived from the journal, not a state).
+                expected_state = status_value["state"]
+                if expected_state in {"succeeded", "stopped"}:
+                    expected_state = "paused"
+                if replayed["state"] != expected_state:
+                    legacy_fatal = (
+                        status_value["state"] == "failed"
+                        and _derived_fatal(outbox, status_value["worker_epoch"])
+                    )
+                    if not legacy_fatal:
+                        mismatched = True
+                if mismatched:
                     issues.append(_issue("status-projection", run_dir / "status.json", "status does not match full outbox replay"))
             except HandoffError as exc:
                 issues.append(_issue("transition", run_dir / "outbox.jsonl", str(exc)))

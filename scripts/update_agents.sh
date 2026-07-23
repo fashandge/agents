@@ -7,12 +7,12 @@
 #   update_agents.sh --help
 #
 # Behavior:
-#   * Default: git pull --ff-only, then run the orchestrator-rename migration.
-#   * --no-pull: skip git and run only the migration.
-#   * --dry-run: never pull and pass --dry-run to the migration.
+#   * Default: git pull --ff-only, then run every cumulative state migration.
+#   * --no-pull: skip git and run only the migrations.
+#   * --dry-run: never pull and pass --dry-run to every migration.
 #
 # Invariants:
-#   * The migration is idempotent and takes its own backup before any write.
+#   * Each migration is idempotent and takes its own backup before any write.
 #   * HANDOFF_REGISTRY_FILE, when set, selects its parent as the state tree;
 #     this keeps tests and non-default installations away from the default tree.
 #   * The Python interpreter is resolved portably and printed before use.
@@ -23,9 +23,9 @@ usage() {
 Usage: update_agents.sh [--no-pull] [--dry-run]
        update_agents.sh --help
 
-Pull this checkout with git pull --ff-only, then run the idempotent handoff
-state migration. --no-pull migrates only. --dry-run never pulls or writes
-state; it reports what the migration would change.
+Pull this checkout with git pull --ff-only, then run the cumulative idempotent
+handoff state migrations. --no-pull migrates only. --dry-run never pulls or
+writes state; it reports what each migration would change.
 EOF
 }
 
@@ -59,13 +59,17 @@ else
 fi
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-MIGRATION=("$PYTHON" "$REPO_ROOT/scripts/migrate_handoff_state_orchestrator.py")
+MIGRATION_ORCHESTRATOR=("$PYTHON" "$REPO_ROOT/scripts/migrate_handoff_state_orchestrator.py")
+MIGRATION_JOURNALS=("$PYTHON" "$REPO_ROOT/scripts/migrate_handoff_state_journals.py")
 if [[ -n "${HANDOFF_REGISTRY_FILE:-}" ]]; then
   [[ "$HANDOFF_REGISTRY_FILE" == /* ]] || die "HANDOFF_REGISTRY_FILE must be absolute"
-  MIGRATION+=(--state-dir "$(dirname "$HANDOFF_REGISTRY_FILE")")
+  state_dir=$(dirname "$HANDOFF_REGISTRY_FILE")
+  MIGRATION_ORCHESTRATOR+=(--state-dir "$state_dir")
+  MIGRATION_JOURNALS+=(--state-dir "$state_dir")
 fi
 if [[ "$dry_run" == true ]]; then
-  MIGRATION+=(--dry-run)
+  MIGRATION_ORCHESTRATOR+=(--dry-run)
+  MIGRATION_JOURNALS+=(--dry-run)
 fi
 
 echo "python: $PYTHON"
@@ -78,8 +82,10 @@ else
   pull_result=skipped
 fi
 
-echo "migration: running ${MIGRATION[*]}"
-"${MIGRATION[@]}" || die "handoff state migration failed"
+echo "migration: running ${MIGRATION_ORCHESTRATOR[*]}"
+"${MIGRATION_ORCHESTRATOR[@]}" || die "orchestrator rename migration failed"
+echo "migration: running ${MIGRATION_JOURNALS[*]}"
+"${MIGRATION_JOURNALS[@]}" || die "journal-state migration failed"
 if [[ "$dry_run" == true ]]; then
   migration_result=dry-run
 else

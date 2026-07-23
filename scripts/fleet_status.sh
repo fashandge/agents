@@ -84,7 +84,7 @@ if [ "$dirty" -gt 0 ]; then
 fi
 
 # Handoff checkouts additionally report runtime identity and state drift.
-if [ -f scripts/migrate_handoff_state_orchestrator.py ]; then
+if [ -f scripts/migrate_handoff_state_orchestrator.py ] && [ -f scripts/migrate_handoff_state_journals.py ]; then
   if [ -n "${HANDOFF_PYTHON:-}" ] && [ -x "${HANDOFF_PYTHON:-}" ]; then py=$HANDOFF_PYTHON
   elif [ -x /opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python ]; then py=/opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python
   elif [ -x /home/opc/miniforge3/envs/ml/bin/python ]; then py=/home/opc/miniforge3/envs/ml/bin/python
@@ -96,8 +96,15 @@ if [ -f scripts/migrate_handoff_state_orchestrator.py ]; then
       '?')     runtime_note="runtime=UNIMPORTABLE" ;;
       *)       runtime_note="runtime=OTHER ($runtime)" ;;
     esac
-    pending=$("$py" scripts/migrate_handoff_state_orchestrator.py --dry-run 2>/dev/null \
+    pending_rename=$("$py" scripts/migrate_handoff_state_orchestrator.py --dry-run 2>/dev/null \
       | sed -n 's/.*total \([0-9][0-9]*\) file.*/\1/p' | tail -1)
+    pending_journals=$("$py" scripts/migrate_handoff_state_journals.py --dry-run 2>/dev/null \
+      | "$py" -c 'import json,sys; print(json.load(sys.stdin)["change_count"])' 2>/dev/null || true)
+    if [[ "${pending_rename:-}" =~ ^[0-9]+$ && "${pending_journals:-}" =~ ^[0-9]+$ ]]; then
+      pending=$((pending_rename + pending_journals))
+    else
+      pending=?
+    fi
     case "${pending:-?}" in
       0) state_note="state=migrated" ;;
       ?) state_note="state=UNKNOWN" ;;
