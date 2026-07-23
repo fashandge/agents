@@ -1699,6 +1699,72 @@ def test_conclude_resumes_a_crash_after_integration(tmp_path, monkeypatch):
     assert handoff.doctor(run_dir)["ok"]
 
 
+def test_conclude_reviews_new_work_after_a_no_integrate_accept(tmp_path, monkeypatch):
+    run = registered_run(tmp_path, monkeypatch)
+    run_dir = Path(run["run_dir"])
+    first = _emit_result(run)
+    handoff.control_release(run_dir, run["orchestrator"])
+
+    class Adapter:
+        def doorbell(self, handle, run_id, inbox_seq):
+            pass
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "TmuxAdapter", Adapter)
+
+    accepted = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit=None, no_integrate=True, final_stop=False,
+    )
+    assert accepted["review"]["reply_to"] == first["message"]["message_id"]
+    # --no-integrate leaves integration "pending" permanently, which is what
+    # used to make every later conclude look like a crashed sequence.
+    assert accepted["integration_skipped"] is True
+    assert handoff.control_show(run_dir)["integration"]["state"] == "pending"
+
+    # The worker drains the review, idles, is dispatched more work, and emits
+    # a SECOND result.
+    handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="paused",
+        data={
+            "state": "paused", "stage": "complete", "current_activity": "idle",
+            "inbox_cursor": len(handoff.read(run_dir, "inbox")),
+            "commitments": [],
+        },
+    )
+    handoffctl._dispatch_registered("weather", "compute the follow-up")
+    inbox_tail = len(handoff.read(run_dir, "inbox"))
+    handoff.emit(
+        run_dir, run["worker"], type="checkpoint", body="resumed",
+        data={
+            "state": "working", "stage": "follow-up",
+            "current_activity": "follow-up work", "inbox_cursor": inbox_tail,
+            "commitments": [],
+        },
+    )
+    second = handoff.emit(
+        run_dir, run["worker"], type="result", body="follow-up done",
+        data={
+            "head": None, "dirty": False, "stage": "follow-up",
+            "inbox_cursor": inbox_tail, "verification": [], "commitments": [],
+        },
+    )
+
+    concluded = handoffctl._conclude_registered(
+        "weather", disposition="accepted", body=None,
+        commit=None, no_integrate=True, final_stop=False,
+    )
+
+    # The new result is reviewed on its own terms rather than being swallowed
+    # by crash recovery re-reporting the stale accepted review.
+    assert concluded["review"] is not None
+    assert concluded["review"]["reply_to"] == second["message"]["message_id"]
+    assert concluded["consumed_through"] == len(handoff.read(run_dir, "outbox"))
+    control = handoff.control_show(run_dir)
+    assert control["review_result_id"] == second["message"]["message_id"]
+    assert control["outbox_cursor"] == concluded["consumed_through"]
+    assert control["review_state"] == "accepted"
+
+
 def test_remote_conclude_uses_one_structured_ssh_request(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(registry))

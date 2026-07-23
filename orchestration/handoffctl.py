@@ -373,20 +373,25 @@ def _conclude_local(
                 "doorbell_error": None,
                 "orchestrator_released": True,
             }
-        resumable = (
-            status["state"] in {"awaiting_review", "paused", "succeeded"}
-            and control["review_state"] == "accepted"
-            and control["integration"]["state"] == "pending"
+        # A result past the cursor is NEW work from a resumed worker, not a
+        # crashed sequence: crash recovery would re-report the previous
+        # accepted review and silently drop it.  --no-integrate leaves
+        # integration "pending" for good, so without this guard every later
+        # conclude on a resumed worker misroutes into recovery.
+        fresh_result = any(
+            message["type"] == "result"
+            for message in outbox[control["outbox_cursor"]:]
         )
-        resume_integrated = (
+        reviewed = (
             status["state"] in {"awaiting_review", "paused", "succeeded"}
             and control["review_state"] == "accepted"
+            and not fresh_result
+        )
+        resumable = reviewed and control["integration"]["state"] == "pending"
+        resume_integrated = (
+            reviewed
             and control["review_result_id"] is not None
             and control["integration"]["state"] != "pending"
-            and not any(
-                message["type"] == "result"
-                for message in outbox[control["outbox_cursor"]:]
-            )
         )
         if status["state"] != "awaiting_review" and not resumable and not resume_integrated:
             raise handoff.HandoffError(
