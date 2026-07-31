@@ -4,7 +4,7 @@
 #
 # Usage:
 #   source ~/projects/agents/codex-env.sh
-#   "${CODEX_NODE_BIN}" "${CODEX_BIN}" exec --model gpt-5.4-mini ...
+#   "${CODEX_NODE_BIN}" "${CODEX_BIN}" exec --model gpt-5.6-luna ...
 
 _codex_env_nvm_dir="$HOME/.nvm/versions/node"
 

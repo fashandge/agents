@@ -59,9 +59,9 @@ class AgentType(str, Enum):
 
 # Default models per agent
 DEFAULT_MODELS: dict[AgentType, str] = {
-    AgentType.CODEX: "gpt-5.4-mini",
+    AgentType.CODEX: "gpt-5.6-luna",
     AgentType.CLAUDE: "sonnet",
-    AgentType.GEMINI: "gemini-3.5-flash",
+    AgentType.GEMINI: "gemini-3.6-flash",
 }
 
 
@@ -108,9 +108,10 @@ class AgentConfig:
 
     Codex-specific options (prefixed with codex_):
         codex_reasoning_effort: Reasoning effort level
-            (low, medium, high, xhigh, max). Defaults to ``"high"`` for
-            gpt-5.4-mini and ``"medium"`` for others. xhigh/max are honoured by
-            extended-reasoning models (e.g. gpt-5.x reasoning variants).
+            (low, medium, high, xhigh, max). Defaults to ``"high"`` for the
+            default Codex model (gpt-5.6-luna) and ``"medium"`` for others.
+            xhigh/max are honoured by extended-reasoning models (e.g. gpt-5.x
+            reasoning variants).
         codex_working_dir: Working directory for Codex.
         codex_add_dirs: Additional directories to add to context.
         codex_output_schema: JSON schema for structured output.
@@ -150,7 +151,7 @@ class AgentConfig:
         # Resolve codex reasoning effort default
         if self.codex_reasoning_effort is None:
             self.codex_reasoning_effort = (
-                "high" if self.model == "gpt-5.4-mini" else "medium"
+                "high" if self.model == DEFAULT_MODELS[AgentType.CODEX] else "medium"
             )
         if self.claude_review_command not in {None, "code-review", "review"}:
             raise ValueError(f"Unknown Claude review command: {self.claude_review_command}")
@@ -494,9 +495,9 @@ claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
             default), no ``--effort`` flag is emitted and any ambient
             ``CLAUDE_EFFORT`` environment variable stays in effect.
         codex_reasoning_effort: Reasoning effort (Codex only: low, medium, high,
-            xhigh, max). If None, defaults to ``"high"`` for gpt-5.4-mini and
-            ``"medium"`` for other models. xhigh/max require a model that
-            honours extended reasoning.
+            xhigh, max). If None, defaults to ``"high"`` for the default Codex
+            model (gpt-5.6-luna) and ``"medium"`` for others. xhigh/max require
+            a model that honours extended reasoning.
         codex_working_dir: Working directory (Codex only).
         codex_add_dirs: Additional directories to add (Codex only).
         codex_output_schema: JSON schema for structured output (Codex only).
