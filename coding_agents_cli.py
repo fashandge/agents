@@ -301,12 +301,14 @@ def run_with_config_and_fallback(
     *,
     heartbeat_interval: float | None = DEFAULT_HEARTBEAT_INTERVAL,
     timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
+    validate: Callable[[AgentResult], bool] | None = None,
 ) -> AgentResult:
     """Try each AgentConfig in order, returning the first successful result.
 
-    An agent is considered to have failed if it returns a non-zero exit code or
-    raises an exception (e.g. binary not found, timeout). The next config in
-    the list is then attempted. If every agent fails, a RuntimeError is raised
+    An agent is considered to have failed if it returns a non-zero exit code,
+    raises an exception (e.g. binary not found, timeout), or — when ``validate``
+    is supplied — produces output that fails validation. The next config in the
+    list is then attempted. If every agent fails, a RuntimeError is raised
     summarising all errors.
 
     Args:
@@ -319,6 +321,12 @@ def run_with_config_and_fallback(
             while each agent is running.
         timeout: Maximum time in seconds to wait for each agent to complete.
             Defaults to 1200 (20 minutes). Set to None for no timeout.
+        validate: Optional predicate applied to an otherwise-successful
+            (returncode 0) result. Return ``True`` to accept it, ``False`` to
+            treat the agent as failed and fall through to the next config. Use
+            this when a zero exit code is insufficient — e.g. the caller needs
+            parseable JSON and an agent can exit 0 with empty or malformed
+            output. A predicate that raises is treated as a validation failure.
 
     Returns:
         The first successful AgentResult.
@@ -350,7 +358,25 @@ def run_with_config_and_fallback(
                 agent_prompt, config, heartbeat_interval=heartbeat_interval, timeout=timeout
             )
             if result.returncode == 0:
-                return result
+                if validate is None:
+                    return result
+                try:
+                    accepted = validate(result)
+                except Exception as exc:  # noqa: BLE001 - a raising validator means reject
+                    accepted = False
+                    logger.warning(
+                        "Validator raised on %s output (%s), treating as failure.",
+                        config.agent.value,
+                        exc,
+                    )
+                if accepted:
+                    return result
+                errors.append(f"{config.agent.value}: output failed validation")
+                logger.warning(
+                    "Agent %s returned output that failed validation. Trying next fallback.",
+                    config.agent.value,
+                )
+                continue
             error_msg = result.stderr.strip() or result.output.strip()
             errors.append(f"{config.agent.value}: {error_msg}")
             logger.warning(

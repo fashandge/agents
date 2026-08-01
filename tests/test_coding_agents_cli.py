@@ -337,3 +337,89 @@ def test_run_claude_internal_forwards_effort_via_pty_wrapper(monkeypatch):
     cmd = captured["command"]
     assert "--effort" in cmd
     assert cmd[cmd.index("--effort") + 1] == "max"
+
+
+def _make_run_with_config_stub(results_by_agent):
+    """Return a fake run_with_config that yields a canned AgentResult per agent."""
+
+    def _fake(prompt, config, **kwargs):
+        agent = config.agent
+        output, returncode = results_by_agent[agent]
+        return coding_agents_cli.AgentResult(
+            output=output, returncode=returncode, stderr="", agent=agent
+        )
+
+    return _fake
+
+
+def test_fallback_skips_returncode0_output_that_fails_validation(monkeypatch):
+    AgentType = coding_agents_cli.AgentType
+    gemini = coding_agents_cli.AgentConfig(agent=AgentType.GEMINI)
+    codex = coding_agents_cli.AgentConfig(agent=AgentType.CODEX)
+    # Gemini exits 0 but returns empty output; Codex exits 0 with valid JSON.
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "run_with_config",
+        _make_run_with_config_stub(
+            {AgentType.GEMINI: ("", 0), AgentType.CODEX: ('{"routings": []}', 0)}
+        ),
+    )
+    result = coding_agents_cli.run_with_config_and_fallback(
+        "prompt",
+        configs=[gemini, codex],
+        validate=lambda r: r.output.strip().startswith("{"),
+    )
+    assert result.agent == AgentType.CODEX
+    assert result.output == '{"routings": []}'
+
+
+def test_fallback_raises_when_all_outputs_fail_validation(monkeypatch):
+    AgentType = coding_agents_cli.AgentType
+    gemini = coding_agents_cli.AgentConfig(agent=AgentType.GEMINI)
+    codex = coding_agents_cli.AgentConfig(agent=AgentType.CODEX)
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "run_with_config",
+        _make_run_with_config_stub({AgentType.GEMINI: ("", 0), AgentType.CODEX: ("nope", 0)}),
+    )
+    with pytest.raises(RuntimeError, match="failed validation"):
+        coding_agents_cli.run_with_config_and_fallback(
+            "prompt",
+            configs=[gemini, codex],
+            validate=lambda r: r.output.strip().startswith("{"),
+        )
+
+
+def test_fallback_without_validate_accepts_first_returncode0(monkeypatch):
+    AgentType = coding_agents_cli.AgentType
+    gemini = coding_agents_cli.AgentConfig(agent=AgentType.GEMINI)
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "run_with_config",
+        _make_run_with_config_stub({AgentType.GEMINI: ("", 0)}),
+    )
+    result = coding_agents_cli.run_with_config_and_fallback("prompt", configs=[gemini])
+    assert result.agent == AgentType.GEMINI
+
+
+def test_fallback_treats_raising_validator_as_failure(monkeypatch):
+    AgentType = coding_agents_cli.AgentType
+    gemini = coding_agents_cli.AgentConfig(agent=AgentType.GEMINI)
+    codex = coding_agents_cli.AgentConfig(agent=AgentType.CODEX)
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "run_with_config",
+        _make_run_with_config_stub(
+            {AgentType.GEMINI: ("boom", 0), AgentType.CODEX: ("ok", 0)}
+        ),
+    )
+
+    def _raising(r):
+        if r.agent == AgentType.GEMINI:
+            raise ValueError("bad")
+        return True
+
+    result = coding_agents_cli.run_with_config_and_fallback(
+        "prompt", configs=[gemini, codex], validate=_raising
+    )
+    assert result.agent == AgentType.CODEX
