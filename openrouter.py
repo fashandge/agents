@@ -20,6 +20,7 @@ class OpenRouterModel(str, Enum):
     """Known OpenRouter model identifiers."""
 
     LLAMA_3_1_8B_INSTRUCT = "meta-llama/llama-3.1-8b-instruct"
+    DEEPSEEK_V4_FLASH = "deepseek/deepseek-v4-flash"
     RANDOM_FREE = "random_free"
 
 
