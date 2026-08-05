@@ -72,6 +72,49 @@ def test_kimi_argv_accepts_explicit_configured_k3_alias(tmp_path, monkeypatch):
     assert argv == ["/bin/kimi", "-m", "kimi-code/k3", "--auto"]
 
 
+def test_pi_argv_pins_model_and_thinking_and_resolves_project_trust(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff ; weird"
+    payload = "$(touch SHOULD_NOT_EXIST); 'quoted' $HOME"
+    kickoff.write_text(payload)
+    monkeypatch.setattr(handoff_launcher.shutil, "which", lambda *args, **kwargs: "/bin/pi")
+
+    argv = handoff_launcher._agent_argv(
+        {
+            "agent": "pi",
+            "model": "deepseek/deepseek-v4-flash",
+            "effort": "max",
+            "pmode": "bypassPermissions",
+            "kickoff": str(kickoff),
+        },
+        {"PATH": "/bin"},
+    )
+
+    assert argv == [
+        "/bin/pi", "--model", "deepseek/deepseek-v4-flash",
+        "--thinking", "max", "--approve", payload,
+    ]
+    assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
+
+
+def test_pi_argv_declines_project_trust_outside_bypass_mode(tmp_path, monkeypatch):
+    # Either way the trust decision is made on the command line: pi's trust
+    # dialog blocks below the agent loop, so an unattended worker must never
+    # be able to reach it.
+    kickoff = tmp_path / "kickoff"
+    kickoff.write_text("task")
+    monkeypatch.setattr(handoff_launcher.shutil, "which", lambda *args, **kwargs: "/bin/pi")
+
+    argv = handoff_launcher._agent_argv(
+        {
+            "agent": "pi", "model": "deepseek/deepseek-v4-flash", "effort": "max",
+            "pmode": "auto", "kickoff": str(kickoff),
+        },
+        {"PATH": "/bin"},
+    )
+
+    assert argv[-2:] == ["--no-approve", "task"]
+
+
 def test_private_wrapper_exec_sets_only_protected_handoff_environment(tmp_path, monkeypatch):
     kickoff = tmp_path / "kickoff"; kickoff.write_text("literal prompt")
     config = {
@@ -169,6 +212,43 @@ def test_cmux_probe_requires_surface_and_expected_process(monkeypatch):
     ] in calls
     outputs["top"] = Completed(stdout=f"{handle}\tzsh\tfolder trust\n")
     assert not adapter.probe(handle, "claude")
+
+
+def test_probes_match_a_short_agent_name_as_a_whole_token(monkeypatch):
+    # `pi` is a fragment of ordinary words and paths, so a plain substring test
+    # would report a live worker for almost any process inventory.
+    handle = "123e4567-e89b-42d3-a456-426614174000"
+    inventory = {"stdout": f"{handle}\tzsh\tpip install rapid-things\n"}
+
+    def fake_run(argv, check=True):
+        if "list-pane-surfaces" in argv:
+            return Completed(stdout=f"surface {handle}\n")
+        return Completed(stdout=inventory["stdout"])
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    adapter = handoff_launcher.CmuxAdapter("cmux")
+    assert not adapter.probe(handle, "pi")
+    inventory["stdout"] = f"{handle}\tpi\t/home/w/.hermes/node/bin/pi --model x\n"
+    assert adapter.probe(handle, "pi")
+
+
+def test_tmux_probe_matches_pi_pane_leader_without_matching_pip(monkeypatch):
+    panes = {"stdout": "0\t123\tnode\n"}
+    ps_output = {"stdout": "pip install something"}
+
+    def fake_run(argv, check=True):
+        if argv[1] == "has-session":
+            return Completed()
+        if argv[1] == "list-panes":
+            return Completed(stdout=panes["stdout"])
+        if argv[0] == "ps":
+            return Completed(stdout=ps_output["stdout"])
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    assert not handoff_launcher.TmuxAdapter().probe("worker", "pi")
+    ps_output["stdout"] = "pi"  # pi rewrites its process title to a bare name
+    assert handoff_launcher.TmuxAdapter().probe("worker", "pi")
 
 
 def test_cmux_launch_uses_the_inherited_orchestrator_workspace(monkeypatch, tmp_path):
@@ -355,6 +435,7 @@ def test_agent_defaults_match_handoff_policy():
         "claude": ("opus", "high"),
         "codex": ("gpt-5.6-terra", "xhigh"),
         "kimi": ("kimi-code/k3", "max"),
+        "pi": ("deepseek/deepseek-v4-flash", "max"),
     }
 
 

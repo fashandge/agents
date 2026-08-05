@@ -60,8 +60,18 @@ AGENT_DEFAULTS = {
     "claude": ("opus", "high"),
     "codex": ("gpt-5.6-terra", "xhigh"),
     "kimi": ("kimi-code/k3", "max"),
+    "pi": ("deepseek/deepseek-v4-flash", "max"),
 }
 ORCHESTRATOR_DOORBELL_TITLE = "Handoff orchestrator pending"
+
+
+def _agent_choices() -> str:
+    return ", ".join(AGENT_DEFAULTS)
+
+
+def _agent_default_help(label: str, index: int) -> str:
+    defaults = ", ".join(f"{agent}={values[index]}" for agent, values in AGENT_DEFAULTS.items())
+    return f"override {label} (defaults: {defaults})"
 
 
 FORCED_DOORBELL_PREAMBLE = (
@@ -94,6 +104,21 @@ def orchestrator_doorbell_body(orchestrator_id: str, *, forced: bool = False) ->
 
 def _compact_terminal_text(value: str) -> str:
     return "".join(value.split())
+
+
+def _agent_token_present(text: str, agent: str) -> bool:
+    """Is ``agent`` present in ``text`` as a whole token rather than a fragment?
+
+    Process inventories are matched by substring, which is safe for a long
+    distinctive name but not for a short one: ``pi`` is a fragment of ordinary
+    words and paths, so a bare substring test would report a live worker for
+    almost any inventory.  Alphanumeric boundaries keep ``pi`` from matching
+    ``pip`` or ``rapid`` while still matching the real entry points, whose
+    names carry non-alphanumeric neighbours (``claude.exe``, ``codex.js``,
+    ``.kimi-code/bin/kimi``, ``/bin/pi``).
+    """
+    pattern = rf"(?<![0-9a-z]){re.escape(agent.lower())}(?![0-9a-z])"
+    return re.search(pattern, text.lower()) is not None
 
 
 def _kimi_instruction_count(screen: str, instruction: str) -> int:
@@ -357,13 +382,13 @@ class TmuxAdapter:
             fields = line.split("\t")
             if len(fields) != 3 or fields[0] != "0":
                 continue
-            command = fields[2].lower()
-            if expected_agent in command:
+            command = fields[2]
+            if _agent_token_present(command, expected_agent):
                 return True
             # Codex is commonly a Node entry point; confirm the pane leader's
             # full argv rather than treating any live shell as worker liveness.
             ps = _run(["ps", "-o", "command=", "-p", fields[1]], check=False)
-            if ps.returncode == 0 and expected_agent in ps.stdout.lower():
+            if ps.returncode == 0 and _agent_token_present(ps.stdout, expected_agent):
                 return True
         return False
 
@@ -480,7 +505,9 @@ class CmuxAdapter:
         # Require both the surface and expected agent in the process inventory;
         # this avoids mistaking a live trust/TUI shell for the agent loop.
         lowered = processes.stdout.lower()
-        return handle.lower() in lowered and expected_agent.lower() in lowered
+        return handle.lower() in lowered and _agent_token_present(
+            lowered, expected_agent,
+        )
 
     def capture(self, handle: str) -> str:
         return _run([
@@ -656,6 +683,21 @@ def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str
         elif config["pmode"] == "auto":
             argv.append("--auto")
         return argv
+    if agent == "pi":
+        prompt = Path(config["kickoff"]).read_text(encoding="utf-8")
+        argv = [executable, "--model", config["model"]]
+        if config["effort"]:
+            argv.extend(["--thinking", config["effort"]])
+        # pi gates no tool on approval — it has no sandbox, so a worker never
+        # stalls on a permission prompt.  Its one interactive gate is project
+        # trust, which blocks *below* the agent loop in a directory carrying
+        # `.pi` resources, so both branches resolve it on the command line: an
+        # unattended worker must never reach that dialog.  `--approve` grants
+        # this run project resources without persisting a trust decision;
+        # `--no-approve` skips them.  Neither prompts.
+        argv.append("--approve" if config["pmode"] == "bypassPermissions" else "--no-approve")
+        argv.append(prompt)
+        return argv
     raise handoff.HandoffError(f"unsupported agent: {agent}", 2)
 
 
@@ -785,7 +827,7 @@ def launch(
     cwd = Path(cwd).resolve(strict=True); kickoff = Path(kickoff).resolve(strict=True)
     orchestrator_id = _validate_orchestrator_id(orchestrator_id)
     if agent not in AGENT_DEFAULTS:
-        raise handoff.HandoffError("agent must be claude, codex, or kimi", 2)
+        raise handoff.HandoffError(f"agent must be one of: {_agent_choices()}", 2)
     default_model, default_effort = AGENT_DEFAULTS[agent]
     model = default_model if model is None else model
     effort = default_effort if effort is None else effort
@@ -960,7 +1002,7 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(request["name"], str) or not request["name"]:
         raise handoff.HandoffError("remote name must be a non-empty string", 2)
     if request["agent"] not in AGENT_DEFAULTS:
-        raise handoff.HandoffError("remote agent must be claude, codex, or kimi", 2)
+        raise handoff.HandoffError(f"remote agent must be one of: {_agent_choices()}", 2)
     for field in ("model", "effort"):
         if request[field] is not None and not isinstance(request[field], str):
             raise handoff.HandoffError(f"remote {field} must be a string or null", 2)
@@ -1472,12 +1514,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=os.environ.get("HANDOFF_MODEL") or None,
-        help="override model (defaults: claude=opus, codex=gpt-5.6-terra, kimi=kimi-code/k3)",
+        help=_agent_default_help("model", 0),
     )
     parser.add_argument(
         "--effort",
         default=os.environ.get("HANDOFF_EFFORT") or None,
-        help="override reasoning effort (defaults: claude=high, codex=xhigh, kimi=max)",
+        help=_agent_default_help("reasoning effort", 1),
     )
     parser.add_argument("--pmode", default=os.environ.get("HANDOFF_PMODE", "bypassPermissions"))
     parser.add_argument("--workspace"); parser.add_argument("--input", action="append", default=[])
