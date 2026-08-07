@@ -32,6 +32,14 @@ from agents.orchestration import handoff_registry
 
 CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 CMUX_APP_NAME = "cmux"
+HERDR_DEFAULT = "herdr"
+# herdr public IDs are opaque stable handles whose suffix is not decimal:
+# a workspace's eleventh pane is ``w1:pB``, not ``w1:p11``.
+HERDR_PANE_RE = re.compile(r"^w[0-9]+:p[0-9A-Za-z]+$")
+# Remote workers are parked in one labelled workspace on the remote server so
+# repeated launches share it instead of scattering tabs across the box.
+HERDR_REMOTE_WORKSPACE_LABEL = "REMOTE_WORKERS"
+HERDR_CAPTURE_LINES = 2000
 LSAPPINFO_DEFAULT = "/usr/bin/lsappinfo"
 REMOTE_PYTHON_DEFAULT = "python3"
 KIMI_SUBMIT_SETTLE_SECONDS = 0.5
@@ -274,6 +282,27 @@ def _run(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[
     if check and result.returncode != 0:
         raise AdapterError(f"session adapter command failed ({result.returncode}): {' '.join(argv[:2])}: {result.stderr.strip()}")
     return result
+
+
+def _herdr_result(argv: list[str]) -> dict[str, Any]:
+    """Run a herdr CLI command and return its ``result`` payload.
+
+    herdr answers control commands with one JSON object on stdout and reports
+    server errors as JSON on stderr with exit status 1, so ``_run`` already
+    raises for a failed command; this only has to reject a zero exit that
+    carried nothing parsable.  Read identifiers out of the returned payload
+    rather than predicting them: herdr's IDs are opaque.
+    """
+    result = _run(argv)
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise AdapterError(
+            f"herdr returned non-JSON output for {' '.join(argv[1:3])}",
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+        raise AdapterError(f"herdr response carried no result for {' '.join(argv[1:3])}")
+    return payload["result"]
 
 
 def _remote_host(value: str) -> str:
@@ -653,6 +682,213 @@ class CmuxAdapter:
         )
 
 
+class HerdrAdapter:
+    """Session adapter for herdr, whose handle is a pane ID such as ``w1:pB``.
+
+    Two properties separate this from :class:`CmuxAdapter`.  The herdr server
+    accepts socket clients from outside its own process tree, so every command
+    here works unchanged from a detached watcher — no surface-hosted watcher is
+    needed.  And herdr recognizes the agent occupying a pane whether or not it
+    started it, exposing an atomic ``agent prompt`` that submits text and Enter
+    against the pane's live bracketed-paste mode.  That removes the
+    settle-and-retry dance the tmux and cmux adapters need, so the paste-hazard
+    workaround is only kept on the raw-pane fallback used while a freshly
+    launched worker has not been recognized yet.
+    """
+
+    def __init__(self, binary: str = HERDR_DEFAULT, workspace: str | None = None):
+        self.binary = binary
+        self.workspace = workspace
+
+    def launch(self, name: str, cwd: Path, terminal_command: str, workspace: str | None = None) -> str:
+        if not workspace:
+            # The inherited ID scopes the worker to the workspace that owns this
+            # orchestrator's own pane, which is the one the human is looking at.
+            workspace = os.environ.get("HERDR_WORKSPACE_ID")
+        if not workspace:
+            raise AdapterError("herdr did not report a workspace for the worker tab")
+        self.workspace = workspace
+        result = _herdr_result([
+            self.binary, "tab", "create", "--workspace", workspace,
+            "--cwd", str(cwd), "--label", name, "--no-focus",
+        ])
+        handle = str((result.get("root_pane") or {}).get("pane_id") or "")
+        if not HERDR_PANE_RE.fullmatch(handle):
+            raise AdapterError(f"could not parse herdr pane ID: {handle or result}")
+        # ``pane run`` sends the command text and Enter in one call and prints
+        # nothing on success.
+        _run([self.binary, "pane", "run", handle, terminal_command])
+        return handle
+
+    def _agent(self, handle: str) -> dict[str, Any] | None:
+        """Return herdr's agent record for this pane, or None if it has none.
+
+        A pane that is still at its shell prompt — or running something herdr
+        cannot classify — has no agent, which is expected in the window between
+        ``pane run`` and the worker's TUI appearing.
+        """
+        result = _run(
+            [self.binary, "agent", "get", handle], check=False,
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        agent = (payload.get("result") or {}).get("agent")
+        return agent if isinstance(agent, dict) else None
+
+    def probe(self, handle: str, expected_agent: str) -> bool:
+        result = _run(
+            [self.binary, "pane", "process-info", "--pane", handle], check=False,
+        )
+        if result.returncode != 0:
+            return False
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        info = (payload.get("result") or {}).get("process_info") or {}
+        processes = info.get("foreground_processes")
+        if not isinstance(processes, list):
+            return False
+        # Match the same inventory fields the tmux probe reads out of ``ps``:
+        # Codex and Claude are Node entry points whose argv0 alone is "node".
+        for process in processes:
+            if not isinstance(process, dict):
+                continue
+            inventory = " ".join(
+                str(process.get(field) or "")
+                for field in ("cmdline", "argv0", "name")
+            )
+            if _agent_token_present(inventory, expected_agent):
+                return True
+        return False
+
+    def _read(self, handle: str, source: str) -> str:
+        return _run([
+            self.binary, "pane", "read", handle,
+            "--source", source, "--lines", str(HERDR_CAPTURE_LINES),
+            "--format", "text",
+        ], check=False).stdout
+
+    def capture(self, handle: str) -> str:
+        """Return the pane's current text, preferring the soft-wrap-joined view.
+
+        Agent TUIs render on the terminal's alternate screen, where
+        ``recent-unwrapped`` carries the composer and status line that
+        ``visible`` can omit; a pane still sitting at a shell prompt is the
+        reverse, answering ``recent-unwrapped`` empty while ``visible`` holds
+        the screen.  Both consumers here — composer scraping and folder-trust
+        matching — need whichever is non-empty, so fall back rather than
+        joining: concatenating would double-count text the Kimi verification
+        counts occurrences of.
+        """
+        screen = self._read(handle, "recent-unwrapped")
+        return screen if screen.strip() else self._read(handle, "visible")
+
+    def _type(self, handle: str, text: str) -> None:
+        _run([self.binary, "pane", "run", handle, text])
+
+    def _type_tui(self, handle: str, text: str, probe: str | None = None) -> None:
+        if self._agent(handle) is not None:
+            # Atomic submit against the pane's live bracketed-paste mode.
+            _run([self.binary, "agent", "prompt", handle, text])
+            return
+        # No agent recognized yet: fall back to the raw pane surface, which
+        # carries the same paste-coalescing hazard as tmux and cmux.
+        _run([self.binary, "pane", "send-text", handle, text])
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        _run([self.binary, "pane", "send-keys", handle, "enter"])
+        time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
+        if _tui_submit_pending(self.capture(handle), probe or text):
+            _run([self.binary, "pane", "send-keys", handle, "enter"])
+
+    def doorbell(self, handle: str, run_id: str, inbox_seq: int) -> None:
+        self._type_tui(handle, f"Check handoff run {run_id}; inbox now through seq {inbox_seq}.")
+
+    def orchestrator_doorbell(
+        self, handle: str, orchestrator_id: str, *, forced: bool = False,
+    ) -> None:
+        """Type the pointer into the orchestrator's composer and raise an alert.
+
+        Typed input is what actually pushes the orchestrator to act, so it is
+        the delivery; the notification is the visible companion cmux
+        orchestrators get and tmux ones do not, and its failure must not fail
+        the doorbell.
+        """
+        pointer = orchestrator_doorbell_body(orchestrator_id)
+        self._type_tui(
+            handle,
+            orchestrator_doorbell_body(orchestrator_id, forced=forced),
+            probe=pointer,
+        )
+        try:
+            self.notify(handle, title=ORCHESTRATOR_DOORBELL_TITLE, body=pointer)
+        except AdapterError:
+            pass
+
+    def composer_guard(self, handle: str) -> str:
+        """Decide whether a typed doorbell may enter this pane's composer now.
+
+        herdr's lifecycle state answers a question neither tmux nor cmux can:
+        ``blocked`` means it recognized an approval or question UI, where the
+        keystrokes a doorbell submits would answer that dialog instead of
+        landing in a text composer.  That defers.  ``working`` does not — input
+        typed during a turn simply queues, and an orchestrator agent is working
+        most of the time, so treating it as busy would starve the doorbell.
+        Everything else falls through to the shared draft heuristic, with
+        herdr's own focus flag as the predicate.
+        """
+        agent = self._agent(handle)
+        if agent is not None and agent.get("agent_status") == "blocked":
+            return COMPOSER_BUSY
+        focused = bool(agent.get("focused")) if agent is not None else True
+        return _composer_guard(lambda: self.capture(handle), lambda: focused)
+
+    def press_enter(self, handle: str) -> None:
+        _run([self.binary, "pane", "send-keys", handle, "enter"])
+
+    def notify(self, handle: str | None, *, title: str, body: str) -> None:
+        """Raise a herdr notification. The handle is accepted for symmetry."""
+        _run([
+            self.binary, "notification", "show", title,
+            "--body", body, "--sound", "request",
+        ])
+
+    def send_literal(self, handle: str, text: str) -> bool:
+        previous_count = _kimi_instruction_count(self.capture(handle), text)
+        if self._agent(handle) is not None:
+            _run([self.binary, "agent", "prompt", handle, text])
+            time.sleep(KIMI_SUBMIT_SETTLE_SECONDS)
+            if _kimi_instruction_accepted(
+                self.capture(handle), text, previous_count=previous_count,
+            ):
+                return True
+        # Same Ctrl-J-then-Enter ladder as the other adapters: some Kimi
+        # versions treat a synthetic Enter as an input newline, others leave
+        # Ctrl-J unsubmitted.
+        _run([self.binary, "pane", "send-text", handle, text])
+        _run([self.binary, "pane", "send-keys", handle, "ctrl+j"])
+        time.sleep(KIMI_SUBMIT_SETTLE_SECONDS)
+        if _kimi_instruction_accepted(
+            self.capture(handle), text, previous_count=previous_count,
+        ):
+            return True
+        _run([self.binary, "pane", "send-keys", handle, "enter"])
+        time.sleep(KIMI_SUBMIT_SETTLE_SECONDS)
+        return _kimi_instruction_accepted(
+            self.capture(handle), text, previous_count=previous_count,
+        )
+
+    def rescue_command(self, handle: str) -> str:
+        return (
+            f"{shlex.quote(self.binary)} pane read {shlex.quote(handle)} "
+            f"--source recent-unwrapped --lines {HERDR_CAPTURE_LINES}"
+        )
+
+
 def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str]:
     agent = config["agent"]
     executable = shutil.which(agent, path=process_env.get("PATH"))
@@ -797,11 +1033,54 @@ def bootstrap_kimi(
     return adapter.send_literal(handle, _kimi_kickoff_instruction(run_dir))
 
 
-def _select_backend(backend: str | None, cmux_binary: str) -> str:
+def _herdr_reachable(herdr_binary: str) -> bool:
+    """Is this process inside a herdr pane whose server answers?
+
+    ``HERDR_ENV`` marks a herdr-managed pane and ``HERDR_WORKSPACE_ID`` is the
+    workspace the worker tab belongs in; without the latter the adapter has
+    nowhere to place the worker.  The server probe keeps a stale environment —
+    inherited by a process that outlived its server — from selecting a backend
+    that cannot launch.
+    """
+    if os.environ.get("HERDR_ENV") != "1" or not os.environ.get("HERDR_WORKSPACE_ID"):
+        return False
+    if not shutil.which(herdr_binary, path=_process_env().get("PATH")):
+        return False
+    return _run([herdr_binary, "status", "server"], check=False).returncode == 0
+
+
+def build_adapter(
+    backend: str,
+    cmux_binary: str = CMUX_DEFAULT,
+    herdr_binary: str = HERDR_DEFAULT,
+) -> Any:
+    """Construct the session adapter for a resolved backend name.
+
+    Every caller that reconstructs an adapter from a persisted record goes
+    through here, so a new backend is added in one place rather than in each
+    dispatch chain.
+    """
+    if backend == "herdr":
+        return HerdrAdapter(herdr_binary)
+    if backend == "cmux":
+        return CmuxAdapter(cmux_binary)
+    if backend == "tmux":
+        return TmuxAdapter()
+    raise handoff.HandoffError(f"unsupported session transport: {backend}", 4)
+
+
+def _select_backend(
+    backend: str | None, cmux_binary: str, herdr_binary: str = HERDR_DEFAULT,
+) -> str:
     if backend is not None:
-        if backend not in {"cmux", "tmux"}:
-            raise handoff.HandoffError("backend must be cmux or tmux", 2)
+        if backend not in {"herdr", "cmux", "tmux"}:
+            raise handoff.HandoffError("backend must be herdr, cmux, or tmux", 2)
         return backend
+    # herdr outranks cmux: a session running inside herdr wants its workers in
+    # the workspace the human is looking at, and only one of the two can own
+    # the terminal this orchestrator inherited.
+    if _herdr_reachable(herdr_binary):
+        return "herdr"
     cmux_ok = (
         bool(os.environ.get("CMUX_WORKSPACE_ID"))
         and Path(cmux_binary).is_file()
@@ -811,7 +1090,9 @@ def _select_backend(backend: str | None, cmux_binary: str) -> str:
         return "cmux"
     if shutil.which("tmux", path=_process_env().get("PATH")):
         return "tmux"
-    raise AdapterError("no backend: cmux socket is unavailable and tmux is not installed")
+    raise AdapterError(
+        "no backend: no herdr or cmux socket is reachable and tmux is not installed",
+    )
 
 
 def launch(
@@ -820,6 +1101,7 @@ def launch(
     workspace: str | None = None, inputs: list[str] | None = None,
     state_root: Path | None = None, run_dir: Path | None = None,
     readiness_timeout: float = 120.0, cmux_binary: str = CMUX_DEFAULT,
+    herdr_binary: str = HERDR_DEFAULT,
     confirm_ready: bool = False, retain_orchestrator: bool = False,
     credential_dir: Path | None = None, recorded_transport: str | None = None,
     orchestrator_id: str | None = None,
@@ -832,7 +1114,7 @@ def launch(
     model = default_model if model is None else model
     effort = default_effort if effort is None else effort
     recorded_model = model or "configured-default"
-    backend = _select_backend(backend, cmux_binary)
+    backend = _select_backend(backend, cmux_binary, herdr_binary)
     protocol_transport = recorded_transport or backend
 
     configured_private_dir = credential_dir or os.environ.get("HANDOFF_CREDENTIAL_DIR")
@@ -862,7 +1144,7 @@ def launch(
     }
     wrapper, config_path = _private_launch_files(private_dir, config)
     terminal_command = f"exec {shlex.quote(str(wrapper))} {shlex.quote(str(config_path))}"
-    adapter: Any = CmuxAdapter(cmux_binary) if backend == "cmux" else TmuxAdapter()
+    adapter: Any = build_adapter(backend, cmux_binary, herdr_binary)
     handle = adapter.launch(name, cwd, terminal_command, workspace)
     goal_file = Path(str(kickoff) + ".goal")
     ready: bool | None = None
@@ -954,7 +1236,13 @@ REMOTE_REQUEST_FIELDS = {
     "name", "kickoff_b64", "goal_b64", "cwd", "agent", "model", "effort",
     "pmode", "inputs", "state_root", "run_dir", "readiness_timeout",
     "confirm_ready", "retain_orchestrator", "credential_dir", "orchestrator_id",
+    "backend", "workspace_label",
 }
+REMOTE_BACKENDS = ("herdr", "tmux")
+# Fields a receiver older than this change does not know about.  It rejects any
+# request whose key set differs, so they are dropped before sending and the
+# launch proceeds on that host's only backend, tmux.
+REMOTE_OPTIONAL_REQUEST_FIELDS = {"backend", "workspace_label"}
 
 # Senders always emit the names above.  The receiver additionally accepts the
 # pre-rename spellings because the two ends of an SSH launch are updated
@@ -991,14 +1279,53 @@ def _decode_remote_file(value: Any, field: str, *, required: bool = False) -> by
     return decoded
 
 
+def _herdr_workspace_by_label(
+    label: str, cwd: Path, binary: str = HERDR_DEFAULT,
+) -> str:
+    """Return the ID of the herdr workspace with this label, creating it once.
+
+    An SSH command inherits no ``HERDR_WORKSPACE_ID``, so a remote worker has
+    to be placed by name.  Reusing one labelled workspace keeps repeat launches
+    on a box collected in a single place instead of scattering tabs, and makes
+    the placement legible to whoever attaches to that server later.
+    """
+    listing = _herdr_result([binary, "workspace", "list"])
+    for workspace in listing.get("workspaces") or []:
+        if isinstance(workspace, dict) and workspace.get("label") == label:
+            found = str(workspace.get("workspace_id") or "")
+            if found:
+                return found
+    created = _herdr_result([
+        binary, "workspace", "create", "--label", label,
+        "--cwd", str(cwd), "--no-focus",
+    ])
+    workspace_id = str((created.get("workspace") or {}).get("workspace_id") or "")
+    if not workspace_id:
+        raise AdapterError(f"could not parse herdr workspace ID for label {label}")
+    return workspace_id
+
+
 def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
     """Validate a JSON-over-stdin request and launch it on this SSH host."""
     if isinstance(request, dict):
         request = {REMOTE_LEGACY_REQUEST_KEYS.get(key, key): value for key, value in request.items()}
-    if isinstance(request, dict) and set(request) == REMOTE_REQUEST_FIELDS - {"orchestrator_id"}:
+    if isinstance(request, dict) and set(request) == REMOTE_REQUEST_FIELDS - {"orchestrator_id"} - REMOTE_OPTIONAL_REQUEST_FIELDS:
         request = {**request, "orchestrator_id": None}
+    if isinstance(request, dict):
+        # A sender older than the herdr backend omits these entirely; default to
+        # the backend that host has always used.
+        request = {
+            "backend": "tmux", "workspace_label": HERDR_REMOTE_WORKSPACE_LABEL,
+            **request,
+        }
     if not isinstance(request, dict) or set(request) != REMOTE_REQUEST_FIELDS:
         raise handoff.HandoffError("invalid remote launch request", 2)
+    if request["backend"] not in REMOTE_BACKENDS:
+        raise handoff.HandoffError(
+            f"remote backend must be one of: {', '.join(REMOTE_BACKENDS)}", 2,
+        )
+    if not isinstance(request["workspace_label"], str) or not request["workspace_label"]:
+        raise handoff.HandoffError("remote workspace_label must be a non-empty string", 2)
     if not isinstance(request["name"], str) or not request["name"]:
         raise handoff.HandoffError("remote name must be a non-empty string", 2)
     if request["agent"] not in AGENT_DEFAULTS:
@@ -1026,6 +1353,12 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
     kickoff_bytes = _decode_remote_file(request["kickoff_b64"], "kickoff", required=True)
     goal_bytes = _decode_remote_file(request["goal_b64"], "goal")
 
+    backend = request["backend"]
+    workspace = (
+        _herdr_workspace_by_label(request["workspace_label"], cwd)
+        if backend == "herdr" else None
+    )
+
     source_dir = Path(tempfile.mkdtemp(prefix="handoff-remote-kickoff-"))
     os.chmod(source_dir, 0o700)
     kickoff = source_dir / "kickoff.md"
@@ -1033,17 +1366,23 @@ def receive_remote_request(request: dict[str, Any]) -> dict[str, Any]:
         handoff._write_new(kickoff, kickoff_bytes, 0o600)  # noqa: SLF001
         if goal_bytes is not None:
             handoff._write_new(Path(str(kickoff) + ".goal"), goal_bytes, 0o600)  # noqa: SLF001
-        return launch(
+        result = launch(
             name=request["name"], kickoff=kickoff, cwd=cwd,
-            agent=request["agent"], backend="tmux", model=request["model"],
+            agent=request["agent"], backend=backend, model=request["model"],
             effort=request["effort"], pmode=request["pmode"],
+            workspace=workspace,
             inputs=request["inputs"], state_root=state_root, run_dir=run_dir,
             readiness_timeout=float(request["readiness_timeout"]),
             confirm_ready=request["confirm_ready"],
             retain_orchestrator=request["retain_orchestrator"],
-            credential_dir=credential_dir, recorded_transport="ssh_tmux",
+            credential_dir=credential_dir, recorded_transport=f"ssh_{backend}",
             orchestrator_id=request["orchestrator_id"],
         )
+        # The sender records the transport from this echo rather than from its
+        # own request, so a receiver that ignored the requested backend cannot
+        # leave the orchestrator holding a handle it will address the wrong way.
+        result["backend"] = backend
+        return result
     finally:
         shutil.rmtree(source_dir, ignore_errors=True)
 
@@ -1076,6 +1415,82 @@ def _remote_tmux_capture(host: str, handle: str, *, scrollback_lines: int | None
     return _run_ssh(host, remote_argv, stdin="", timeout=15.0).stdout
 
 
+def _remote_herdr_pane_command(host: str, handle: str, binary: str = HERDR_DEFAULT) -> str:
+    """Return the remote pane's foreground command inventory as one string."""
+    result = _run_ssh(
+        host, [binary, "pane", "process-info", "--pane", handle], stdin="", timeout=15.0,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise AdapterError("remote herdr returned non-JSON process info") from exc
+    processes = ((payload.get("result") or {}).get("process_info") or {}).get(
+        "foreground_processes",
+    )
+    if not isinstance(processes, list):
+        return ""
+    return " ".join(
+        str(process.get("cmdline") or process.get("argv0") or "")
+        for process in processes
+        if isinstance(process, dict)
+    )
+
+
+def _remote_herdr_capture(
+    host: str,
+    handle: str,
+    *,
+    scrollback_lines: int | None = None,
+    binary: str = HERDR_DEFAULT,
+) -> str:
+    """Capture one exact remote herdr pane; no worker state is mutated."""
+    lines = str(scrollback_lines if scrollback_lines is not None else HERDR_CAPTURE_LINES)
+
+    def read(source: str) -> str:
+        return _run_ssh(
+            host,
+            [binary, "pane", "read", handle, "--source", source, "--lines", lines,
+             "--format", "text"],
+            stdin="",
+            timeout=15.0,
+        ).stdout
+
+    screen = read("recent-unwrapped")
+    return screen if screen.strip() else read("visible")
+
+
+def _remote_pane_command(host: str, handle: str, backend: str) -> str:
+    if backend == "herdr":
+        return _remote_herdr_pane_command(host, handle)
+    return _remote_tmux_pane_command(host, handle)
+
+
+def _remote_capture(
+    host: str, handle: str, backend: str, *, scrollback_lines: int | None = None,
+) -> str:
+    if backend == "herdr":
+        return _remote_herdr_capture(host, handle, scrollback_lines=scrollback_lines)
+    return _remote_tmux_capture(host, handle, scrollback_lines=scrollback_lines)
+
+
+def _remote_press_enter(host: str, handle: str, backend: str) -> None:
+    remote_argv = (
+        [HERDR_DEFAULT, "pane", "send-keys", handle, "enter"]
+        if backend == "herdr"
+        else ["tmux", "send-keys", "-t", handle, "C-m"]
+    )
+    _run_ssh(host, remote_argv, stdin="", timeout=15.0)
+
+
+def _remote_rescue_argv(handle: str, backend: str) -> list[str]:
+    if backend == "herdr":
+        return [
+            HERDR_DEFAULT, "pane", "read", handle,
+            "--source", "recent-unwrapped", "--lines", str(HERDR_CAPTURE_LINES),
+        ]
+    return ["tmux", "capture-pane", "-p", "-t", handle, "-S", "-2000"]
+
+
 def _is_remote_codex_folder_trust_prompt(
     pane_command: str,
     screen: str,
@@ -1098,15 +1513,16 @@ def _rescue_remote_codex_folder_trust(
     host: str,
     handle: str,
     remote_cwd: Path,
+    backend: str = "tmux",
 ) -> None:
     """Advance one verified, pre-agent Codex folder-trust dialog at most once."""
     result["folder_trust_rescued"] = False
     if result.get("worker_ready") is not False:
         return
     try:
-        pane_command = _remote_tmux_pane_command(host, handle)
-        screen = _remote_tmux_capture(
-            host, handle, scrollback_lines=REMOTE_FOLDER_TRUST_SCROLLBACK_LINES,
+        pane_command = _remote_pane_command(host, handle, backend)
+        screen = _remote_capture(
+            host, handle, backend, scrollback_lines=REMOTE_FOLDER_TRUST_SCROLLBACK_LINES,
         )
     except AdapterError:
         result["startup_unconfirmed"] = True
@@ -1116,15 +1532,10 @@ def _rescue_remote_codex_folder_trust(
         return
 
     try:
-        _run_ssh(
-            host,
-            ["tmux", "send-keys", "-t", handle, "C-m"],
-            stdin="",
-            timeout=15.0,
-        )
+        _remote_press_enter(host, handle, backend)
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
-        pane_command = _remote_tmux_pane_command(host, handle)
-        screen = _remote_tmux_capture(host, handle)
+        pane_command = _remote_pane_command(host, handle, backend)
+        screen = _remote_capture(host, handle, backend)
     except AdapterError:
         result["startup_unconfirmed"] = True
         return
@@ -1157,6 +1568,7 @@ def _rescue_remote_claude_folder_trust(
     host: str,
     handle: str,
     remote_cwd: Path,
+    backend: str = "tmux",
 ) -> None:
     """Advance one verified, pre-agent Claude folder-trust dialog at most once.
 
@@ -1168,9 +1580,9 @@ def _rescue_remote_claude_folder_trust(
     if result.get("worker_ready") is not False:
         return
     try:
-        pane_command = _remote_tmux_pane_command(host, handle)
-        screen = _remote_tmux_capture(
-            host, handle, scrollback_lines=REMOTE_FOLDER_TRUST_SCROLLBACK_LINES,
+        pane_command = _remote_pane_command(host, handle, backend)
+        screen = _remote_capture(
+            host, handle, backend, scrollback_lines=REMOTE_FOLDER_TRUST_SCROLLBACK_LINES,
         )
     except AdapterError:
         result["startup_unconfirmed"] = True
@@ -1180,15 +1592,10 @@ def _rescue_remote_claude_folder_trust(
         return
 
     try:
-        _run_ssh(
-            host,
-            ["tmux", "send-keys", "-t", handle, "C-m"],
-            stdin="",
-            timeout=15.0,
-        )
+        _remote_press_enter(host, handle, backend)
         time.sleep(TUI_SUBMIT_SETTLE_SECONDS)
-        pane_command = _remote_tmux_pane_command(host, handle)
-        screen = _remote_tmux_capture(host, handle)
+        pane_command = _remote_pane_command(host, handle, backend)
+        screen = _remote_capture(host, handle, backend)
     except AdapterError:
         result["startup_unconfirmed"] = True
         return
@@ -1378,9 +1785,14 @@ def launch_remote(
     run_dir: Path | None = None, readiness_timeout: float | None = None,
     confirm_ready: bool = False, retain_orchestrator: bool = False,
     credential_dir: Path | None = None, orchestrator_id: str | None = None,
+    backend: str = "herdr", workspace_label: str = HERDR_REMOTE_WORKSPACE_LABEL,
 ) -> dict[str, Any]:
     """Launch through an installed copy of this module on an SSH host."""
     host = _remote_host(host)
+    if backend not in REMOTE_BACKENDS:
+        raise handoff.HandoffError(
+            f"remote backend must be one of: {', '.join(REMOTE_BACKENDS)}", 2,
+        )
     orchestrator_id = _validate_orchestrator_id(orchestrator_id)
     kickoff = Path(kickoff).resolve(strict=True)
     remote_cwd = _remote_path(str(remote_cwd), "cwd", required=True)
@@ -1419,7 +1831,19 @@ def launch_remote(
         "retain_orchestrator": retain_orchestrator,
         "credential_dir": str(credential_dir) if credential_dir is not None else None,
         "orchestrator_id": orchestrator_id,
+        "backend": backend,
+        "workspace_label": workspace_label,
     }
+    if backend == "tmux":
+        # A receiver older than the herdr backend rejects any request whose key
+        # set it does not recognize.  tmux is what it would have done anyway, so
+        # drop the new keys and stay compatible; a herdr request has to fail
+        # loudly instead, which it does with "invalid remote launch request".
+        payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in REMOTE_OPTIONAL_REQUEST_FIELDS
+        }
     remote_argv = [
         remote_python, "-m", "agents.orchestration.handoff_launcher",
         "--receive-remote-request",
@@ -1443,30 +1867,39 @@ def launch_remote(
     remote_handle = remote_result.get("handle")
     if not isinstance(remote_handle, str):
         raise AdapterError("remote launcher did not return a session handle")
+    # Trust the backend the receiver reports over the one requested: a host
+    # whose package predates this change silently launches tmux, and recording
+    # herdr there would address every later doorbell and probe the wrong way.
+    effective_backend = remote_result.get("backend")
+    if effective_backend not in REMOTE_BACKENDS:
+        effective_backend = "tmux"
     result = dict(remote_result)
     result.update({
         "run_id": result.get("run_id") or Path(remote_run_dir).name,
         "run_dir": f"ssh://{host}{remote_run_dir}",
         "remote_run_dir": remote_run_dir,
         "remote_host": host,
-        "transport": "ssh_tmux",
-        "session_transport": "tmux",
-        "handle": f"ssh://{host}/tmux/{remote_handle}",
+        "transport": f"ssh_{effective_backend}",
+        "session_transport": effective_backend,
+        "handle": f"ssh://{host}/{effective_backend}/{remote_handle}",
         "remote_handle": remote_handle,
     })
     if agent == "codex":
         _rescue_remote_codex_folder_trust(
             result, host=host, handle=remote_handle, remote_cwd=remote_cwd,
+            backend=effective_backend,
         )
     elif agent == "claude":
         _rescue_remote_claude_folder_trust(
             result, host=host, handle=remote_handle, remote_cwd=remote_cwd,
+            backend=effective_backend,
         )
     try:
         handoff_registry.register(
             run_id=result["run_id"], name=name, run_dir=remote_run_dir,
             run_uri=result["run_dir"], host=host, remote_python=remote_python,
-            transport="ssh_tmux", session_transport="tmux", handle=remote_handle,
+            transport=f"ssh_{effective_backend}",
+            session_transport=effective_backend, handle=remote_handle,
             agent=agent,
             model=result.get("model") or model or AGENT_DEFAULTS[agent][0],
             effort=result.get("effort") or effort or AGENT_DEFAULTS[agent][1],
@@ -1479,8 +1912,7 @@ def launch_remote(
         result["registry_error"] = str(exc)
     if result.get("rescue_command"):
         result["rescue_command"] = _ssh_display_command(
-            host,
-            ["tmux", "capture-pane", "-p", "-t", remote_handle, "-S", "-2000"],
+            host, _remote_rescue_argv(remote_handle, effective_backend),
         )
     return result
 
@@ -1494,11 +1926,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(AGENT_DEFAULTS),
         default=os.environ.get("HANDOFF_AGENT", "claude"),
     )
-    parser.add_argument("--backend", choices=("cmux", "tmux"), default=os.environ.get("HANDOFF_BACKEND") or None)
+    parser.add_argument(
+        "--backend",
+        choices=("herdr", "cmux", "tmux"),
+        default=os.environ.get("HANDOFF_BACKEND") or None,
+        help="local session backend (default: herdr inside herdr, else cmux inside cmux, else tmux)",
+    )
     parser.add_argument(
         "--remote-host",
         default=os.environ.get("HANDOFF_REMOTE_HOST") or None,
-        help="launch on an SSH host that has this agents package, tmux, and the selected agent installed",
+        help="launch on an SSH host that has this agents package, the selected agent, and the remote backend installed",
+    )
+    parser.add_argument(
+        "--remote-backend",
+        choices=("herdr", "tmux"),
+        default=os.environ.get("HANDOFF_REMOTE_BACKEND") or "herdr",
+        help="session backend on --remote-host (default: herdr)",
+    )
+    parser.add_argument(
+        "--remote-workspace",
+        default=os.environ.get("HANDOFF_REMOTE_WORKSPACE") or HERDR_REMOTE_WORKSPACE_LABEL,
+        help=(
+            "herdr workspace label on --remote-host that holds worker tabs "
+            f"(default: {HERDR_REMOTE_WORKSPACE_LABEL}); created on first use"
+        ),
     )
     parser.add_argument(
         "--remote-cwd",
@@ -1537,6 +1988,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wait-ready", action="store_true", help="wait for the worker-ready checkpoint")
     parser.add_argument("--retain-orchestrator", "--retain-coordinator", dest="retain_orchestrator", action="store_true", help="retain the orchestrator lease for active monitoring")
     parser.add_argument("--cmux-binary", default=CMUX_DEFAULT)
+    parser.add_argument("--herdr-binary", default=HERDR_DEFAULT)
     parser.add_argument(
         "--orchestrator-state", "--coordinator-state", dest="orchestrator_state",
         type=Path,
@@ -1577,6 +2029,7 @@ def main(argv: list[str] | None = None) -> int:
                 retain_orchestrator=args.retain_orchestrator,
                 credential_dir=Path(configured_remote_private) if configured_remote_private else None,
                 orchestrator_id=orchestrator_id,
+                backend=args.remote_backend, workspace_label=args.remote_workspace,
             )
         else:
             result = launch(
@@ -1588,7 +2041,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.readiness_timeout
                     if args.readiness_timeout is not None else DEFAULT_READINESS_TIMEOUT
                 ),
-                cmux_binary=args.cmux_binary, confirm_ready=args.wait_ready,
+                cmux_binary=args.cmux_binary, herdr_binary=args.herdr_binary,
+                confirm_ready=args.wait_ready,
                 retain_orchestrator=args.retain_orchestrator,
                 orchestrator_id=orchestrator_id,
             )

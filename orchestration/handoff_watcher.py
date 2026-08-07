@@ -64,6 +64,7 @@ def _target(transport: Any, target: Any) -> dict[str, str]:
     if not isinstance(target, dict):
         raise handoff.HandoffError("orchestrator target must be an object", 5)
     fields = {
+        "herdr": {"pane"},
         "cmux": {"workspace", "surface"},
         "tmux": {"handle"},
         "native_app": {"thread_id"},
@@ -72,6 +73,10 @@ def _target(transport: Any, target: Any) -> dict[str, str]:
         raise handoff.HandoffError("orchestrator target does not match its transport", 5)
     if not all(isinstance(value, str) and value for value in target.values()):
         raise handoff.HandoffError("orchestrator target fields must be non-empty strings", 5)
+    if transport == "herdr" and not handoff_launcher.HERDR_PANE_RE.fullmatch(target["pane"]):
+        raise handoff.HandoffError(
+            "herdr orchestrator pane must be a pane ID such as w1:p2", 5,
+        )
     if transport == "cmux":
         try:
             surface = uuid.UUID(target["surface"])

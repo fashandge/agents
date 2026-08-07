@@ -907,3 +907,107 @@ def test_probe_program_dead_filter_deletes_nonterminal_run_dir(tmp_path):
     assert result["selected"] is True
     assert result["run_dir_deleted"] is True
     assert not run_dir.exists()
+
+
+class FakeHerdr:
+    """Answers herdr pane get/close for a fixed set of live panes."""
+
+    def __init__(self, *live_panes):
+        self.live = set(live_panes)
+        self.calls = []
+
+    def __call__(self, argv, *, check=True):
+        self.calls.append(argv)
+        if argv[:3] == ["herdr", "pane", "get"]:
+            if argv[3] in self.live:
+                return subprocess.CompletedProcess(argv, 0, '{"result": {"pane": {}}}', "")
+            return subprocess.CompletedProcess(
+                argv, 1, '{"error": {"code": "pane_not_found"}}', "",
+            )
+        if argv[:3] == ["herdr", "pane", "close"]:
+            self.live.discard(argv[3])
+            return subprocess.CompletedProcess(argv, 0, '{"result": {"type": "ok"}}', "")
+        raise AssertionError(argv)
+
+
+def test_herdr_pane_absence_is_only_concluded_from_a_server_verdict(monkeypatch):
+    monkeypatch.setattr(handoff_launcher, "_run", FakeHerdr("w1:pB"))
+    assert handoff_clean._herdr_pane_absent("w1:pB") is False
+    assert handoff_clean._herdr_pane_absent("w1:pZ") is True
+
+    # A broken invocation is not evidence of absence.
+    monkeypatch.setattr(
+        handoff_launcher,
+        "_run",
+        lambda argv, check=True: subprocess.CompletedProcess(
+            argv, 127, "", "herdr: command not found",
+        ),
+    )
+    assert handoff_clean._herdr_pane_absent("w1:pB") is None
+
+    monkeypatch.setattr(
+        handoff_launcher,
+        "_run",
+        lambda argv, check=True: (_ for _ in ()).throw(
+            handoff_launcher.AdapterError("socket unavailable")
+        ),
+    )
+    assert handoff_clean._herdr_pane_absent("w1:pB") is None
+
+
+def test_local_herdr_session_is_closed_through_herdr(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    run = record(registry, run_id="run-one", session_transport="herdr", handle="w1:pB")
+    fake = FakeHerdr("w1:pB")
+    monkeypatch.setattr(handoff_launcher, "_run", fake)
+
+    action, note, error = handoff_clean._local_session(
+        run, force=True, dry_run=False, cmux_binary="/exact/cmux",
+    )
+
+    assert (action, error) == ("kill", None)
+    assert ["herdr", "pane", "close", "w1:pB"] in fake.calls
+
+
+def test_local_herdr_session_already_gone_reports_none(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    run = record(registry, run_id="run-one", session_transport="herdr", handle="w1:pB")
+    monkeypatch.setattr(handoff_launcher, "_run", FakeHerdr())
+
+    action, note, error = handoff_clean._local_session(
+        run, force=True, dry_run=False, cmux_binary="/exact/cmux",
+    )
+
+    assert action == "none"
+    assert "already gone" in note
+
+
+def test_unreachable_herdr_leaves_liveness_unknown(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    run = record(registry, run_id="run-one", session_transport="herdr", handle="w1:pB")
+    monkeypatch.setattr(
+        handoff_launcher,
+        "_run",
+        lambda argv, check=True: subprocess.CompletedProcess(argv, 127, "", "not found"),
+    )
+
+    action, note, error = handoff_clean._local_session(
+        run, force=True, dry_run=False, cmux_binary="/exact/cmux",
+    )
+
+    assert action == "unknown"
+    assert "liveness is unknown" in note
+
+
+def test_unknown_session_transport_is_unknown_not_absent(tmp_path):
+    registry = tmp_path / "registry.json"
+    run = record(registry, run_id="run-one", session_transport="screen", handle="worker")
+
+    action, note, error = handoff_clean._local_session(
+        run, force=True, dry_run=False, cmux_binary="/exact/cmux",
+    )
+
+    # Reporting "none" here would let the caller reap the record while the real
+    # session keeps running, orphaning a live worker.
+    assert action == "unknown"
+    assert "liveness is unknown" in note

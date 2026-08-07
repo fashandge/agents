@@ -6,8 +6,8 @@
 # (or reuses) the singleton watcher.
 #
 # Usage:
-#   handoff_orchestrator_ensure.sh --transport cmux|tmux --owner-pid <pid> \
-#       [--target <exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
+#   handoff_orchestrator_ensure.sh --transport herdr|cmux|tmux --owner-pid <pid> \
+#       [--target <exact-handle>] [--state <watcher.json>] [--interval 5]
 #
 # Behavior:
 #   * --state omitted: create $HOME/.local/state/agents/handoff/orchestrators
@@ -27,8 +27,9 @@
 #     process — never a transient tool shell's $$ or $PPID. Registration
 #     captures both PID and process-start identity so PID reuse cannot
 #     preserve an orphaned watcher.
-#   * cmux registration resolves the orchestrator surface from CMUX_SURFACE_ID
-#     in the environment; tmux registration requires --target with the exact
+#   * herdr registration resolves the orchestrator pane from HERDR_PANE_ID in
+#     the environment; cmux registration resolves the surface from
+#     CMUX_SURFACE_ID; tmux registration requires --target with the exact
 #     orchestrator tmux handle.
 #   * Keep the printed state path private and reuse it only for the same
 #     orchestrator session; pass it as --orchestrator-state to every monitored
@@ -38,7 +39,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: handoff_orchestrator_ensure.sh --transport cmux|tmux [--owner-pid <pid>|auto] [--target auto|<exact-tmux-handle>] [--state <watcher.json>] [--interval 5]
+Usage: handoff_orchestrator_ensure.sh --transport herdr|cmux|tmux [--owner-pid <pid>|auto] [--target auto|<exact-handle>] [--state <watcher.json>] [--interval 5]
 
 Idempotent handoff session-watcher bootstrap: registers the orchestrator
 target once (unless --state already exists), then starts or reuses the
@@ -52,6 +53,10 @@ Pass an explicit numeric PID to override.
 For --transport tmux, --target accepts "auto" (resolve to the current tmux
 session; requires running inside tmux) or an exact session handle, validated
 with `tmux has-session` at registration.
+
+For --transport herdr and cmux, --target is optional: the orchestrator's own
+pane or surface is read from HERDR_PANE_ID / CMUX_SURFACE_ID in the
+environment. Pass --target <pane-id> only to register a different herdr pane.
 EOF
 }
 
@@ -80,8 +85,8 @@ done
 
 [[ -n "$transport" ]] || { usage >&2; die "--transport is required"; }
 case "$transport" in
-  cmux|tmux) ;;
-  *) die "--transport must be cmux or tmux" ;;
+  herdr|cmux|tmux) ;;
+  *) die "--transport must be herdr, cmux, or tmux" ;;
 esac
 
 # Resolve the orchestrator PID automatically when omitted or set to "auto":
@@ -96,6 +101,9 @@ fi
 [[ "$owner_pid" =~ ^[0-9]+$ ]] || die "--owner-pid must be the numeric PID of the long-lived orchestrator process (or 'auto'), never a transient tool shell's \$\$ or \$PPID"
 if [[ "$transport" == tmux && -z "$target" ]]; then
   die "--target <exact-tmux-handle> is required for --transport tmux"
+fi
+if [[ "$transport" == herdr && -z "$target" && -z "${HERDR_PANE_ID:-}" ]]; then
+  die "--transport herdr needs HERDR_PANE_ID in the environment (run inside a herdr pane) or an explicit --target <pane-id>"
 fi
 
 if [[ -z "$state" ]]; then

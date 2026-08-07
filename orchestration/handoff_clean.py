@@ -79,10 +79,17 @@ for r in runs:
         e["finished"] = bool(owning.get("finished_at"))
     except Exception as ex:  # noqa: BLE001
         e["finished"] = None
-    e["session_alive"] = subprocess.run(
-        ["tmux", "has-session", "-t", r["handle"]],
-        capture_output=True,
-    ).returncode == 0
+    transport = r.get("session_transport") or "tmux"
+    if transport == "herdr":
+        e["session_alive"] = subprocess.run(
+            ["herdr", "pane", "get", r["handle"]],
+            capture_output=True,
+        ).returncode == 0
+    else:
+        e["session_alive"] = subprocess.run(
+            ["tmux", "has-session", "-t", r["handle"]],
+            capture_output=True,
+        ).returncode == 0
     # Terminal for cleanup = the orchestrator marked the run finished OR the
     # live worker epoch declared a fatal error OR a legacy terminal fact
     # (pre-collapse status or desired_state stop) OR the run directory is
@@ -109,10 +116,12 @@ for r in runs:
     reapable = terminal or e["session_alive"] is False or r.get("force")
     if mode == "kill" and e["selected"] and reapable:
         if e["session_alive"]:
-            kr = subprocess.run(
-                ["tmux", "kill-session", "-t", r["handle"]],
-                capture_output=True, text=True,
+            kill_argv = (
+                ["herdr", "pane", "close", r["handle"]]
+                if transport == "herdr"
+                else ["tmux", "kill-session", "-t", r["handle"]]
             )
+            kr = subprocess.run(kill_argv, capture_output=True, text=True)
             e["killed"] = kr.returncode == 0
             if kr.returncode != 0:
                 e["kill_error"] = (kr.stderr or kr.stdout).strip()
@@ -159,6 +168,9 @@ def _probe_host(
         {
             "run_id": r["run_id"], "handle": r["handle"], "run_dir": r["run_dir"],
             "force": force, "delete_run_dir": delete_run_dir, "facts": facts,
+            # The owning host addresses its own session; a remote herdr pane is
+            # probed and closed through herdr, not tmux.
+            "session_transport": r.get("session_transport") or "tmux",
         }
         for r in runs
     ]
@@ -293,7 +305,32 @@ def _session_absent(record: dict[str, Any], *, cmux_binary: str) -> bool | None:
             return None
         surfaces, _ = snapshot
         return handle.lower() not in _uuids(surfaces)
+    if transport == "herdr":
+        return _herdr_pane_absent(handle)
     return None
+
+
+def _herdr_pane_absent(handle: str, binary: str = handoff_launcher.HERDR_DEFAULT) -> bool | None:
+    """Does herdr answer that this pane is gone? ``None`` when it cannot answer.
+
+    ``pane get`` fails with a JSON error for a pane that no longer exists, but
+    also for an unreachable server, so absence is only concluded from an error
+    payload the server itself produced.
+    """
+    try:
+        result = handoff_launcher._run(  # noqa: SLF001 - shared adapter discipline
+            [binary, "pane", "get", handle], check=False,
+        )
+    except handoff_launcher.AdapterError:
+        return None
+    if result.returncode == 0:
+        return False
+    try:
+        payload = json.loads(result.stdout or result.stderr)
+    except (json.JSONDecodeError, TypeError):
+        # A non-JSON failure is a broken invocation, not a server verdict.
+        return None
+    return isinstance(payload, dict) and isinstance(payload.get("error"), dict)
 
 
 def _local_fatal(record: dict[str, Any]) -> bool:
@@ -354,7 +391,35 @@ def _local_session(
                 return "none", "cmux surface is already gone", None
             return "kill", None, None
         return _cmux_close_surface(handle, binary=cmux_binary)
-    return "none", f"unknown session transport {transport!r}; no session cleanup attempted", None
+    if transport == "herdr":
+        absent = _herdr_pane_absent(handle)
+        if absent is None:
+            return "unknown", "herdr is unreachable; session liveness is unknown", None
+        if absent:
+            return "none", "herdr pane is already gone", None
+        if dry_run:
+            return "kill", None, None
+        if not force:
+            terminal_now, note = handoff_registry._assess_terminal(record)  # noqa: SLF001
+            if not terminal_now:
+                return "error", f"run went live during cleanup ({note}); session left running", None
+        try:
+            closed = handoff_launcher._run(  # noqa: SLF001
+                [handoff_launcher.HERDR_DEFAULT, "pane", "close", handle], check=False,
+            )
+        except handoff_launcher.AdapterError as exc:
+            return "unknown", f"herdr is unreachable ({exc}); session liveness is unknown", None
+        if closed.returncode != 0:
+            return "error", f"herdr pane close failed: {(closed.stderr or closed.stdout).strip()}", None
+        return "kill", None, None
+    # An unrecognized transport is not evidence that nothing is running.
+    # Reporting "none" here would let the caller reap the record while the real
+    # session keeps going, orphaning a live worker with no way back to it.
+    return (
+        "unknown",
+        f"unknown session transport {transport!r}; session liveness is unknown",
+        None,
+    )
 
 
 def _remote_terminal_note(row: dict[str, Any]) -> str | None:

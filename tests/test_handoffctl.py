@@ -1119,7 +1119,7 @@ def test_native_app_orchestrator_retarget_is_still_rejected(tmp_path):
         handoffctl._retarget_orchestrator(_tmux_retarget_args(state_path, "thread-2"))
 
     assert excinfo.value.exit_code == 2
-    assert "cmux and tmux" in str(excinfo.value)
+    assert "herdr, cmux, and tmux" in str(excinfo.value)
     assert handoff_watcher.read(state_path)["target"] == {"thread_id": "thread-1"}
 
 
@@ -2310,3 +2310,95 @@ def test_cmux_doorbell_omits_workspace_flag_when_unresolved(monkeypatch):
     assert calls[0][1] == "send"
     assert calls[1][1] == "send-key"
     assert calls[2][1] == "read-screen"
+
+
+def _herdr_register_args(state, target=None):
+    return Namespace(
+        state=state,
+        transport="herdr",
+        target=target,
+        surface=None,
+        cmux_binary="/exact/cmux",
+        owner_pid=os.getpid(),
+        orchestrator_id=None,
+    )
+
+
+def test_herdr_orchestrator_registration_uses_the_inherited_pane(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p2")
+    monkeypatch.setattr(
+        handoffctl.handoff_launcher,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("herdr must not be probed to learn our own pane"),
+    )
+
+    value = handoffctl._register_orchestrator(
+        _herdr_register_args(tmp_path / "orchestrator" / "watcher.json"),
+    )
+
+    assert value["target"] == {"pane": "w1:p2"}
+
+
+def test_herdr_orchestrator_registration_requires_a_pane(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoffctl._register_orchestrator(
+            _herdr_register_args(tmp_path / "orchestrator" / "watcher.json"),
+        )
+
+    assert excinfo.value.exit_code == 2
+    assert "HERDR_PANE_ID" in str(excinfo.value)
+
+
+def test_herdr_orchestrator_registration_rejects_a_tmux_style_target(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoffctl._register_orchestrator(
+            _herdr_register_args(tmp_path / "orchestrator" / "watcher.json", "session:0.1"),
+        )
+
+    assert excinfo.value.exit_code == 2
+    assert "pane ID" in str(excinfo.value)
+
+
+def test_herdr_orchestrator_retarget_replaces_the_pane(tmp_path, monkeypatch):
+    state_path = tmp_path / "orchestrator" / "watcher.json"
+    handoff_watcher.initialize(
+        state_path, transport="herdr", target={"pane": "w1:p2"}, owner_pid=os.getpid(),
+    )
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+
+    value = handoffctl._retarget_orchestrator(_tmux_retarget_args(state_path, "w3:pF"))
+
+    assert value["target"] == {"pane": "w3:pF"}
+
+
+def test_worker_doorbell_reconstructs_the_herdr_adapter_from_the_record(monkeypatch):
+    calls = []
+
+    class Herdr:
+        def __init__(self, binary=None):
+            self.binary = binary
+
+        def doorbell(self, handle, run_id, inbox_seq):
+            calls.append((handle, run_id, inbox_seq))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "HerdrAdapter", Herdr)
+
+    sent, error = handoffctl._ring_doorbell(
+        {"session_transport": "herdr", "handle": "w1:pB"}, "run-1", 4,
+    )
+
+    assert sent is True and error is None
+    assert calls == [("w1:pB", "run-1", 4)]
+
+
+def test_worker_doorbell_reports_an_unknown_transport_instead_of_ringing(monkeypatch):
+    sent, error = handoffctl._ring_doorbell(
+        {"session_transport": "screen", "handle": "worker"}, "run-1", 4,
+    )
+
+    assert sent is False
+    assert "unsupported session transport: screen" in error

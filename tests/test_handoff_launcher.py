@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from agents.orchestration import handoff
 from agents.orchestration import handoff_launcher
 from agents.orchestration import handoff_registry
 
@@ -12,6 +13,11 @@ from agents.orchestration import handoff_registry
 @pytest.fixture(autouse=True)
 def isolate_handoff_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("HANDOFF_REGISTRY_FILE", str(tmp_path / "registry.json"))
+    # Backend autoselection reads the session's own multiplexer environment, so
+    # a suite run from inside cmux or herdr would otherwise select a backend the
+    # test never asked for.  Each test opts back in to exactly what it needs.
+    for name in ("HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_PANE_ID", "CMUX_WORKSPACE_ID"):
+        monkeypatch.delenv(name, raising=False)
 
 
 class Completed:
@@ -1410,3 +1416,447 @@ def test_local_claude_trust_rescue_returns_promptly_when_already_trusted(tmp_pat
     assert adapter.enters == 0
     assert result["folder_trust_rescued"] is False
     assert "startup_unconfirmed" not in result
+
+
+def _herdr_json(payload):
+    return Completed(stdout=json.dumps(payload))
+
+
+def test_herdr_launch_creates_a_tab_and_runs_the_wrapper_in_its_root_pane(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1:3] == ["tab", "create"]:
+            return _herdr_json({"result": {"root_pane": {"pane_id": "w1:pB"}}})
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    adapter = handoff_launcher.HerdrAdapter("herdr")
+    command = "exec '/private/wrapper ; x' '/private/config $(x)'"
+
+    handle = adapter.launch("name ; x", tmp_path, command, "w1")
+
+    assert handle == "w1:pB"
+    assert adapter.workspace == "w1"
+    assert [
+        "herdr", "tab", "create", "--workspace", "w1", "--cwd", str(tmp_path),
+        "--label", "name ; x", "--no-focus",
+    ] in calls
+    # The wrapper path crosses as one literal argv element, never a shell burst.
+    assert ["herdr", "pane", "run", "w1:pB", command] in calls
+
+
+def test_herdr_launch_uses_the_inherited_workspace_and_rejects_a_bad_pane_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w7")
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        return _herdr_json({"result": {"root_pane": {"pane_id": "not-a-pane"}}})
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+
+    with pytest.raises(handoff_launcher.AdapterError) as excinfo:
+        handoff_launcher.HerdrAdapter().launch("worker", tmp_path, "exec /w /c")
+
+    assert "could not parse herdr pane ID" in str(excinfo.value)
+    assert calls[0][:5] == ["herdr", "tab", "create", "--workspace", "w7"]
+
+
+def test_herdr_launch_without_any_workspace_refuses_to_guess(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERDR_WORKSPACE_ID", raising=False)
+    monkeypatch.setattr(
+        handoff_launcher,
+        "_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("no herdr command may run without a resolved workspace")
+        ),
+    )
+
+    with pytest.raises(handoff_launcher.AdapterError):
+        handoff_launcher.HerdrAdapter().launch("worker", tmp_path, "exec /w /c")
+
+
+def test_herdr_probe_reads_the_foreground_process_inventory(monkeypatch):
+    inventory = {
+        "result": {
+            "process_info": {
+                "foreground_processes": [
+                    {"argv0": "zsh", "cmdline": "-zsh", "name": "zsh"},
+                    {
+                        "argv0": "node",
+                        "cmdline": "node /private/codex/bin/codex.js",
+                        "name": "node",
+                    },
+                ],
+            },
+        },
+    }
+    monkeypatch.setattr(
+        handoff_launcher, "_run", lambda argv, check=True: _herdr_json(inventory),
+    )
+    adapter = handoff_launcher.HerdrAdapter()
+
+    assert adapter.probe("w1:pB", "codex")
+    # A shell-only pane is not a live worker, and "pi" must not match "private".
+    assert not adapter.probe("w1:pB", "pi")
+
+
+def test_herdr_probe_reports_absence_rather_than_raising_when_the_pane_is_gone(monkeypatch):
+    monkeypatch.setattr(
+        handoff_launcher,
+        "_run",
+        lambda argv, check=True: Completed(
+            returncode=1, stdout='{"error": {"code": "pane_not_found"}}',
+        ),
+    )
+
+    assert not handoff_launcher.HerdrAdapter().probe("w1:pB", "claude")
+
+
+def test_herdr_capture_falls_back_to_the_visible_screen_when_recent_is_empty(monkeypatch):
+    def fake_run(argv, check=True):
+        source = argv[argv.index("--source") + 1]
+        return Completed(stdout="" if source == "recent-unwrapped" else "shell prompt\n")
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+
+    assert handoff_launcher.HerdrAdapter().capture("w1:pB") == "shell prompt\n"
+
+
+def test_herdr_doorbell_submits_atomically_through_the_agent_surface(monkeypatch):
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            return _herdr_json({"result": {"agent": {"agent_status": "idle"}}})
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(
+        handoff_launcher.time,
+        "sleep",
+        lambda *_: (_ for _ in ()).throw(
+            AssertionError("an atomic submit needs no settle delay")
+        ),
+    )
+
+    handoff_launcher.HerdrAdapter().doorbell("w1:pB", "run-secret", 9)
+
+    body = "Check handoff run run-secret; inbox now through seq 9."
+    assert ["herdr", "agent", "prompt", "w1:pB", body] in calls
+    assert not any(call[1:3] == ["pane", "send-text"] for call in calls)
+
+
+def test_herdr_doorbell_falls_back_to_the_pane_before_the_agent_is_recognized(monkeypatch):
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            return Completed(returncode=1, stdout='{"error": {"code": "agent_not_found"}}')
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda *_: None)
+
+    handoff_launcher.HerdrAdapter().doorbell("w1:pB", "run-secret", 9)
+
+    body = "Check handoff run run-secret; inbox now through seq 9."
+    assert ["herdr", "pane", "send-text", "w1:pB", body] in calls
+    assert ["herdr", "pane", "send-keys", "w1:pB", "enter"] in calls
+
+
+def test_herdr_orchestrator_doorbell_types_and_notifies_and_survives_a_failed_alert(monkeypatch):
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1:3] == ["agent", "get"]:
+            return _herdr_json({"result": {"agent": {"agent_status": "idle"}}})
+        if argv[1:3] == ["notification", "show"]:
+            raise handoff_launcher.AdapterError("notification daemon is down")
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    orchestrator_id = "123e4567-e89b-42d3-a456-426614174000"
+
+    handoff_launcher.HerdrAdapter().orchestrator_doorbell("w1:p2", orchestrator_id)
+
+    pointer = handoff_launcher.orchestrator_doorbell_body(orchestrator_id)
+    assert ["herdr", "agent", "prompt", "w1:p2", pointer] in calls
+    assert any(call[1:3] == ["notification", "show"] for call in calls)
+
+
+def test_herdr_composer_guard_defers_only_while_an_approval_ui_is_up(monkeypatch):
+    status = {"value": "blocked"}
+
+    def fake_run(argv, check=True):
+        if argv[1:3] == ["agent", "get"]:
+            return _herdr_json({
+                "result": {"agent": {"agent_status": status["value"], "focused": True}},
+            })
+        return Completed(stdout="agent transcript\n")
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    adapter = handoff_launcher.HerdrAdapter()
+
+    assert adapter.composer_guard("w1:p2") == handoff_launcher.COMPOSER_BUSY
+    # A working orchestrator is the normal case: input typed during a turn
+    # queues, so treating it as busy would starve every doorbell.
+    status["value"] = "working"
+    assert adapter.composer_guard("w1:p2") == handoff_launcher.COMPOSER_CLEAR
+
+
+def test_backend_autoselection_prefers_herdr_from_a_herdr_session(tmp_path, monkeypatch):
+    cmux = tmp_path / "cmux"
+    cmux.write_text("")
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w1")
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace:parent")
+    monkeypatch.setattr(handoff_launcher.shutil, "which", lambda *args, **kwargs: "/usr/local/bin/herdr")
+
+    def fake_run(argv, check=True):
+        assert argv[:3] == ["herdr", "status", "server"], argv
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+
+    assert handoff_launcher._select_backend(None, str(cmux)) == "herdr"
+
+
+def test_backend_autoselection_skips_herdr_when_its_server_is_down(tmp_path, monkeypatch):
+    cmux = tmp_path / "cmux"
+    cmux.write_text("")
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w1")
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace:parent")
+    monkeypatch.setattr(handoff_launcher.shutil, "which", lambda *args, **kwargs: "/usr/local/bin/herdr")
+
+    def fake_run(argv, check=True):
+        # herdr's probe fails; cmux's answers.
+        return Completed(returncode=1) if argv[0] == "herdr" else Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+
+    assert handoff_launcher._select_backend(None, str(cmux)) == "cmux"
+
+
+def test_backend_autoselection_ignores_a_stale_herdr_env_without_a_workspace(tmp_path, monkeypatch):
+    cmux = tmp_path / "cmux"
+    cmux.write_text("")
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.delenv("HERDR_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+    monkeypatch.setattr(handoff_launcher.shutil, "which", lambda *args, **kwargs: "/opt/homebrew/bin/tmux")
+    monkeypatch.setattr(
+        handoff_launcher,
+        "_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("no server probe without a workspace to launch into")
+        ),
+    )
+
+    assert handoff_launcher._select_backend(None, str(cmux)) == "tmux"
+
+
+def test_explicit_backend_rejects_an_unknown_name(tmp_path):
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        handoff_launcher._select_backend("screen", str(tmp_path / "cmux"))
+
+    assert excinfo.value.exit_code == 2
+    assert "herdr, cmux, or tmux" in str(excinfo.value)
+
+
+def _remote_herdr_request(tmp_path, **overrides):
+    request = {
+        "name": "remote-worker",
+        "kickoff_b64": handoff_launcher.base64.b64encode(b"do the work").decode(),
+        "goal_b64": None,
+        "cwd": str(tmp_path),
+        "agent": "pi",
+        "model": None,
+        "effort": None,
+        "pmode": "bypassPermissions",
+        "inputs": [],
+        "state_root": None,
+        "run_dir": None,
+        "readiness_timeout": 90,
+        "confirm_ready": False,
+        "retain_orchestrator": False,
+        "credential_dir": None,
+        "orchestrator_id": None,
+        "backend": "herdr",
+        "workspace_label": "REMOTE_WORKERS",
+    }
+    request.update(overrides)
+    return request
+
+
+def test_receive_remote_request_reuses_the_labelled_herdr_workspace(tmp_path, monkeypatch):
+    captured = {}
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1:3] == ["workspace", "list"]:
+            return _herdr_json({
+                "result": {
+                    "workspaces": [
+                        {"label": "~", "workspace_id": "w6"},
+                        {"label": "REMOTE_WORKERS", "workspace_id": "w9"},
+                    ],
+                },
+            })
+        raise AssertionError(f"an existing workspace must not be recreated: {argv}")
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+        return {"run_dir": "/remote/state/run", "handle": "w9:p3"}
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(handoff_launcher, "launch", fake_launch)
+
+    result = handoff_launcher.receive_remote_request(_remote_herdr_request(tmp_path))
+
+    assert captured["backend"] == "herdr"
+    assert captured["workspace"] == "w9"
+    assert captured["recorded_transport"] == "ssh_herdr"
+    # The receiver echoes what it actually did, which the sender records.
+    assert result["backend"] == "herdr"
+
+
+def test_receive_remote_request_creates_the_worker_workspace_on_first_use(tmp_path, monkeypatch):
+    captured = {}
+    calls = []
+
+    def fake_run(argv, check=True):
+        calls.append(argv)
+        if argv[1:3] == ["workspace", "list"]:
+            return _herdr_json({"result": {"workspaces": [{"label": "~", "workspace_id": "w6"}]}})
+        if argv[1:3] == ["workspace", "create"]:
+            return _herdr_json({"result": {"workspace": {"workspace_id": "w11"}}})
+        return Completed()
+
+    monkeypatch.setattr(handoff_launcher, "_run", fake_run)
+    monkeypatch.setattr(handoff_launcher, "launch", lambda **kwargs: (
+        captured.update(kwargs) or {"run_dir": "/remote/state/run", "handle": "w11:p1"}
+    ))
+
+    handoff_launcher.receive_remote_request(_remote_herdr_request(tmp_path))
+
+    assert captured["workspace"] == "w11"
+    assert [
+        "herdr", "workspace", "create", "--label", "REMOTE_WORKERS",
+        "--cwd", str(tmp_path), "--no-focus",
+    ] in calls
+
+
+def test_receive_remote_request_defaults_an_old_sender_to_tmux(tmp_path, monkeypatch):
+    captured = {}
+    request = _remote_herdr_request(tmp_path)
+    del request["backend"]
+    del request["workspace_label"]
+    monkeypatch.setattr(handoff_launcher, "launch", lambda **kwargs: (
+        captured.update(kwargs) or {"run_dir": "/remote/state/run", "handle": "worker"}
+    ))
+    monkeypatch.setattr(
+        handoff_launcher,
+        "_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("a tmux launch must not touch herdr")
+        ),
+    )
+
+    result = handoff_launcher.receive_remote_request(request)
+
+    assert captured["backend"] == "tmux"
+    assert captured["recorded_transport"] == "ssh_tmux"
+    assert result["backend"] == "tmux"
+
+
+def test_launch_remote_records_the_backend_the_host_actually_used(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("do the work")
+    sent = {}
+
+    def fake_run_ssh(host, remote_argv, *, stdin, timeout):
+        sent["payload"] = json.loads(stdin)
+        # A host whose package predates the herdr backend silently launches
+        # tmux and echoes no backend at all.
+        return Completed(stdout=json.dumps({
+            "run_dir": "/remote/state/run", "handle": "remote-worker",
+        }))
+
+    monkeypatch.setattr(handoff_launcher, "_run_ssh", fake_run_ssh)
+
+    result = handoff_launcher.launch_remote(
+        host="oci-box", remote_python="python3", name="remote-worker",
+        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/investment"),
+        agent="pi", backend="herdr",
+    )
+
+    assert sent["payload"]["backend"] == "herdr"
+    assert sent["payload"]["workspace_label"] == "REMOTE_WORKERS"
+    # Recording herdr here would address every later doorbell the wrong way.
+    assert result["transport"] == "ssh_tmux"
+    assert result["session_transport"] == "tmux"
+    assert result["handle"] == "ssh://oci-box/tmux/remote-worker"
+    record = handoff_registry.resolve("remote-worker", private=True)
+    assert record["session_transport"] == "tmux"
+
+
+def test_launch_remote_herdr_reports_a_pane_handle_and_herdr_rescue(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("do the work")
+
+    monkeypatch.setattr(
+        handoff_launcher, "_run_ssh",
+        lambda host, remote_argv, *, stdin, timeout: Completed(stdout=json.dumps({
+            "run_dir": "/remote/state/run", "handle": "w9:p3", "backend": "herdr",
+            "rescue_command": "herdr pane read w9:p3 --source recent-unwrapped --lines 2000",
+        })),
+    )
+
+    result = handoff_launcher.launch_remote(
+        host="oci-box", remote_python="python3", name="remote-worker",
+        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/investment"),
+        agent="pi", backend="herdr",
+    )
+
+    assert result["transport"] == "ssh_herdr"
+    assert result["session_transport"] == "herdr"
+    assert result["handle"] == "ssh://oci-box/herdr/w9:p3"
+    assert result["remote_handle"] == "w9:p3"
+    assert result["rescue_command"] == (
+        "ssh oci-box 'herdr pane read w9:p3 --source recent-unwrapped --lines 2000'"
+    )
+    record = handoff_registry.resolve("remote-worker", private=True)
+    assert record["session_transport"] == "herdr"
+    assert record["handle"] == "w9:p3"
+
+
+def test_launch_remote_tmux_stays_compatible_with_an_old_receiver(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("do the work")
+    sent = {}
+
+    def fake_run_ssh(host, remote_argv, *, stdin, timeout):
+        sent["payload"] = json.loads(stdin)
+        return Completed(stdout=json.dumps({
+            "run_dir": "/remote/state/run", "handle": "remote-worker", "backend": "tmux",
+        }))
+
+    monkeypatch.setattr(handoff_launcher, "_run_ssh", fake_run_ssh)
+
+    handoff_launcher.launch_remote(
+        host="oci-box", remote_python="python3", name="remote-worker",
+        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/investment"),
+        agent="pi", backend="tmux",
+    )
+
+    # An older receiver rejects any request whose key set it does not know.
+    assert "backend" not in sent["payload"]
+    assert "workspace_label" not in sent["payload"]

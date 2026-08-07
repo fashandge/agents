@@ -2108,3 +2108,113 @@ def test_tmux_passive_doorbell_macos_failure_is_best_effort(monkeypatch):
     }, {"run-secret": 9}, "passive")
 
     assert method == "macos_notification_failed"
+
+
+def test_orchestrator_doorbell_routes_a_herdr_pane_opaquely(monkeypatch):
+    orchestrator_id = "b071b964-8bc9-4af3-bbe7-46d6c36e27f9"
+    calls = []
+
+    class Herdr(ComposerClear):
+        def __init__(self, binary):
+            self.binary = binary
+
+        def orchestrator_doorbell(self, pane, observed_id, *, forced=False):
+            calls.append(("herdr", pane, observed_id, forced))
+
+        def notify(self, pane, *, title, body):
+            calls.append(("herdr_notify", pane, title, body))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "HerdrAdapter", Herdr)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": orchestrator_id,
+        "transport": "herdr",
+        "target": {"pane": "w1:p2"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9}, "active")
+
+    assert method == "terminal_input"
+    assert calls == [("herdr", "w1:p2", orchestrator_id, False)]
+    assert "run-secret" not in str(calls)
+    assert "seq 9" not in str(calls)
+
+
+def test_passive_herdr_doorbell_notifies_without_typing(monkeypatch):
+    calls = []
+
+    class Herdr(ComposerClear):
+        def __init__(self, binary):
+            self.binary = binary
+
+        def orchestrator_doorbell(self, pane, observed_id, *, forced=False):
+            raise AssertionError("a re-reminder must never type into the composer")
+
+        def notify(self, pane, *, title, body):
+            calls.append(("notify", pane, title, body))
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "HerdrAdapter", Herdr)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+        "transport": "herdr",
+        "target": {"pane": "w1:p2"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9}, "passive")
+
+    assert method == "herdr_notification"
+    assert calls[0][0] == "notify"
+
+
+def test_herdr_doorbell_defers_while_the_composer_is_busy(monkeypatch):
+    class Herdr:
+        def __init__(self, binary):
+            self.binary = binary
+
+        def composer_guard(self, pane):
+            return handoff_launcher.COMPOSER_BUSY
+
+        def orchestrator_doorbell(self, pane, observed_id, *, forced=False):
+            raise AssertionError("a busy composer must not be typed into")
+
+    monkeypatch.setattr(handoffctl.handoff_launcher, "HerdrAdapter", Herdr)
+    monkeypatch.setattr(
+        handoffctl.handoff_watcher, "owner_process_status", lambda owner: "alive",
+    )
+
+    method = handoffctl._notify_orchestrator({
+        "orchestrator_id": "b071b964-8bc9-4af3-bbe7-46d6c36e27f9",
+        "transport": "herdr",
+        "target": {"pane": "w1:p2"},
+        "owner_process": {"pid": os.getpid(), "started_at": "test"},
+    }, {"run-secret": 9}, "active")
+
+    assert method == handoff_watcher.DEFERRED_INPUT
+
+
+def test_herdr_orchestrator_target_requires_a_pane_id(tmp_path):
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        orchestrator_state(tmp_path, transport="herdr", target={"pane": "session:0.1"})
+
+    assert excinfo.value.exit_code == 5
+    assert "pane ID" in str(excinfo.value)
+
+
+def test_herdr_orchestrator_target_rejects_a_tmux_shaped_target(tmp_path):
+    with pytest.raises(handoff.HandoffError) as excinfo:
+        orchestrator_state(tmp_path, transport="herdr", target={"handle": "w1:p2"})
+
+    assert excinfo.value.exit_code == 5
+
+
+def test_herdr_orchestrator_watcher_stays_detached(tmp_path):
+    # The herdr server accepts socket clients from outside its process tree, so
+    # the doorbell channels a detached watcher uses all work.
+    assert handoffctl._resolve_watcher_mode("auto", "herdr") == "detached"
+    with pytest.raises(handoff.HandoffError):
+        handoffctl._resolve_watcher_mode("surface", "herdr")

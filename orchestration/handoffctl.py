@@ -102,14 +102,31 @@ def _mutation_inputs(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _notify_result_ready(run_dir: Path) -> None:
-    """Best-effort cmux alert after the durable result is authoritative."""
+    """Best-effort native alert after the durable result is authoritative."""
     try:
         run = handoff._load_json(  # noqa: SLF001 - same-package immutable run reader
             Path(run_dir) / "run.json",
             handoff._validate_run,  # noqa: SLF001 - reject a malformed transport record
         )
+        transport = run["worker"]["transport"]
+        if transport == "herdr":
+            if not os.environ.get("HERDR_PANE_ID"):
+                return
+            subprocess.run(
+                [
+                    handoff_launcher.HERDR_DEFAULT, "notification", "show",
+                    RESULT_NOTIFICATION_TITLE,
+                    "--body", RESULT_NOTIFICATION_BODY,
+                    "--sound", "done",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=RESULT_NOTIFICATION_TIMEOUT_SECONDS,
+            )
+            return
         surface = os.environ.get("CMUX_SURFACE_ID")
-        if run["worker"]["transport"] != "cmux" or not surface:
+        if transport != "cmux" or not surface:
             return
         subprocess.run(
             [
@@ -165,14 +182,7 @@ def _context_local(run_dir: Path) -> dict[str, Any]:
 
 def _ring_doorbell(record: dict[str, Any], run_id: str, inbox_seq: int) -> tuple[bool, str | None]:
     try:
-        if record["session_transport"] == "tmux":
-            adapter: Any = handoff_launcher.TmuxAdapter()
-        elif record["session_transport"] == "cmux":
-            adapter = handoff_launcher.CmuxAdapter(handoff_launcher.CMUX_DEFAULT)
-        else:
-            raise handoff.HandoffError(
-                f"unsupported session transport: {record['session_transport']}", 4,
-            )
+        adapter: Any = handoff_launcher.build_adapter(record["session_transport"])
         adapter.doorbell(record["handle"], run_id, inbox_seq)
         return True, None
     except (handoff.HandoffError, handoff_launcher.AdapterError) as exc:
@@ -583,16 +593,23 @@ def _read_registered_outbox(record: dict[str, Any], after: int) -> list[dict[str
 
 
 def _notify_watched_event(record: dict[str, Any], event: dict[str, Any]) -> None:
-    surface = os.environ.get("CMUX_SURFACE_ID")
-    if not surface:
+    title = f"Handoff {event['type']}: {record['name']}"
+    body = f"Outbox sequence {event['seq']} is ready"
+    if os.environ.get("HERDR_PANE_ID"):
+        argv = [
+            handoff_launcher.HERDR_DEFAULT, "notification", "show", title,
+            "--body", body, "--sound", "request",
+        ]
+    elif os.environ.get("CMUX_SURFACE_ID"):
+        argv = [
+            "cmux", "notify", "--surface", os.environ["CMUX_SURFACE_ID"],
+            "--title", title, "--body", body,
+        ]
+    else:
         return
     try:
         subprocess.run(
-            [
-                "cmux", "notify", "--surface", surface,
-                "--title", f"Handoff {event['type']}: {record['name']}",
-                "--body", f"Outbox sequence {event['seq']} is ready",
-            ],
+            argv,
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=RESULT_NOTIFICATION_TIMEOUT_SECONDS,
         )
@@ -754,6 +771,31 @@ def _notify_orchestrator(value: dict[str, Any], coverage: dict[str, int], urgenc
                 failures.append(f"macOS fallback failed ({macos_error})")
                 raise handoff_launcher.AdapterError("; ".join(failures)) from macos_error
         return "+".join(accepted)
+    if value["transport"] == "herdr":
+        adapter = handoff_launcher.HerdrAdapter(handoff_launcher.HERDR_DEFAULT)
+        pane = target["pane"]
+        if urgency == "passive":
+            # A re-reminder must never type into the orchestrator's composer;
+            # herdr has a real visible-alert channel, so unlike tmux this does
+            # not have to degrade to a macOS banner.
+            try:
+                adapter.notify(
+                    pane,
+                    title=ORCHESTRATOR_NOTIFICATION_TITLE,
+                    body=ORCHESTRATOR_NOTIFICATION_BODY,
+                )
+                return "herdr_notification"
+            except handoff_launcher.AdapterError:
+                return "herdr_notification_failed"
+        guard = _composer_guard(adapter, pane)
+        if guard == handoff_launcher.COMPOSER_BUSY:
+            return DEFERRED_INPUT
+        # ``orchestrator_doorbell`` types the pointer and raises the companion
+        # notification; the notification's failure never fails the doorbell.
+        adapter.orchestrator_doorbell(
+            pane, orchestrator_id, forced=guard == handoff_launcher.COMPOSER_FORCED,
+        )
+        return "terminal_input"
     if value["transport"] == "native_app":
         _send_native_app_doorbell(
             target["thread_id"],
@@ -842,8 +884,28 @@ def _resolve_tmux_target(target: str) -> str:
     return target
 
 
+def _resolve_herdr_pane(target: str | None) -> str:
+    """Resolve the orchestrator's own herdr pane, defaulting to the inherited ID.
+
+    herdr injects ``HERDR_PANE_ID`` into every managed pane, so an orchestrator
+    running inside one already knows its own address and needs no ``--target``.
+    """
+    pane = target or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        raise handoff.HandoffError(
+            "herdr orchestrator registration requires --target or HERDR_PANE_ID", 2,
+        )
+    if not handoff_launcher.HERDR_PANE_RE.fullmatch(pane):
+        raise handoff.HandoffError(
+            f"herdr orchestrator target must be a pane ID such as w1:p2, not {pane}", 2,
+        )
+    return pane
+
+
 def _register_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
-    if args.transport == "cmux":
+    if args.transport == "herdr":
+        target = {"pane": _resolve_herdr_pane(args.target)}
+    elif args.transport == "cmux":
         surface = args.surface or os.environ.get("CMUX_SURFACE_ID")
         if not surface:
             raise handoff.HandoffError(
@@ -870,6 +932,10 @@ def _register_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
 
 def _retarget_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
     value = handoff_watcher.read(args.state)
+    if value["transport"] == "herdr":
+        return handoff_watcher.retarget(
+            args.state, {"pane": _resolve_herdr_pane(args.target)},
+        )
     if value["transport"] == "tmux":
         if not args.target:
             raise handoff.HandoffError("tmux orchestrator retarget requires --target", 2)
@@ -878,7 +944,7 @@ def _retarget_orchestrator(args: argparse.Namespace) -> dict[str, Any]:
         )
     if value["transport"] != "cmux":
         raise handoff.HandoffError(
-            "orchestrator retarget currently supports cmux and tmux orchestrators only", 2,
+            "orchestrator retarget currently supports herdr, cmux, and tmux orchestrators only", 2,
         )
     surface = args.surface or os.environ.get("CMUX_SURFACE_ID")
     if not surface:
@@ -902,10 +968,12 @@ def _resolve_watcher_mode(mode: str, transport: str) -> str:
     the default ``socketControlMode: "cmuxOnly"``, so a detached (launchd-
     orphaned) watcher can never raise a native cmux alert and every doorbell
     degrades to a transient macOS banner.  cmux orchestrators therefore default
-    to a watcher hosted inside a dedicated cmux terminal surface; tmux and
-    native-app orchestrators keep the detached daemon, which their channels
-    accept.  An explicit ``detached`` request for a cmux orchestrator remains
-    allowed for callers that accept the degraded fallback.
+    to a watcher hosted inside a dedicated cmux terminal surface; herdr, tmux,
+    and native-app orchestrators keep the detached daemon, which their channels
+    accept — the herdr server answers socket clients from anywhere on the host,
+    so a detached watcher types and notifies exactly as a hosted one would.  An
+    explicit ``detached`` request for a cmux orchestrator remains allowed for
+    callers that accept the degraded fallback.
     """
     if mode == "auto":
         return "surface" if transport == "cmux" else "detached"
@@ -1390,11 +1458,13 @@ def build_parser() -> argparse.ArgumentParser:
     orchestrator_commands = orchestrator.add_subparsers(dest="orchestrator_command", required=True)
     orchestrator_register = orchestrator_commands.add_parser("register")
     orchestrator_register.add_argument("--state", required=True, type=_absolute)
-    orchestrator_register.add_argument("--transport", required=True, choices=("cmux", "tmux", "native-app"))
+    orchestrator_register.add_argument(
+        "--transport", required=True, choices=("herdr", "cmux", "tmux", "native-app"),
+    )
     orchestrator_register.add_argument(
         "--target",
-        help="exact tmux session handle ('auto' resolves the current session) "
-        "or native-app thread ID",
+        help="exact herdr pane ID (defaults to HERDR_PANE_ID), tmux session handle "
+        "('auto' resolves the current session), or native-app thread ID",
     )
     orchestrator_register.add_argument("--surface", help="exact cmux orchestrator surface UUID")
     orchestrator_register.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
@@ -1404,11 +1474,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_register.add_argument("--orchestrator-id", "--coordinator-id", dest="orchestrator_id")
     orchestrator_retarget = orchestrator_commands.add_parser(
-        "retarget", help="replace a stopped cmux or tmux orchestrator's terminal target",
+        "retarget", help="replace a stopped herdr, cmux, or tmux orchestrator's terminal target",
     )
     orchestrator_retarget.add_argument("--state", required=True, type=_absolute)
     orchestrator_retarget.add_argument(
-        "--target", help="exact tmux session handle ('auto' resolves the current session)",
+        "--target",
+        help="exact herdr pane ID (defaults to HERDR_PANE_ID) or tmux session handle "
+        "('auto' resolves the current session)",
     )
     orchestrator_retarget.add_argument("--surface", help="exact cmux orchestrator surface UUID")
     orchestrator_retarget.add_argument("--cmux-binary", default=handoff_launcher.CMUX_DEFAULT)
