@@ -1,17 +1,29 @@
 #!/bin/bash
-# update_agents.sh — update this agents checkout and migrate persisted handoff
-# state in one operator-facing command.
+# update_agents.sh — update this agents checkout and the sibling skills
+# checkout, then migrate persisted handoff state, in one operator-facing
+# command.
 #
 # Usage:
-#   update_agents.sh [--no-pull] [--dry-run]
+#   update_agents.sh [--no-pull] [--dry-run] [--skills-dir <path>]
 #   update_agents.sh --help
 #
 # Behavior:
-#   * Default: git pull --ff-only, then run every cumulative state migration.
-#   * --no-pull: skip git and run only the migrations.
+#   * Default: git pull --ff-only in this checkout and in the skills checkout,
+#     then run every cumulative state migration.
+#   * --no-pull: skip both pulls and run only the migrations.
 #   * --dry-run: never pull and pass --dry-run to every migration.
 #
+# Why skills too: agents ships the launcher and protocol, skills ships the
+# instructions agents read (handoff-agent and friends, reached through the
+# ~/.claude/skills and ~/.agents/skills symlinks). Syncing a box means both;
+# updating only this repo leaves workers running new code against stale docs.
+#
 # Invariants:
+#   * The skills checkout is optional. Absent, or present but not a git
+#     worktree, is reported and skipped — never an error.
+#   * A failed skills pull does not abort the migrations, which are the part
+#     that must not be left half-done; it is reported in the summary and the
+#     script exits non-zero afterward so it cannot pass unnoticed.
 #   * Each migration is idempotent and takes its own backup before any write.
 #   * HANDOFF_REGISTRY_FILE, when set, selects its parent as the state tree;
 #     this keeps tests and non-default installations away from the default tree.
@@ -20,12 +32,17 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: update_agents.sh [--no-pull] [--dry-run]
+Usage: update_agents.sh [--no-pull] [--dry-run] [--skills-dir <path>]
        update_agents.sh --help
 
-Pull this checkout with git pull --ff-only, then run the cumulative idempotent
-handoff state migrations. --no-pull migrates only. --dry-run never pulls or
-writes state; it reports what each migration would change.
+Pull this checkout and the skills checkout with git pull --ff-only, then run
+the cumulative idempotent handoff state migrations. --no-pull migrates only.
+--dry-run never pulls or writes state; it reports what each migration would
+change.
+
+The skills checkout defaults to $HOME/skills, overridden by --skills-dir or
+HANDOFF_SKILLS_DIR. It is optional: a missing directory, or one that is not a
+git worktree, is reported and skipped rather than failing the update.
 EOF
 }
 
@@ -33,10 +50,12 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 pull=true
 dry_run=false
+skills_dir=${HANDOFF_SKILLS_DIR:-$HOME/skills}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-pull) pull=false; shift ;;
     --dry-run) pull=false; dry_run=true; shift ;;
+    --skills-dir) skills_dir=${2:?'missing value for --skills-dir'}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -82,6 +101,28 @@ else
   pull_result=skipped
 fi
 
+# The skills checkout is commonly dirty with agent-managed files under
+# .system/; --ff-only still succeeds when the incoming commits touch other
+# paths, and fails loudly rather than merging when they collide.
+if [[ "$pull" != true ]]; then
+  echo "skills: skipped"
+  skills_result=skipped
+elif [[ ! -d "$skills_dir" ]]; then
+  echo "skills: no checkout at $skills_dir; skipped"
+  skills_result=absent
+elif ! git -C "$skills_dir" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "skills: $skills_dir is not a git worktree; skipped"
+  skills_result=absent
+else
+  echo "skills: running git pull --ff-only in $skills_dir"
+  if git -C "$skills_dir" pull --ff-only; then
+    skills_result=completed
+  else
+    echo "ERROR: skills pull failed in $skills_dir; agent instructions may be stale" >&2
+    skills_result=failed
+  fi
+fi
+
 echo "migration: running ${MIGRATION_ORCHESTRATOR[*]}"
 "${MIGRATION_ORCHESTRATOR[@]}" || die "orchestrator rename migration failed"
 echo "migration: running ${MIGRATION_JOURNALS[*]}"
@@ -91,4 +132,8 @@ if [[ "$dry_run" == true ]]; then
 else
   migration_result=completed
 fi
-echo "update complete: pull=$pull_result migration=$migration_result"
+echo "update complete: pull=$pull_result skills=$skills_result migration=$migration_result"
+# Deferred so the migrations still run and report; a stale skills checkout is a
+# real partial failure and must not exit 0.
+[[ "$skills_result" == failed ]] && exit 1
+exit 0
