@@ -91,7 +91,7 @@ esac
 
 # Resolve the orchestrator PID automatically when omitted or set to "auto":
 # handoff_orchestrator_pid.sh walks this call's process ancestry to the nearest
-# long-lived agent (claude|codex|kimi). An explicit numeric PID always wins.
+# long-lived agent (claude|codex|kimi|pi). An explicit numeric PID always wins.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -z "$owner_pid" || "$owner_pid" == "auto" ]]; then
   if ! owner_pid=$("$here/handoff_orchestrator_pid.sh" --pid-only 2>/dev/null); then

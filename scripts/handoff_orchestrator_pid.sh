@@ -10,10 +10,10 @@
 # orchestrator. This replaces the hand-run `ps`/parent-walk the handoff-agent
 # skill previously spelled out.
 #
-# Scope: the three terminal CLI agents (claude, codex, kimi). The Codex desktop
-# app uses a GUI, task-based protocol (not the local-v1 ancestry model), so it
-# is intentionally not detected here — its "orchestrator PID" concept does not
-# apply to the session watcher.
+# Scope: the four terminal CLI agents (claude, codex, kimi, pi). The Codex
+# desktop app uses a GUI, task-based protocol (not the local-v1 ancestry
+# model), so it is intentionally not detected here — its "orchestrator PID"
+# concept does not apply to the session watcher.
 #
 # Usage:
 #   handoff_orchestrator_pid.sh [--from-pid <pid>] [--max-depth <n>] [--pid-only]
@@ -37,8 +37,8 @@ usage() {
   cat <<'EOF'
 Usage: handoff_orchestrator_pid.sh [--from-pid <pid>] [--max-depth <n>] [--pid-only]
 
-Detect the long-lived orchestrator agent PID (claude|codex|kimi) by walking the
-process-ancestry chain from the calling shell. Prints one JSON line:
+Detect the long-lived orchestrator agent PID (claude|codex|kimi|pi) by walking
+the process-ancestry chain from the calling shell. Prints one JSON line:
   {"pid": <n>, "agent": "<name>", "command": "<argv>", "depth": <k>}
 or, with --pid-only, just <n>. Exits nonzero with a JSON error (naming the
 agents searched and PIDs inspected) when no agent ancestor is found.
@@ -48,7 +48,7 @@ EOF
 # Known agent executable basenames, in resolution priority order. A basename is
 # compared after stripping a Node/Python script extension so a node-wrapped
 # entry point (e.g. `node .../codex.js`) still resolves.
-AGENTS=(claude codex kimi)
+AGENTS=(claude codex kimi pi)
 
 from_pid=""
 max_depth=40
@@ -143,7 +143,7 @@ import json, sys
 inspected = [int(p) for p in sys.argv[1:] if p]
 print(json.dumps({
     "error": "no orchestrator agent process found in ancestry",
-    "searched_agents": ["claude", "codex", "kimi"],
+    "searched_agents": ["claude", "codex", "kimi", "pi"],
     "inspected_pids": inspected,
     "hint": "pass --from-pid <shell-pid> if the agent is not an ancestor of this shell",
 }))
