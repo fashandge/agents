@@ -68,6 +68,21 @@ def adapter(monkeypatch):
     return fake
 
 
+@pytest.fixture
+def no_trust_gate(monkeypatch):
+    """Stub the three folder-trust rescues for tests that are not about them.
+
+    The real rescues poll a live screen and only give up after their render
+    grace, so leaving them in place costs seconds of wall clock per test
+    against a fake adapter that will never show a dialog.
+    """
+    for agent in ("codex", "claude", "kimi"):
+        monkeypatch.setattr(
+            spawn_worker.handoff_launcher, f"_rescue_local_{agent}_folder_trust",
+            lambda result, **kwargs: result.setdefault("folder_trust_rescued", False),
+        )
+
+
 def write_prompt(tmp_path, text="Rename the widget helper and run the tests."):
     prompt = tmp_path / "prompt.md"
     prompt.write_text(text)
@@ -128,6 +143,10 @@ def test_spawn_uses_the_launcher_agent_defaults(tmp_path, adapter, monkeypatch, 
         spawn_worker.handoff_launcher, "_rescue_local_claude_folder_trust",
         lambda result, **kwargs: result.setdefault("folder_trust_rescued", False),
     )
+    monkeypatch.setattr(
+        spawn_worker.handoff_launcher, "_rescue_local_kimi_folder_trust",
+        lambda result, **kwargs: result.setdefault("folder_trust_rescued", False),
+    )
     monkeypatch.setattr(spawn_worker, "_bootstrap_kimi", lambda *args, **kwargs: True)
 
     result = spawn_worker.spawn(
@@ -172,7 +191,9 @@ def test_spawn_places_a_worker_in_an_explicit_workspace(tmp_path, adapter):
     assert adapter.launched[0][3] == "w7"
 
 
-def test_kimi_is_pointed_at_the_prompt_file_rather_than_typed_the_body(tmp_path, adapter, monkeypatch):
+def test_kimi_is_pointed_at_the_prompt_file_rather_than_typed_the_body(
+    tmp_path, adapter, monkeypatch, no_trust_gate,
+):
     payload = "line one\nline two"
     prompt = write_prompt(tmp_path, payload)
     monkeypatch.setattr(handoff_launcher, "wait_process", lambda *args, **kwargs: True)
@@ -188,7 +209,9 @@ def test_kimi_is_pointed_at_the_prompt_file_rather_than_typed_the_body(tmp_path,
     assert payload not in adapter.literals[0]
 
 
-def test_kimi_reports_a_rescue_command_when_delivery_is_unconfirmed(tmp_path, adapter, monkeypatch):
+def test_kimi_reports_a_rescue_command_when_delivery_is_unconfirmed(
+    tmp_path, adapter, monkeypatch, no_trust_gate,
+):
     monkeypatch.setattr(handoff_launcher, "wait_process", lambda *args, **kwargs: False)
 
     result = spawn_worker.spawn(
@@ -219,6 +242,54 @@ def test_claude_startup_clears_its_folder_trust_dialog(tmp_path, adapter, monkey
     assert seen == {"handle": "w1:pA", "cwd": tmp_path.resolve()}
     assert result["folder_trust_rescued"] is True
     assert result["prompt_sent"] is True
+
+
+def test_kimi_trust_dialog_is_cleared_before_the_bootstrap_wait(tmp_path, adapter, monkeypatch):
+    # Kimi's gate blocks the input widget its prompt is typed into, so a rescue
+    # that ran after (or not at all) would burn the whole bootstrap budget and
+    # then report the prompt undelivered — the live failure this covers.
+    order = []
+
+    def fake_rescue(result, *, adapter, handle, cwd):
+        order.append("rescue")
+        result["folder_trust_rescued"] = True
+
+    monkeypatch.setattr(
+        spawn_worker.handoff_launcher, "_rescue_local_kimi_folder_trust", fake_rescue,
+    )
+    monkeypatch.setattr(
+        spawn_worker, "_bootstrap_kimi",
+        lambda *args, **kwargs: (order.append("bootstrap"), True)[1],
+    )
+
+    result = spawn_worker.spawn(
+        label="kimi-trust", prompt=write_prompt(tmp_path), cwd=tmp_path,
+        agent="kimi", backend="tmux",
+    )
+
+    assert order == ["rescue", "bootstrap"]
+    assert result["folder_trust_rescued"] is True
+    assert result["prompt_sent"] is True
+
+
+def test_kimi_bootstrap_shares_one_budget_across_both_waits(tmp_path, adapter, monkeypatch):
+    # Two full-length waits would stall for twice the advertised timeout.
+    seen = {}
+    monkeypatch.setattr(
+        handoff_launcher, "wait_process",
+        lambda a, h, agent, timeout: seen.setdefault("process", timeout) and True or True,
+    )
+
+    def fake_widget_wait(a, h, *, timeout):
+        seen["widget"] = timeout
+        return True
+
+    monkeypatch.setattr(handoff_launcher, "wait_kimi_input_ready", fake_widget_wait)
+
+    spawn_worker._bootstrap_kimi(adapter, "w1:pA", write_prompt(tmp_path))
+
+    assert seen["process"] == spawn_worker.KIMI_BOOTSTRAP_TIMEOUT
+    assert seen["widget"] <= spawn_worker.KIMI_BOOTSTRAP_TIMEOUT
 
 
 def test_wrapper_exec_leaves_no_handoff_environment_and_discards_launch_files(tmp_path, monkeypatch):

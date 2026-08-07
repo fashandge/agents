@@ -30,6 +30,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -209,10 +210,12 @@ def _deliver(
 ) -> None:
     """Finish the per-agent startup that argv alone cannot cover.
 
-    Claude and Codex both block below their agent loop on a first-launch
-    folder-trust dialog, which would leave a spawned tab dead until a human
-    noticed.  Kimi takes no prompt on its command line at all.  Everything here
-    is borrowed from the heavy launcher rather than reimplemented.
+    All three of Claude, Codex, and Kimi block below their agent loop on a
+    first-launch folder-trust dialog, which would leave a spawned tab dead until
+    a human noticed — and nobody is watching this one.  Kimi additionally takes
+    no prompt on its command line, so its dialog has to be cleared *before* the
+    bootstrap wait rather than alongside it.  Everything here is borrowed from
+    the heavy launcher rather than reimplemented.
     """
     startup: dict[str, Any] = {}
     if agent == "codex":
@@ -223,7 +226,11 @@ def _deliver(
         handoff_launcher._rescue_local_claude_folder_trust(  # noqa: SLF001
             startup, adapter=adapter, handle=handle, cwd=cwd,
         )
-    if agent in ("codex", "claude"):
+    elif agent == "kimi":
+        handoff_launcher._rescue_local_kimi_folder_trust(  # noqa: SLF001
+            startup, adapter=adapter, handle=handle, cwd=cwd,
+        )
+    if agent in ("codex", "claude", "kimi"):
         result["folder_trust_rescued"] = bool(startup.get("folder_trust_rescued"))
         if startup.get("startup_unconfirmed"):
             result["startup_unconfirmed"] = True
@@ -236,10 +243,20 @@ def _deliver(
 
 
 def _bootstrap_kimi(adapter: Any, handle: str, prompt: Path) -> bool:
-    """Point Kimi at the prompt file; never type the prompt body into its TUI."""
+    """Point Kimi at the prompt file; never type the prompt body into its TUI.
+
+    Process visibility and the interactive input widget are separate waits, and
+    they share one budget the way ``handoff_launcher.bootstrap_kimi`` does:
+    giving each phase the full timeout would let a stuck launch stall for twice
+    as long as the caller was told to expect.
+    """
+    started_at = time.monotonic()
     if not handoff_launcher.wait_process(adapter, handle, "kimi", timeout=KIMI_BOOTSTRAP_TIMEOUT):
         return False
-    if not handoff_launcher.wait_kimi_input_ready(adapter, handle, timeout=KIMI_BOOTSTRAP_TIMEOUT):
+    remaining = KIMI_BOOTSTRAP_TIMEOUT - (time.monotonic() - started_at)
+    if remaining <= 0.0:
+        return False
+    if not handoff_launcher.wait_kimi_input_ready(adapter, handle, timeout=remaining):
         return False
     pointer = json.dumps(str(prompt), ensure_ascii=False)
     return adapter.send_literal(handle, f"Read the task in {pointer} and do it.")

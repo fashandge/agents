@@ -63,6 +63,14 @@ CODEX_TRUST_RENDER_GRACE = 3.0
 # launched surface (local and, via receive_remote_request, on the SSH host).
 LOCAL_CLAUDE_TRUST_TIMEOUT = 30.0
 CLAUDE_TRUST_RENDER_GRACE = 3.0
+# Kimi Code gates project MCP servers behind its own "Trust this folder?"
+# dialog, which `--yolo` does not cover, and which blocks the input widget its
+# kickoff is typed into. Its native TUI takes longer to paint than Codex's or
+# Claude's, so the no-dialog grace is longer: returning early because the
+# process is up but the dialog has not rendered yet would leave the gate
+# standing for the whole bootstrap wait.
+LOCAL_KIMI_TRUST_TIMEOUT = 30.0
+KIMI_TRUST_RENDER_GRACE = 6.0
 REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
 AGENT_DEFAULTS = {
     "claude": ("opus", "high"),
@@ -1166,6 +1174,13 @@ def launch(
         _rescue_local_claude_folder_trust(
             startup_rescue, adapter=adapter, handle=handle, cwd=cwd,
         )
+    elif agent == "kimi":
+        # Must precede bootstrap_kimi: the dialog sits above the input widget
+        # the kickoff is typed into, so leaving it standing spends the entire
+        # bootstrap budget waiting for a composer that cannot appear.
+        _rescue_local_kimi_folder_trust(
+            startup_rescue, adapter=adapter, handle=handle, cwd=cwd,
+        )
     if agent == "kimi":
         kickoff_sent = bootstrap_kimi(
             adapter,
@@ -1212,7 +1227,7 @@ def launch(
         "orchestrator_released": orchestrator_released,
         "rescue_command": rescue,
     }
-    if agent in ("codex", "claude"):
+    if agent in ("codex", "claude", "kimi"):
         result["folder_trust_rescued"] = bool(startup_rescue.get("folder_trust_rescued"))
         if startup_rescue.get("startup_unconfirmed"):
             result["startup_unconfirmed"] = True
@@ -1689,6 +1704,52 @@ def _claude_trust_cwd_matches(screen: str, cwd: Path) -> bool:
     )
 
 
+def _kimi_folder_trust_dialog_present(screen: str) -> bool:
+    """True when Kimi Code's exact folder-trust dialog is on screen.
+
+    Matches the fixed heading and menu literals only; the directory is verified
+    separately by :func:`_kimi_trust_cwd_matches`.  All three literals are
+    plain ASCII on purpose — the dialog also renders ``Don't trust`` and a
+    ``↑↓ navigate`` affordance, but an apostrophe or arrow glyph that a
+    terminal substitutes would silently stop the match.
+    """
+    return (
+        "Trust this folder?" in screen
+        and "Exit Kimi Code" in screen
+        and "Enter select" in screen
+    )
+
+
+def _kimi_trust_cwd_matches(screen: str, cwd: Path) -> bool:
+    """Confirm Kimi's trust dialog names the exact directory we launched into.
+
+    Codex and Claude label their path line (``You are in``, ``Accessing
+    workspace:``); Kimi prints the bare path on its own line under the heading,
+    so there is no marker to anchor on.  Scan the lines after the heading for
+    an absolute path that is a non-trivial prefix of the cwd, which tolerates
+    the same width truncation and symlink canonicalization the other two need
+    while still rejecting a dialog raised for some other directory.
+    """
+    index = screen.find("Trust this folder?")
+    if index < 0:
+        return False
+    candidates = {str(cwd)}
+    try:
+        candidates.add(str(cwd.resolve()))
+    except OSError:
+        pass
+    for line in screen[index:].splitlines():
+        shown = line.strip()
+        if not shown.startswith("/"):
+            continue
+        if any(
+            target.startswith(shown) and len(shown) >= min(len(target), 12)
+            for target in candidates
+        ):
+            return True
+    return False
+
+
 def _rescue_local_folder_trust(
     result: dict[str, Any],
     *,
@@ -1773,6 +1834,31 @@ def _rescue_local_claude_folder_trust(
         result, adapter=adapter, handle=handle, cwd=cwd, agent="claude",
         dialog_present=_claude_folder_trust_dialog_present,
         cwd_matches=_claude_trust_cwd_matches,
+        timeout=timeout, render_grace=render_grace,
+    )
+
+
+def _rescue_local_kimi_folder_trust(
+    result: dict[str, Any],
+    *,
+    adapter: Any,
+    handle: str,
+    cwd: Path,
+    timeout: float = LOCAL_KIMI_TRUST_TIMEOUT,
+    render_grace: float = KIMI_TRUST_RENDER_GRACE,
+) -> None:
+    """Advance one verified local Kimi folder-trust dialog at most once.
+
+    Kimi's gate is the costliest of the three to leave standing: it blocks the
+    input widget, and the kickoff is delivered *into* that widget rather than on
+    argv, so an uncleared dialog burns the whole bootstrap wait and then reports
+    the kickoff undelivered.  `--yolo` does not cover it — that governs tool
+    approval, while this governs project MCP servers.
+    """
+    _rescue_local_folder_trust(
+        result, adapter=adapter, handle=handle, cwd=cwd, agent="kimi",
+        dialog_present=_kimi_folder_trust_dialog_present,
+        cwd_matches=_kimi_trust_cwd_matches,
         timeout=timeout, render_grace=render_grace,
     )
 

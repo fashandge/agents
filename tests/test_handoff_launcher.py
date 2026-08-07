@@ -701,6 +701,9 @@ def test_kimi_launch_passes_full_startup_timeout(tmp_path, monkeypatch):
     observed = {}
     monkeypatch.setenv("HANDOFF_CREDENTIAL_DIR", str(private))
     monkeypatch.setattr(handoff_launcher, "CmuxAdapter", lambda binary: Adapter())
+    # This test is about the bootstrap budget, not the trust gate that now runs
+    # ahead of it; stub the gate the way the other launch tests do.
+    monkeypatch.setattr(handoff_launcher, "_rescue_local_kimi_folder_trust", lambda *a, **k: None)
 
     def fake_bootstrap(adapter, handle, *, run_dir, timeout):
         observed["timeout"] = timeout
@@ -1416,6 +1419,86 @@ def test_local_claude_trust_rescue_returns_promptly_when_already_trusted(tmp_pat
     assert adapter.enters == 0
     assert result["folder_trust_rescued"] is False
     assert "startup_unconfirmed" not in result
+
+
+def _kimi_trust_screen(cwd, *, shown=None):
+    """Render Kimi's folder-trust dialog verbatim as captured from a live pane;
+    ``shown`` overrides the path line (canonicalized or width-truncated)."""
+    path = shown if shown is not None else str(cwd)
+    return (
+        "  Trust this folder?\n"
+        "  ↑↓ navigate · Enter select · Esc exit\n"
+        "\n"
+        f"  {path}\n"
+        "\n"
+        "  Kimi Code loads project-level MCP servers (.mcp.json, .kimi-code/mcp.json) only in\n"
+        "  trusted folders. They run as local processes on your machine.\n"
+        "\n"
+        "   ❯ Trust this folder\n"
+        "     Enable project MCP servers. Remembered for this folder.\n"
+        "\n"
+        "     Don't trust\n"
+        "     Exit Kimi Code. Asked again next launch.\n"
+    )
+
+
+def test_kimi_trust_matcher_tolerates_symlinked_cwd_and_truncation(tmp_path):
+    real = tmp_path / "repo"
+    real.mkdir()
+    cwd = tmp_path / "launched-as"
+    cwd.symlink_to(real)
+    exact = _kimi_trust_screen(cwd)
+    assert handoff_launcher._kimi_folder_trust_dialog_present(exact)
+    assert handoff_launcher._kimi_trust_cwd_matches(exact, cwd)
+    resolved = _kimi_trust_screen(cwd, shown=str(cwd.resolve()))
+    assert handoff_launcher._kimi_trust_cwd_matches(resolved, cwd)
+    truncated = _kimi_trust_screen(cwd, shown=str(cwd)[:-1])
+    assert handoff_launcher._kimi_trust_cwd_matches(truncated, cwd)
+    other = _kimi_trust_screen(tmp_path / "somewhere-else-entirely")
+    assert not handoff_launcher._kimi_trust_cwd_matches(other, cwd)
+
+
+def test_kimi_trust_matcher_ignores_the_running_agent_screen(tmp_path):
+    # Kimi's own composer, and Claude's dialog, must not read as Kimi's gate.
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    assert not handoff_launcher._kimi_folder_trust_dialog_present(
+        "yolo  K3 thinking: max  ~/projects/agents  main\n> \n",
+    )
+    assert not handoff_launcher._kimi_folder_trust_dialog_present(_claude_trust_screen(cwd))
+
+
+def test_local_kimi_trust_rescue_presses_enter_once_for_the_authorized_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    adapter = FakeTrustAdapter([_kimi_trust_screen(cwd)], agent="kimi", ready_after=0)
+    result = {}
+
+    handoff_launcher._rescue_local_kimi_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd,
+    )
+
+    assert adapter.enters == 1
+    assert result["folder_trust_rescued"] is True
+    assert "startup_unconfirmed" not in result
+
+
+def test_local_kimi_trust_rescue_leaves_a_foreign_dialog_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff_launcher.time, "sleep", lambda v: None)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    foreign = _kimi_trust_screen(tmp_path / "not-our-repo")
+    adapter = FakeTrustAdapter([foreign], agent="kimi", ready_after=0)
+    result = {}
+
+    handoff_launcher._rescue_local_kimi_folder_trust(
+        result, adapter=adapter, handle="h", cwd=cwd,
+    )
+
+    assert adapter.enters == 0
+    assert result["folder_trust_rescued"] is False
+    assert result["startup_unconfirmed"] is True
 
 
 def _herdr_json(payload):

@@ -36,7 +36,8 @@ Commands without a mode marker work in both.
   herdr server, resolved by label and created on first use.
 - All four agent kinds, which take **three different delivery paths**: argv
   (claude, codex, pi), a typed file pointer (kimi), and a cleared folder-trust
-  dialog (claude, codex).
+  dialog (claude, codex, kimi — kimi's must clear *before* its bootstrap wait,
+  since the dialog sits above the widget the pointer is typed into).
 - The safe-exec boundary: the terminal receives only two quoted paths, so a
   prompt full of shell metacharacters cannot be interpreted.
 - **The point of the test: nothing durable is created and the worker does not
@@ -399,12 +400,20 @@ If you started the box's herdr server for this test, leaving it running is fine
   the agent to finish, and is not supposed to. Read the pane for the answer.
 - **Only kimi's spawn blocks**, and only until its input widget appears. A
   `prompt_sent: false` with a `rescue_command` is kimi's startup wait expiring
-  — read the pane before concluding the delivery ladder regressed.
-- **A codex or claude worker sitting on a folder-trust dialog** means the rescue
-  did not fire. It reports `startup_unconfirmed: true` when the dialog named a
-  directory other than the one launched into; that is deliberate — clearing an
-  unrelated directory's trust dialog is not authorized. Clear it by hand and
-  note it.
+  — read the pane before concluding the delivery ladder regressed. Both its
+  waits share one budget, so the ceiling is `KIMI_BOOTSTRAP_TIMEOUT` total, not
+  per phase; a spawn that takes visibly longer than that is a regression.
+- **A worker sitting on a folder-trust dialog** means the rescue did not fire.
+  All three of claude, codex, and kimi are gated. It reports
+  `startup_unconfirmed: true` when the dialog named a directory other than the
+  one launched into; that is deliberate — clearing an unrelated directory's
+  trust dialog is not authorized. Clear it by hand and note it.
+- **Kimi's trust is remembered per folder**, in
+  `~/.kimi-code/workspace-trust/wd_<slug>`, so the gate only appears on the
+  first spawn into a checkout and a passing run proves nothing on the second.
+  To exercise it deliberately, back up and delete that file, spawn, then
+  confirm `folder_trust_rescued: true` with `prompt_sent: true` in a few
+  seconds rather than a two-minute stall.
 - **Do not add monitoring to diagnose a stuck worker.** There is no watcher and
   no doorbell in this mode. Read the pane, or type into it directly with
   `herdr agent prompt <target> "<text>"`.
