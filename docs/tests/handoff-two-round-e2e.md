@@ -5,11 +5,33 @@ A manual/agent-driven end-to-end exercise of the handoff protocol across a
 to be executed by an agent, so every step is a literal command with a checkable
 assertion rather than prose.
 
+## Mode
+
+The test runs in two modes, decided by the **driving** session's environment:
+
+- **herdr mode** (`HERDR_ENV == "1"`): the orchestrator-under-test and the
+  local worker are spawned as **herdr sessions in the same workspace**
+  (`$HERDR_WORKSPACE_ID`). The remote worker uses the herdr remote backend
+  (`transport: ssh_herdr`).
+- **cmux mode** (anything else): the original flow — the orchestrator is a raw
+  cmux terminal tab in `$CMUX_WORKSPACE_ID` and the local worker is a cmux
+  surface. The remote worker **still defaults to the herdr remote backend**
+  (`ssh_herdr`); only an explicit `--remote-backend tmux` in the orchestrator's
+  launch yields `ssh_tmux`.
+
+Every section below marks which mode its commands belong to; commands without a
+mode marker work in both.
+
 ## What this exercises
 
-- Watcher bootstrap in a brand-new orchestrator session (`--transport cmux`).
-- Two workers on **two different transports** at once: a local `cmux` worker and
-  a remote `ssh_tmux` worker on `oci-box`.
+- Watcher bootstrap in a brand-new orchestrator session (herdr mode: a
+  **detached** herdr watcher — herdr's socket accepts out-of-tree clients, so
+  no surface-hosted watcher; cmux mode: the surface-hosted cmux watcher).
+- Two workers on two different transports at once: a local worker in the same
+  workspace (herdr mode: a `herdr` pane/tab; cmux mode: a `cmux` surface) and a
+  remote `ssh_herdr` worker on `oci-box` (the remote herdr backend is the
+  default even from a cmux orchestrator; `--remote-backend tmux` opts back to
+  `ssh_tmux`).
 - The doorbell → `orchestrator pending` → review → `conclude` loop.
 - **Round 2 is the point of the test.** A worker that is accepted with
   `--no-integrate`, pauses, is resumed by `dispatch`, and produces a *second*
@@ -22,8 +44,10 @@ Round 1 alone will pass even against the broken build. Do not shorten this test.
 ## Preconditions
 
 ```bash
+echo "HERDR_ENV=${HERDR_ENV:-<unset>}"          # "1" → herdr mode, else cmux mode
+[ "$HERDR_ENV" = "1" ] && herdr status server   # herdr mode: server must be running
 ~/projects/agents/scripts/fleet_status.sh          # every checkout dirty=0
-ssh -o ConnectTimeout=8 oci-box 'echo ok; which codex tmux'
+ssh -o ConnectTimeout=8 oci-box 'echo ok; which codex tmux herdr'
 <helper> runs list                                 # ideally []
 ```
 
@@ -33,8 +57,9 @@ ssh -o ConnectTimeout=8 oci-box 'echo ok; which codex tmux'
 /opt/homebrew/Caskroom/miniconda/base/envs/ml/bin/python -m agents.orchestration.handoffctl
 ```
 
-If the box is stopped and the request authorizes using it:
-`~/projects/investment/src/scripts/oci_box_ctl.sh up`.
+On the box, use its env's python (`/home/opc/miniforge3/envs/ml/bin/python3 -m
+agents.orchestration.handoffctl`). If the box is stopped and the request
+authorizes using it: `~/projects/investment/src/scripts/oci_box_ctl.sh up`.
 
 Pick a unique run-name prefix per execution (e.g. `e2e-<MMDD>-a` / `-b`) so a
 previous execution's registry records and scratch dirs can never be mistaken
@@ -42,11 +67,62 @@ for this one's.
 
 ## Procedure
 
-### Phase 0 — fresh orchestrator session in a new cmux tab
+### Phase 0 — fresh orchestrator session (herdr mode)
 
-The orchestrator under test must be a **new** Claude session, not the session
-driving this document. Snapshot layout first; every later layout check compares
-against this.
+Run this block only when `$HERDR_ENV == "1"`. The orchestrator under test must
+be a **new** Claude session, not the session driving this document. Snapshot
+layout first; every later layout check compares against this.
+
+```bash
+herdr workspace list
+herdr tab list --workspace "$HERDR_WORKSPACE_ID"
+```
+
+Spawn the tab unfocused and start Claude in it; parse the **pane ID** (the
+orchestrator's handle, format `w<ws>:p<n>`) and the **tab ID** (`w<ws>:t<n>`)
+out of the create result:
+
+```bash
+herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd ~/projects/agents \
+  --label e2e-orchestrator --no-focus     # result.root_pane.pane_id, result.tab.tab_id
+herdr pane run <pane_id> "claude"
+```
+
+**Submit discipline (herdr mode):** `herdr agent prompt <pane_id> <text>` is
+atomic — text and Enter in one call against the pane's live bracketed-paste
+mode — **but only once herdr has recognized the agent** in the pane. Before
+recognition it fails with `agent_not_found`. So: poll `herdr agent get
+<pane_id>` until it returns a record (not `agent_not_found`), then wait for the
+composer with `herdr agent wait <pane_id> --until idle --timeout 120000`, then
+send the driving prompt as a single `herdr agent prompt <pane_id> "<text>"`
+call, and confirm with `herdr agent read <pane_id> --source recent-unwrapped`
+that the composer is empty. If the agent never gets recognized, fall back to
+the raw-pane path with the cmux-mode discipline below (`pane send-text` →
+~1 s → `pane send-keys <pane_id> enter` → read back).
+
+The prompt must make the new session do the work itself — the observer never
+launches the workers. The herdr clause is the point of this mode: local workers
+must land in this same workspace as herdr sessions:
+
+> Use /handoff-agent. Spawn two workers: one Codex worker on the remote box
+> `oci-box` (the default herdr remote backend) and one Claude worker locally,
+> **as a herdr session in this same workspace** (the default here — do not
+> force a different backend). Round 1: have each compute `<expression A>` —
+> closed form plus an independent check with its own kickoff-pinned Python,
+> scratch dir only, no repo writes, no commits. Review and `conclude
+> --no-integrate` each. Round 2: once both are paused, dispatch each a
+> follow-up to compute `<expression B>` and conclude those the same way.
+> Report each run id, the review `reply_to`, and `consumed_through`.
+
+Use two *different* expressions with distinct values (e.g. `12 * 12` → 144,
+then `100 - 37` → 63) so a stale round-1 answer can never be mistaken for a
+correct round-2 answer.
+
+### Phase 0 — fresh orchestrator session (cmux mode)
+
+Run this block only when `$HERDR_ENV != "1"`. The orchestrator under test must
+be a **new** Claude session, not the session driving this document. Snapshot
+layout first; every later layout check compares against this.
 
 ```bash
 CMUX_QUIET=1 cmux --id-format both list-workspaces
@@ -63,11 +139,11 @@ cmux send --workspace "$CMUX_WORKSPACE_ID" --surface <uuid> "cd ~/projects/agent
 cmux send-key --workspace "$CMUX_WORKSPACE_ID" --surface <uuid> enter
 ```
 
-**Submit discipline (applies to every send in this document):** agent TUIs
-coalesce a same-burst text+Enter into a bracketed paste, leaving the text
-unsent in the composer while looking delivered. Always send the text and the
-Enter as **two separate commands** ~1 s apart, then `cmux read-screen` to
-confirm the composer is empty. Re-send a bare Enter if it is not.
+**Submit discipline (cmux mode):** agent TUIs coalesce a same-burst text+Enter
+into a bracketed paste, leaving the text unsent in the composer while looking
+delivered. Always send the text and the Enter as **two separate commands** ~1 s
+apart, then `cmux read-screen` to confirm the composer is empty. Re-send a bare
+Enter if it is not.
 
 Wait for the Claude TUI to be ready (`read-screen` shows its composer), then
 send the driving prompt as text-then-Enter. The prompt must make the new
@@ -104,6 +180,10 @@ For each run:
 - `outbox_cursor` == that run's outbox length
 - `integration.state == "pending"` (expected: `--no-integrate` was used)
 - worker status settles at `state: paused`
+- transports: herdr mode → local `transport: herdr` (pane in the same
+  workspace) and remote `transport: ssh_herdr`; cmux mode → local
+  `transport: cmux` and remote `transport: ssh_herdr` (or `ssh_tmux` only if
+  the orchestrator forced `--remote-backend tmux`).
 
 ### Phase 2 — round 2 (the regression-sensitive round)
 
@@ -115,7 +195,10 @@ the second results.
 ```
 
 Expect `message.type == "steer"`, `doorbell_sent: true`,
-`orchestrator_released: true`.
+`orchestrator_released: true`. (Herdr mode: the result doorbell arrives as an
+atomic `herdr agent prompt` into the orchestrator's composer plus a
+`herdr notification show` alert; cmux mode: the surface-hosted watcher rings
+the composer.)
 
 **Key assertion — this is what round 2 exists for.** After the second
 `conclude` on each run:
@@ -142,7 +225,23 @@ show` back.
 Always scope with `--watcher-state`; an unscoped bulk clean considers **every**
 run in the registry, including other sessions' workers. Omit `--delete-run-dir`
 unless the run journals are also meant to go — they are the evidence for this
-test. Close the orchestrator-under-test tab with the guarded helper only:
+test. Close the orchestrator-under-test tab with the guarded procedure for the
+current mode only:
+
+**herdr mode** — close exactly the one tab by its exact tab ID, with
+snapshot/verify guards (the same invariants as `cmux_close_surface_safe.sh`:
+never a sweep, never positional):
+
+```bash
+herdr tab list --workspace "$HERDR_WORKSPACE_ID" > /tmp/e2e-tabs.before
+herdr workspace list > /tmp/e2e-ws.before
+herdr tab close <orchestrator tab_id>
+# verify: every OTHER pre-existing tab (diff /tmp/e2e-tabs.before) and every
+# workspace is still present. If anything else disappeared, STOP all layout
+# actions and report to the user.
+```
+
+**cmux mode:**
 
 ```bash
 ~/projects/agents/scripts/cmux_close_surface_safe.sh --surface <uuid>
@@ -168,11 +267,22 @@ over SSH with that host's Python.
 
 **Screen reads (diagnostic only).** Useful for spotting a worker stuck below
 the agent loop (folder-trust dialog, permission prompt) that the journals
-cannot show:
+cannot show. herdr mode — use `pane read`, the adapter's own capture, with
+`recent-unwrapped` first and `visible` as fallback. Not `agent read`: a worker
+stuck below the agent loop is exactly the case herdr may not have recognized as
+an agent yet, and the agent commands fail with `agent_not_found` there (see the
+pitfall below). The pane surface always answers:
+
+```bash
+herdr pane read <pane_id> --source recent-unwrapped --lines 2000 --format text   # local worker / orchestrator pane
+ssh oci-box 'herdr pane read <pane_id> --source recent-unwrapped --lines 2000 --format text'  # remote worker
+```
+
+cmux mode:
 
 ```bash
 cmux read-screen --surface <uuid> --scrollback          # local worker / orchestrator tab
-ssh oci-box 'tmux capture-pane -p -t <handle> -S -2000' # remote worker
+ssh oci-box 'tmux capture-pane -p -t <handle> -S -2000' # remote worker (tmux opt-out only)
 ```
 
 **Scope verification.** The tasks are arithmetic, so any repo change is a bug:
@@ -184,8 +294,11 @@ ls -la <each worker's scratch dir>       # only the worker's own emit-staging fi
 
 ## Pass criteria
 
-1. Two runs registered to the **new** session's orchestrator id, one
-   `transport: cmux`, one `transport: ssh_tmux`.
+1. Two runs registered to the **new** session's orchestrator id — herdr mode:
+   one `transport: herdr` (pane in the same workspace), one
+   `transport: ssh_herdr`; cmux mode: one `transport: cmux`, one
+   `transport: ssh_herdr` (`ssh_tmux` only if `--remote-backend tmux` was
+   forced).
 2. Round 1: both results correct, reviews tied to the round-1 result ids.
 3. Round 2: both results correct **and** reviews tied to the **round-2** result
    ids, with `consumed_through` advanced. (The regression-sensitive check.)
@@ -193,9 +306,10 @@ ls -la <each worker's scratch dir>       # only the worker's own emit-staging fi
    `orchestrator_released: true`.
 5. No worker wrote outside its scratch dir; `fleet_status.sh` unchanged
    throughout; no commits.
-6. Teardown: registry empty of these runs, remote tmux session gone, local
-   worker surface gone, and **every pre-existing workspace and surface still
-   present**.
+6. Teardown: registry empty of these runs, remote herdr tab gone (or tmux
+   session, under `--remote-backend tmux`), local worker tab/surface gone, and
+   **every pre-existing workspace, tab, and surface still present** (mode-
+   appropriate listing).
 7. `doctor` reports ok for each run before teardown.
 
 ## Known pitfalls
@@ -230,3 +344,12 @@ ls -la <each worker's scratch dir>       # only the worker's own emit-staging fi
   `git checkout <pre-fix-sha> -- <file>` and restore with
   `git checkout HEAD -- <file>`; a stash of a clean tree silently stashes
   nothing and the "before" run is really an "after" run.
+- **Herdr mode: `agent prompt` needs a recognized agent.** Until `herdr agent
+  get <pane_id>` returns a record, prompts fail with `agent_not_found` — wait
+  for recognition (or use the `pane send-text`/`send-keys` fallback with the
+  cmux-mode settle discipline) instead of retrying `agent prompt` blindly.
+- **Herdr mode: the watcher is detached.** There is no watcher surface to close
+  and no "close the surface to restart the watcher" step — `orchestrator
+  pending` is still the only cure for a repeating doorbell, and the doorbell
+  arrives as a composer prompt plus a herdr notification, not a terminal-only
+  ring.
