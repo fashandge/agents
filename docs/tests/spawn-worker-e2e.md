@@ -79,8 +79,13 @@ ssh oci-box 'herdr status server'               # status: running
 
 If the box's `agents` checkout predates this module, the remote phase fails with
 an error naming `update_agents.sh`. That is Phase 5's assertion; refresh the
-host with `~/projects/agents/scripts/update_agents.sh oci-box` before Phase 2,
-and run Phase 5 first if you want to observe the error.
+host before Phase 2, and run Phase 5 first if you want to observe the error.
+The script takes no host argument — it updates the checkout it runs in, so it
+runs **on** the box:
+
+```bash
+ssh oci-box 'cd ~/projects/agents && ./scripts/update_agents.sh'
+```
 
 Pick a unique label prefix per execution (e.g. `sw-<MMDD>-a`) so a previous
 execution's tabs and scratch dirs can never be mistaken for this one's.

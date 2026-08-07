@@ -47,8 +47,8 @@ REMOTE_REQUEST_FIELDS = {
     "workspace_label",
 }
 REMOTE_STALE_HINT = (
-    "the remote agents checkout has no spawn_worker module; refresh it with "
-    "~/projects/agents/scripts/update_agents.sh <host>"
+    "the remote agents checkout has no spawn_worker module; refresh it on the "
+    "host with: ssh <host> '~/projects/agents/scripts/update_agents.sh'"
 )
 
 
