@@ -390,7 +390,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--effort", default=None,
         help=handoff_launcher._agent_default_help("reasoning effort", 1),  # noqa: SLF001
     )
-    parser.add_argument("--pmode", default="bypassPermissions")
+    parser.add_argument(
+        "--pmode", default="bypassPermissions",
+        help="agent permission mode, passed through to the agent CLI (default: bypassPermissions)",
+    )
     parser.add_argument(
         "--backend", choices=("herdr", "cmux", "tmux"), default=None,
         help="local session backend (default: herdr inside herdr, else cmux inside cmux, else tmux)",
