@@ -9,6 +9,11 @@ Its sibling, `handoff-two-round-e2e.md`, tests the durable protocol. This
 document tests the mode that has none — so almost every assertion here is about
 something that must **not** exist.
 
+The spawn-worker skill's opt-in attended mode (the orchestrator answering
+worker questions over herdr lifecycle events) has its own runbook that lives
+with the skill, since it tests the skill's loop rather than this launcher:
+`~/skills/spawn-worker/references/attended-mode-e2e-test.md`.
+
 ## Mode
 
 The test runs in two modes, decided by the **driving** session's environment:
