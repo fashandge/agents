@@ -169,8 +169,14 @@ def spawn(
     private_dir: Path | None = None,
     cmux_binary: str = handoff_launcher.CMUX_DEFAULT,
     herdr_binary: str = handoff_launcher.HERDR_DEFAULT,
+    split: str | None = None, ratio: float | None = None,
 ) -> dict[str, Any]:
-    """Open a tab, start ``agent`` on ``prompt``, and return without waiting."""
+    """Open a tab, start ``agent`` on ``prompt``, and return without waiting.
+
+    ``split`` moves the worker in beside the caller's own pane instead of
+    leaving it in its own tab — for the case where the human wants to watch the
+    worker rather than walk away from it. herdr only.
+    """
     cwd = Path(cwd).resolve(strict=True)
     prompt = Path(prompt).resolve(strict=True)
     if agent not in handoff_launcher.AGENT_DEFAULTS:
@@ -201,6 +207,13 @@ def spawn(
         "backend": backend, "handle": handle, "cwd": str(cwd),
         "prompt_path": str(prompt),
     }
+    if split:
+        if backend != "herdr":
+            raise handoff.HandoffError(
+                f"--split needs the herdr backend; this session resolved to {backend}", 2,
+            )
+        adapter.split_into_current(handle, direction=split, ratio=ratio)
+        result["split"] = split
     _deliver(result, adapter=adapter, handle=handle, agent=agent, cwd=cwd, prompt=prompt)
     return result
 
@@ -384,6 +397,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workspace", default=None, help="local backend workspace override")
     parser.add_argument(
+        "--split", choices=("right", "down"), default=None,
+        help=(
+            "herdr only: put the worker in a split beside this pane instead of its own "
+            "tab, for a worker you want to watch (a reviewer) rather than walk away from"
+        ),
+    )
+    parser.add_argument(
+        "--ratio", type=float, default=None,
+        help="split ratio for --split (herdr default when omitted)",
+    )
+    parser.add_argument(
         "--remote-host", default=None,
         help="SSH host with this agents package, the selected agent, and a reachable herdr server",
     )
@@ -425,6 +449,12 @@ def main(argv: list[str] | None = None) -> int:
                 raise handoff.HandoffError(
                     "--remote-host cannot be combined with --backend or --workspace", 2,
                 )
+            if args.split is not None:
+                # The remote worker lands in the remote host's herdr server; there
+                # is no pane of this session's to split it against.
+                raise handoff.HandoffError(
+                    "--split cannot be combined with --remote-host", 2,
+                )
             remote_cwd = args.remote_cwd or args.cwd
             if remote_cwd is None:
                 raise handoff.HandoffError(
@@ -450,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
                 effort=args.effort, pmode=args.pmode, workspace=args.workspace,
                 private_dir=private_dir,
                 cmux_binary=args.cmux_binary, herdr_binary=args.herdr_binary,
+                split=args.split, ratio=args.ratio,
             )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         if result.get("rescue_command"):

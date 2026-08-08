@@ -532,3 +532,40 @@ def test_cli_rejects_remote_combined_with_a_local_backend(tmp_path, capsys):
 
     assert exit_code == 2
     assert "--backend" in capsys.readouterr().err
+
+
+def test_spawn_split_moves_the_worker_in_beside_the_caller(tmp_path, adapter, no_trust_gate):
+    """--split is the whole point of watching a worker instead of walking away."""
+    adapter.splits = []
+    adapter.split_into_current = lambda handle, direction="right", ratio=None: (
+        adapter.splits.append((handle, direction, ratio)) or {}
+    )
+
+    result = spawn_worker.spawn(
+        label="reviewer", prompt=write_prompt(tmp_path), cwd=tmp_path, agent="pi",
+        backend="herdr", split="right", ratio=0.5,
+    )
+
+    assert adapter.splits == [("w1:pA", "right", 0.5)]
+    assert result["split"] == "right"
+
+
+def test_spawn_without_split_leaves_the_worker_in_its_own_tab(tmp_path, adapter, no_trust_gate):
+    called = []
+    adapter.split_into_current = lambda *a, **k: called.append(a)
+
+    result = spawn_worker.spawn(
+        label="worker", prompt=write_prompt(tmp_path), cwd=tmp_path, agent="pi", backend="herdr",
+    )
+
+    assert called == []
+    assert "split" not in result
+
+
+def test_spawn_split_rejects_non_herdr_backends(tmp_path, adapter, no_trust_gate):
+    """tmux and cmux have no equivalent move, so failing loudly beats a silent tab."""
+    with pytest.raises(spawn_worker.handoff.HandoffError):
+        spawn_worker.spawn(
+            label="worker", prompt=write_prompt(tmp_path), cwd=tmp_path, agent="pi",
+            backend="tmux", split="right",
+        )

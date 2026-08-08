@@ -728,6 +728,43 @@ class HerdrAdapter:
         _run([self.binary, "pane", "run", handle, terminal_command])
         return handle
 
+    def split_into_current(
+        self, handle: str, direction: str = "right", ratio: float | None = None,
+    ) -> dict[str, Any]:
+        """Move a just-launched worker pane in beside the caller's own pane.
+
+        ``launch`` always makes a tab, because a worker is background work by
+        definition.  When the human wants to watch the worker instead — a
+        reviewer they read as it works — a tab is the wrong shape: it hides the
+        thing they asked to see.  Moving the pane here rather than splitting
+        first keeps one launch path: the worker is already running with its
+        prompt delivered, and herdr closes the emptied tab on the way out.
+
+        Focus goes back to the caller afterwards.  ``pane move`` focuses what it
+        moved, and a spawn that steals the human's keyboard mid-sentence is the
+        same mistake as a tab that steals their screen.
+        """
+        current = _herdr_result([self.binary, "pane", "current"])
+        pane = current.get("pane") or current
+        caller_pane = str(pane.get("pane_id") or "")
+        caller_tab = str(pane.get("tab_id") or "")
+        if not HERDR_PANE_RE.fullmatch(caller_pane) or not caller_tab:
+            raise AdapterError(
+                "herdr could not identify the calling pane, so there is nothing to split",
+            )
+
+        argv = [
+            self.binary, "pane", "move", handle,
+            "--tab", caller_tab, "--target-pane", caller_pane, "--split", direction,
+        ]
+        if ratio is not None:
+            argv += ["--ratio", str(ratio)]
+        moved = _herdr_result(argv)
+
+        back = {"right": "left", "down": "up"}[direction]
+        _run([self.binary, "pane", "focus", "--pane", handle, "--direction", back], check=False)
+        return moved
+
     def _agent(self, handle: str) -> dict[str, Any] | None:
         """Return herdr's agent record for this pane, or None if it has none.
 
