@@ -69,9 +69,12 @@ ssh oci-box 'herdr status server'               # must report running
 `<spawn>` throughout is `~/projects/agents/scripts/spawn_worker.sh`.
 
 If the box is stopped and the request authorizes using it:
-`~/projects/investment/src/scripts/oci_box_ctl.sh up`. **A rebooted box has no
-herdr server** — it is not started by systemd or cron. Start one headlessly
-before the remote phase, and say so in the result:
+`~/projects/investment/src/scripts/oci_box_ctl.sh up`. A rebooted box starts
+its herdr server at boot via `herdr-server.service` (installed by
+`bootstrap_oci_box.sh`), so a missing server is a broken unit, not the normal
+state — check `systemctl status herdr-server` on the box. On a host without
+the unit, start one headlessly before the remote phase, and say so in the
+result:
 
 ```bash
 ssh oci-box 'nohup herdr server >/tmp/herdr-server.log 2>&1 &'
@@ -391,10 +394,17 @@ If you started the box's herdr server for this test, leaving it running is fine
 - **The `spawn/` root persisting is not a leak.** `_spawn_root()` recreates it on
   every spawn at mode `0700`. Only per-spawn directories inside it are supposed
   to vanish.
-- **A rebooted box has no herdr server**, and remote spawn is herdr-only. The
-  failure is a clear `server_not_running` error from herdr, not a tmux fallback
-  — do not "fix" it by reaching for `--remote-backend`, which does not exist
-  here.
+- **Remote spawn is herdr-only.** When no server is reachable the failure is a
+  clear `server_not_running` error from herdr, not a tmux fallback — do not
+  "fix" it by reaching for `--remote-backend`, which does not exist here. On
+  the box this should be rare: `herdr-server.service` starts the server at
+  boot (see Preconditions).
+- **The herdr server restores its session — including agents.** It persists
+  workspace state and, on restart, relaunches the restored panes' agents. A
+  test tab that was never torn down can therefore reappear after a reboot with
+  a fresh live agent in it. This is why the label prefix must be unique per
+  execution: a restored `sw-<older>-*` tab is a previous run's leftover to
+  report, not this run's damage — and not yours to close.
 - **`prompt_sent: true` means delivered, not answered.** For claude, codex, and
   pi it means the prompt is on the agent's argv; the command does not wait for
   the agent to finish, and is not supposed to. Read the pane for the answer.
