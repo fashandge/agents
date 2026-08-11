@@ -191,6 +191,37 @@ def test_spawn_places_a_worker_in_an_explicit_workspace(tmp_path, adapter):
     assert adapter.launched[0][3] == "w7"
 
 
+def test_spawn_resolves_a_workspace_label_to_an_id(tmp_path, adapter, monkeypatch):
+    seen = {}
+
+    def fake_resolve(label, cwd, binary=handoff_launcher.HERDR_DEFAULT):
+        seen["label"], seen["cwd"] = label, str(cwd)
+        return "w9"
+
+    monkeypatch.setattr(handoff_launcher, "_herdr_workspace_by_label", fake_resolve)
+
+    spawn_worker.spawn(
+        label="routed", prompt=write_prompt(tmp_path), cwd=tmp_path, agent="pi",
+        backend="herdr", workspace_label="rtk",
+    )
+
+    assert seen == {"label": "rtk", "cwd": str(tmp_path.resolve())}
+    assert adapter.launched[0][3] == "w9"
+
+
+def test_workspace_label_rejects_workspace_split_and_other_backends(tmp_path, adapter):
+    common = dict(
+        label="routed", prompt=write_prompt(tmp_path), cwd=tmp_path, agent="pi",
+        workspace_label="rtk",
+    )
+    with pytest.raises(handoff.HandoffError, match="--workspace"):
+        spawn_worker.spawn(backend="herdr", workspace="w7", **common)
+    with pytest.raises(handoff.HandoffError, match="--split"):
+        spawn_worker.spawn(backend="herdr", split="right", **common)
+    with pytest.raises(handoff.HandoffError, match="herdr backend"):
+        spawn_worker.spawn(backend="tmux", **common)
+
+
 def test_kimi_is_pointed_at_the_prompt_file_rather_than_typed_the_body(
     tmp_path, adapter, monkeypatch, no_trust_gate,
 ):

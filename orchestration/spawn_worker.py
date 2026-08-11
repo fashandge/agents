@@ -166,6 +166,7 @@ def spawn(
     *, label: str, prompt: Path, cwd: Path, agent: str = "claude",
     backend: str | None = None, model: str | None = None, effort: str | None = None,
     pmode: str = "bypassPermissions", workspace: str | None = None,
+    workspace_label: str | None = None,
     private_dir: Path | None = None,
     cmux_binary: str = handoff_launcher.CMUX_DEFAULT,
     herdr_binary: str = handoff_launcher.HERDR_DEFAULT,
@@ -176,6 +177,12 @@ def spawn(
     ``split`` moves the worker in beside the caller's own pane instead of
     leaving it in its own tab — for the case where the human wants to watch the
     worker rather than walk away from it. herdr only.
+
+    ``workspace_label`` places the worker tab in the herdr workspace carrying
+    that label — usually the target project's folder name — creating the
+    workspace rooted at ``cwd`` on first use.  herdr only, and exclusive with
+    ``workspace`` (which takes an already-resolved ID) and with ``split``
+    (which keeps the worker beside the caller's own pane).
     """
     cwd = Path(cwd).resolve(strict=True)
     prompt = Path(prompt).resolve(strict=True)
@@ -187,6 +194,23 @@ def spawn(
     model = default_model if model is None else model
     effort = default_effort if effort is None else effort
     backend = handoff_launcher._select_backend(backend, cmux_binary, herdr_binary)  # noqa: SLF001
+    if workspace_label:
+        if workspace:
+            raise handoff.HandoffError(
+                "--workspace-label cannot be combined with --workspace", 2,
+            )
+        if split:
+            raise handoff.HandoffError(
+                "--split keeps the worker beside this pane; it cannot be "
+                "combined with --workspace-label", 2,
+            )
+        if backend != "herdr":
+            raise handoff.HandoffError(
+                f"--workspace-label needs the herdr backend; this session resolved to {backend}", 2,
+            )
+        workspace = handoff_launcher._herdr_workspace_by_label(  # noqa: SLF001
+            workspace_label, cwd, binary=herdr_binary,
+        )
     if private_dir is None:
         private_dir = _private_dir(label)
 
@@ -398,7 +422,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--backend", choices=("herdr", "cmux", "tmux"), default=None,
         help="local session backend (default: herdr inside herdr, else cmux inside cmux, else tmux)",
     )
-    parser.add_argument("--workspace", default=None, help="local backend workspace override")
+    parser.add_argument("--workspace", default=None, help="local backend workspace override (resolved ID)")
+    parser.add_argument(
+        "--workspace-label", default=None,
+        help=(
+            "herdr only: place the worker tab in the workspace labelled TEXT — "
+            "usually the target project's folder name — creating it rooted at "
+            "the worker cwd on first use; exclusive with --workspace and --split"
+        ),
+    )
     parser.add_argument(
         "--split", choices=("right", "down"), default=None,
         help=(
@@ -448,9 +480,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(actual_argv)
         if args.remote_host:
-            if args.backend is not None or args.workspace is not None:
+            if args.backend is not None or args.workspace is not None or args.workspace_label is not None:
                 raise handoff.HandoffError(
-                    "--remote-host cannot be combined with --backend or --workspace", 2,
+                    "--remote-host cannot be combined with --backend, --workspace, "
+                    "or --workspace-label (use --remote-workspace)", 2,
                 )
             if args.split is not None:
                 # The remote worker lands in the remote host's herdr server; there
@@ -481,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
                 label=args.label, prompt=prompt, cwd=args.cwd or Path.cwd(),
                 agent=args.agent, backend=args.backend, model=args.model,
                 effort=args.effort, pmode=args.pmode, workspace=args.workspace,
+                workspace_label=args.workspace_label,
                 private_dir=private_dir,
                 cmux_binary=args.cmux_binary, herdr_binary=args.herdr_binary,
                 split=args.split, ratio=args.ratio,
