@@ -121,6 +121,63 @@ def test_pi_argv_declines_project_trust_outside_bypass_mode(tmp_path, monkeypatc
     assert argv[-2:] == ["--no-approve", "task"]
 
 
+def test_gemini_argv_resolves_agy_binary_and_pins_model_effort(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff ; weird"
+    payload = "$(touch SHOULD_NOT_EXIST); 'quoted' $HOME"
+    kickoff.write_text(payload)
+    which_calls = []
+
+    def fake_which(name, path=None):
+        which_calls.append(name)
+        return "/bin/agy"
+
+    monkeypatch.setattr(handoff_launcher.shutil, "which", fake_which)
+
+    argv = handoff_launcher._agent_argv(
+        {
+            "agent": "gemini",
+            "model": "gemini-3.7-flash",
+            "effort": "high",
+            "pmode": "bypassPermissions",
+            "kickoff": str(kickoff),
+        },
+        {"PATH": "/bin"},
+    )
+
+    # The gemini agent's binary is agy; resolving "gemini" would find nothing
+    # (or the wrong tool) on a host that has both installed.
+    assert which_calls == ["agy"]
+    assert argv == [
+        "/bin/agy", "--model", "gemini-3.7-flash", "--effort", "high",
+        "--dangerously-skip-permissions", "-i", payload,
+    ]
+    assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
+
+
+def test_gemini_argv_outside_bypass_mode_keeps_permission_prompts(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff"
+    kickoff.write_text("task")
+    monkeypatch.setattr(handoff_launcher.shutil, "which", lambda *args, **kwargs: "/bin/agy")
+
+    argv = handoff_launcher._agent_argv(
+        {
+            "agent": "gemini", "model": "gemini-3.7-flash", "effort": "high",
+            "pmode": "auto", "kickoff": str(kickoff),
+        },
+        {"PATH": "/bin"},
+    )
+
+    assert "--dangerously-skip-permissions" not in argv
+    assert argv[-2:] == ["-i", "task"]
+
+
+def test_gemini_probe_matches_agy_process_not_agent_name():
+    inventory = "w1:p2\tagy\t/Users/w/.local/bin/agy --model gemini-3.7-flash\n"
+    assert handoff_launcher._agent_token_present(inventory, "gemini")
+    # "agy" must still be matched as a whole token, not a fragment.
+    assert not handoff_launcher._agent_token_present("w1:p2\tzsh\t/bin/magyar\n", "gemini")
+
+
 def test_private_wrapper_exec_sets_only_protected_handoff_environment(tmp_path, monkeypatch):
     kickoff = tmp_path / "kickoff"; kickoff.write_text("literal prompt")
     config = {
@@ -440,6 +497,7 @@ def test_agent_defaults_match_handoff_policy():
     assert handoff_launcher.AGENT_DEFAULTS == {
         "claude": ("opus", "high"),
         "codex": ("gpt-5.6-terra", "xhigh"),
+        "gemini": ("gemini-3.7-flash", "high"),
         "kimi": ("kimi-code/k3", "max"),
         "pi": ("deepseek/deepseek-v4-flash", "max"),
     }

@@ -39,10 +39,12 @@ Commands without a mode marker work in both.
   is already looking at.
 - A remote worker landing in the `REMOTE_WORKERS` workspace on the host's own
   herdr server, resolved by label and created on first use.
-- All four agent kinds, which take **three different delivery paths**: argv
-  (claude, codex, pi), a typed file pointer (kimi), and a cleared folder-trust
-  dialog (claude, codex, kimi — kimi's must clear *before* its bootstrap wait,
-  since the dialog sits above the widget the pointer is typed into).
+- All five agent kinds, which take **three different delivery paths**: argv
+  (claude, codex, pi, gemini), a typed file pointer (kimi), and a cleared
+  folder-trust dialog (claude, codex, kimi, gemini — kimi's must clear *before*
+  its bootstrap wait, since the dialog sits above the widget the pointer is
+  typed into; gemini is Antigravity's `agy` binary, so its process probe
+  matches `agy`, not `gemini`).
 - The safe-exec boundary: the terminal receives only two quoted paths, so a
   prompt full of shell metacharacters cannot be interpreted.
 - **The point of the test: nothing durable is created and the worker does not
@@ -125,13 +127,13 @@ document from the driving session, and never register anything.
 
 ### Phase 1 — local spawn, one per agent kind
 
-Write four prompts to a scratch directory outside the repo. Each is a plain task
+Write five prompts to a scratch directory outside the repo. Each is a plain task
 with **no role, no protocol, and no mention of an orchestrator** — that contract
 belongs to the `spawn-worker` skill and is asserted in Phase 4.
 
 Give each agent a *different* arithmetic expression with a distinct value (e.g.
-`12 * 12` → 144, `100 - 37` → 63, `2 ** 10` → 1024, `999 / 3` → 333) so one
-worker's answer can never be mistaken for another's.
+`12 * 12` → 144, `100 - 37` → 63, `2 ** 10` → 1024, `999 / 3` → 333,
+`7 * 111` → 777) so one worker's answer can never be mistaken for another's.
 
 ```bash
 S=$(mktemp -d)
@@ -146,6 +148,7 @@ EOF
 <spawn> sw-<MMDD>-claude "$S/claude.md" ~/projects/agents --agent claude
 <spawn> sw-<MMDD>-codex  "$S/codex.md"  ~/projects/agents --agent codex
 <spawn> sw-<MMDD>-kimi   "$S/kimi.md"   ~/projects/agents --agent kimi
+<spawn> sw-<MMDD>-gemini "$S/gemini.md" ~/projects/agents --agent gemini
 ```
 
 Assertions on each JSON line — the command's whole output contract:
@@ -154,11 +157,11 @@ Assertions on each JSON line — the command's whole output contract:
   has that backend's shape.
 - `model` / `effort` equal `AGENT_DEFAULTS` for that agent: claude `opus`/`high`,
   codex `gpt-5.6-terra`/`xhigh`, kimi `kimi-code/k3`/`max`, pi
-  `deepseek/deepseek-v4-flash`/`max`. A drift here means the lightweight path
-  has grown its own copy of the table.
-- `prompt_sent: true` for all four.
-- claude and codex additionally report `folder_trust_rescued` (either boolean is
-  a pass; `startup_unconfirmed: true` is not).
+  `deepseek/deepseek-v4-flash`/`max`, gemini `gemini-3.7-flash`/`high`. A drift
+  here means the lightweight path has grown its own copy of the table.
+- `prompt_sent: true` for all five.
+- claude, codex, and gemini additionally report `folder_trust_rescued` (either
+  boolean is a pass; `startup_unconfirmed: true` is not).
 - **No `run_id`, `run_dir`, `transport`, or `registry_recorded` field exists.**
   Those are the heavy launcher's; their presence means the two paths have been
   merged.

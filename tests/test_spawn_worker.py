@@ -128,6 +128,7 @@ def test_spawn_writes_no_handoff_protocol_state(tmp_path, adapter, isolate_spawn
     [
         ("claude", "opus", "high"),
         ("codex", "gpt-5.6-terra", "xhigh"),
+        ("gemini", "gemini-3.7-flash", "high"),
         ("kimi", "kimi-code/k3", "max"),
         ("pi", "deepseek/deepseek-v4-flash", "max"),
     ],
@@ -147,6 +148,10 @@ def test_spawn_uses_the_launcher_agent_defaults(tmp_path, adapter, monkeypatch, 
         spawn_worker.handoff_launcher, "_rescue_local_kimi_folder_trust",
         lambda result, **kwargs: result.setdefault("folder_trust_rescued", False),
     )
+    monkeypatch.setattr(
+        spawn_worker.handoff_launcher, "_rescue_local_gemini_folder_trust",
+        lambda result, **kwargs: result.setdefault("folder_trust_rescued", False),
+    )
     monkeypatch.setattr(spawn_worker, "_bootstrap_kimi", lambda *args, **kwargs: True)
 
     result = spawn_worker.spawn(
@@ -163,7 +168,7 @@ def test_spawn_rejects_an_unknown_agent(tmp_path, adapter):
     with pytest.raises(handoff.HandoffError) as excinfo:
         spawn_worker.spawn(
             label="bad", prompt=write_prompt(tmp_path), cwd=tmp_path,
-            agent="gemini", backend="tmux",
+            agent="aider", backend="tmux",
         )
 
     # An error that enumerates the valid set, per the agent-native CLI rules.

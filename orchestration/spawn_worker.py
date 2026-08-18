@@ -247,9 +247,9 @@ def _deliver(
 ) -> None:
     """Finish the per-agent startup that argv alone cannot cover.
 
-    All three of Claude, Codex, and Kimi block below their agent loop on a
-    first-launch folder-trust dialog, which would leave a spawned tab dead until
-    a human noticed — and nobody is watching this one.  Kimi additionally takes
+    Claude, Codex, Kimi, and Gemini (Antigravity) all block below their agent
+    loop on a first-launch folder-trust dialog, which would leave a spawned tab
+    dead until a human noticed — and nobody is watching this one.  Kimi takes
     no prompt on its command line, so its dialog has to be cleared *before* the
     bootstrap wait rather than alongside it.  Everything here is borrowed from
     the heavy launcher rather than reimplemented.
@@ -267,7 +267,11 @@ def _deliver(
         handoff_launcher._rescue_local_kimi_folder_trust(  # noqa: SLF001
             startup, adapter=adapter, handle=handle, cwd=cwd,
         )
-    if agent in ("codex", "claude", "kimi"):
+    elif agent == "gemini":
+        handoff_launcher._rescue_local_gemini_folder_trust(  # noqa: SLF001
+            startup, adapter=adapter, handle=handle, cwd=cwd,
+        )
+    if agent in ("codex", "claude", "kimi", "gemini"):
         result["folder_trust_rescued"] = bool(startup.get("folder_trust_rescued"))
         if startup.get("startup_unconfirmed"):
             result["startup_unconfirmed"] = True

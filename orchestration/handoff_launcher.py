@@ -33,9 +33,10 @@ from agents.orchestration import handoff_registry
 CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 CMUX_APP_NAME = "cmux"
 HERDR_DEFAULT = "herdr"
-# herdr public IDs are opaque stable handles whose suffix is not decimal:
-# a workspace's eleventh pane is ``w1:pB``, not ``w1:p11``.
-HERDR_PANE_RE = re.compile(r"^w[0-9]+:p[0-9A-Za-z]+$")
+# herdr public IDs are opaque stable handles whose suffixes are not decimal:
+# a workspace's eleventh pane is ``w1:pB``, not ``w1:p11``, and the tenth
+# workspace is ``wA``, not ``w10``.
+HERDR_PANE_RE = re.compile(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$")
 # Remote workers are parked in one labelled workspace on the remote server so
 # repeated launches share it instead of scattering tabs across the box.
 HERDR_REMOTE_WORKSPACE_LABEL = "REMOTE_WORKERS"
@@ -71,13 +72,29 @@ CLAUDE_TRUST_RENDER_GRACE = 3.0
 # standing for the whole bootstrap wait.
 LOCAL_KIMI_TRUST_TIMEOUT = 30.0
 KIMI_TRUST_RENDER_GRACE = 6.0
+# Antigravity CLI (the gemini agent's ``agy`` binary) shows the same
+# first-launch "Do you trust the contents of this project?" dialog, which
+# `--dangerously-skip-permissions` does not cover — that governs tool
+# approvals once the agent loop is running, while this blocks below it.
+LOCAL_GEMINI_TRUST_TIMEOUT = 30.0
+GEMINI_TRUST_RENDER_GRACE = 3.0
 REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
 AGENT_DEFAULTS = {
     "claude": ("opus", "high"),
     "codex": ("gpt-5.6-terra", "xhigh"),
+    "gemini": ("gemini-3.7-flash", "high"),
     "kimi": ("kimi-code/k3", "max"),
     "pi": ("deepseek/deepseek-v4-flash", "max"),
 }
+# Agents whose CLI binary is not named after the agent.  Everything that
+# resolves or matches a worker process — argv construction and the process
+# probes — must go through this map, or a gemini worker (process ``agy``)
+# looks permanently absent.
+AGENT_BINARIES = {"gemini": "agy"}
+
+
+def _agent_binary(agent: str) -> str:
+    return AGENT_BINARIES.get(agent, agent)
 ORCHESTRATOR_DOORBELL_TITLE = "Handoff orchestrator pending"
 
 
@@ -132,8 +149,11 @@ def _agent_token_present(text: str, agent: str) -> bool:
     ``pip`` or ``rapid`` while still matching the real entry points, whose
     names carry non-alphanumeric neighbours (``claude.exe``, ``codex.js``,
     ``.kimi-code/bin/kimi``, ``/bin/pi``).
+
+    The token searched for is the agent's *binary* name — a gemini worker runs
+    as ``agy``, and "gemini" never appears in its process inventory.
     """
-    pattern = rf"(?<![0-9a-z]){re.escape(agent.lower())}(?![0-9a-z])"
+    pattern = rf"(?<![0-9a-z]){re.escape(_agent_binary(agent).lower())}(?![0-9a-z])"
     return re.search(pattern, text.lower()) is not None
 
 
@@ -936,9 +956,10 @@ class HerdrAdapter:
 
 def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str]:
     agent = config["agent"]
-    executable = shutil.which(agent, path=process_env.get("PATH"))
+    binary = _agent_binary(agent)
+    executable = shutil.which(binary, path=process_env.get("PATH"))
     if executable is None:
-        raise AdapterError(f"agent executable not found: {agent}")
+        raise AdapterError(f"agent executable not found: {binary}")
     if agent == "claude":
         prompt = Path(config["kickoff"]).read_text(encoding="utf-8")
         argv = [executable, "--model", config["model"]]
@@ -956,6 +977,19 @@ def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str
         else:
             argv.extend(["-a", "on-request"])
         argv.append(prompt)
+        return argv
+    if agent == "gemini":
+        prompt = Path(config["kickoff"]).read_text(encoding="utf-8")
+        argv = [executable, "--model", config["model"]]
+        if config["effort"]:
+            # agy validates model and effort together: the base flash model
+            # name is rejected without an --effort (low|medium|high).
+            argv.extend(["--effort", config["effort"]])
+        if config["pmode"] == "bypassPermissions":
+            argv.append("--dangerously-skip-permissions")
+        # -i (--prompt-interactive) takes the prompt as its value and keeps
+        # the session interactive afterwards, like claude's positional prompt.
+        argv.extend(["-i", prompt])
         return argv
     if agent == "kimi":
         argv = [executable, "-m", config["model"]]
@@ -1216,6 +1250,13 @@ def launch(
         # the kickoff is typed into, so leaving it standing spends the entire
         # bootstrap budget waiting for a composer that cannot appear.
         _rescue_local_kimi_folder_trust(
+            startup_rescue, adapter=adapter, handle=handle, cwd=cwd,
+        )
+    elif agent == "gemini":
+        # Antigravity gates first launch into an untrusted folder the same
+        # way; its kickoff rides on argv, so clearing the dialog is all that
+        # is needed for the worker to start.
+        _rescue_local_gemini_folder_trust(
             startup_rescue, adapter=adapter, handle=handle, cwd=cwd,
         )
     if agent == "kimi":
@@ -1741,6 +1782,23 @@ def _claude_trust_cwd_matches(screen: str, cwd: Path) -> bool:
     )
 
 
+def _gemini_folder_trust_dialog_present(screen: str) -> bool:
+    """True when Antigravity CLI's exact folder-trust dialog is on screen.
+
+    The dialog is Claude-shaped but unnumbered: a ``> Yes, I trust this
+    folder`` / ``No, exit`` menu under "Do you trust the contents of this
+    project?".  Matches the fixed menu literals only; the directory is
+    verified separately by :func:`_claude_trust_cwd_matches`, which works
+    unchanged because Antigravity labels its path line with the same
+    ``Accessing workspace:`` marker Claude Code uses.
+    """
+    return (
+        "Do you trust the contents of this project?" in screen
+        and "Yes, I trust this folder" in screen
+        and "No, exit" in screen
+    )
+
+
 def _kimi_folder_trust_dialog_present(screen: str) -> bool:
     """True when Kimi Code's exact folder-trust dialog is on screen.
 
@@ -1896,6 +1954,29 @@ def _rescue_local_kimi_folder_trust(
         result, adapter=adapter, handle=handle, cwd=cwd, agent="kimi",
         dialog_present=_kimi_folder_trust_dialog_present,
         cwd_matches=_kimi_trust_cwd_matches,
+        timeout=timeout, render_grace=render_grace,
+    )
+
+
+def _rescue_local_gemini_folder_trust(
+    result: dict[str, Any],
+    *,
+    adapter: Any,
+    handle: str,
+    cwd: Path,
+    timeout: float = LOCAL_GEMINI_TRUST_TIMEOUT,
+    render_grace: float = GEMINI_TRUST_RENDER_GRACE,
+) -> None:
+    """Advance one verified local Antigravity folder-trust dialog at most once.
+
+    The default selection is "Yes, I trust this folder", so a bare Enter
+    confirms it — same interaction as Claude's dialog.  The cwd matcher is
+    Claude's, since both CLIs print the path under ``Accessing workspace:``.
+    """
+    _rescue_local_folder_trust(
+        result, adapter=adapter, handle=handle, cwd=cwd, agent="gemini",
+        dialog_present=_gemini_folder_trust_dialog_present,
+        cwd_matches=_claude_trust_cwd_matches,
         timeout=timeout, render_grace=render_grace,
     )
 
