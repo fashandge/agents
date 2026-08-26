@@ -495,7 +495,7 @@ def test_wait_ready_needs_live_agent_and_semantic_revision(monkeypatch):
 
 def test_agent_defaults_match_handoff_policy():
     assert handoff_launcher.AGENT_DEFAULTS == {
-        "claude": ("opus", "high"),
+        "claude": ("opus", "medium"),
         "codex": ("gpt-5.6-terra", "xhigh"),
         "gemini": ("gemini-3.7-flash", "high"),
         "kimi": ("kimi-code/k3", "max"),
