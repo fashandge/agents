@@ -965,6 +965,11 @@ def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str
         argv = [executable, "--model", config["model"]]
         if config["effort"]:
             argv.extend(["--effort", config["effort"]])
+        if config["model"] == "opus":
+            # Only the bare `opus` alias (Opus 5) runs Concise; explicit
+            # models — `fable`, `claude-opus-4-8[1m]` — keep the default
+            # output style.
+            argv.extend(["--settings", '{"outputStyle": "Concise"}'])
         argv.extend(["--permission-mode", config["pmode"], prompt])
         return argv
     if agent == "codex":

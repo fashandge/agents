@@ -42,6 +42,24 @@ def test_agent_argv_preserves_kickoff_metacharacters_as_one_literal_arg(tmp_path
     assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
 
 
+def test_claude_argv_sets_concise_output_style_only_for_bare_opus(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff"
+    kickoff.write_text("task")
+    monkeypatch.setattr(handoff_launcher.shutil, "which", lambda *args, **kwargs: "/bin/claude")
+    base = {"agent": "claude", "effort": "medium", "pmode": "bypassPermissions", "kickoff": str(kickoff)}
+
+    argv = handoff_launcher._agent_argv({**base, "model": "opus"}, {"PATH": "/bin"})
+    assert argv == [
+        "/bin/claude", "--model", "opus", "--effort", "medium",
+        "--settings", '{"outputStyle": "Concise"}',
+        "--permission-mode", "bypassPermissions", "task",
+    ]
+
+    for model in ("claude-opus-4-8[1m]", "fable"):
+        argv = handoff_launcher._agent_argv({**base, "model": model}, {"PATH": "/bin"})
+        assert "--settings" not in argv
+
+
 def test_kimi_argv_passes_explicit_default_without_putting_kickoff_on_argv(tmp_path, monkeypatch):
     kickoff = tmp_path / "kickoff"
     kickoff.write_text("literal $(touch SHOULD_NOT_EXIST)")
