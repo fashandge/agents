@@ -80,7 +80,7 @@ LOCAL_GEMINI_TRUST_TIMEOUT = 30.0
 GEMINI_TRUST_RENDER_GRACE = 3.0
 REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}$")
 AGENT_DEFAULTS = {
-    "claude": ("opus", "medium"),
+    "claude": ("fable", "low"),
     "codex": ("gpt-5.6-terra", "xhigh"),
     "gemini": ("gemini-3.7-flash", "high"),
     "kimi": ("kimi-code/k3", "max"),

@@ -126,7 +126,7 @@ def test_spawn_writes_no_handoff_protocol_state(tmp_path, adapter, isolate_spawn
 @pytest.mark.parametrize(
     ("agent", "model", "effort"),
     [
-        ("claude", "opus", "medium"),
+        ("claude", "fable", "low"),
         ("codex", "gpt-5.6-terra", "xhigh"),
         ("gemini", "gemini-3.7-flash", "high"),
         ("kimi", "kimi-code/k3", "max"),

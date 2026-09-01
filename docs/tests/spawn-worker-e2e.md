@@ -155,7 +155,7 @@ Assertions on each JSON line — the command's whole output contract:
 
 - `backend` matches the driving mode (`herdr` / `cmux` / `tmux`), and `handle`
   has that backend's shape.
-- `model` / `effort` equal `AGENT_DEFAULTS` for that agent: claude `opus`/`medium`,
+- `model` / `effort` equal `AGENT_DEFAULTS` for that agent: claude `fable`/`low`,
   codex `gpt-5.6-terra`/`xhigh`, kimi `kimi-code/k3`/`max`, pi
   `deepseek/deepseek-v4-flash`/`max`, gemini `gemini-3.7-flash`/`high`. A drift
   here means the lightweight path has grown its own copy of the table.
