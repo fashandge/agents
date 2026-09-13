@@ -40,6 +40,10 @@ from agents.orchestration import handoff_launcher
 
 
 SPAWN_STATE_DIRNAME = ".local/state/agents/spawn"
+# DSH is a lightweight-only worker; its installed profile owns model, effort,
+# and permissions. Keep the durable launcher's supported-agent set unchanged.
+AGENT_DEFAULTS = {**handoff_launcher.AGENT_DEFAULTS, "dsh": (None, None)}
+DSH_PROFILE = "dsh-tui"
 # Kimi is the one agent with no argv prompt, so it is handed a path to read
 # instead of having the prompt typed into its composer.
 KIMI_BOOTSTRAP_TIMEOUT = 120.0
@@ -115,9 +119,23 @@ def exec_from_config(config_path: str | None = None) -> None:
         process_env["KIMI_MODEL_THINKING_EFFORT"] = config["effort"]
     os.chdir(config["cwd"])
     # Build argv before deleting anything: `_agent_argv` reads the prompt file.
-    argv = handoff_launcher._agent_argv(config, process_env)  # noqa: SLF001
+    argv = _agent_argv(config, process_env)
     _discard_launch_files(Path(config["private_dir"]))
     os.execvpe(argv[0], argv, process_env)
+
+
+def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str]:
+    if config["agent"] != "dsh":
+        return handoff_launcher._agent_argv(config, process_env)  # noqa: SLF001
+    executable = shutil.which("dsh", path=process_env.get("PATH"))
+    if executable is None:
+        raise handoff_launcher.AdapterError("agent executable not found: dsh")
+    prompt = Path(config["kickoff"]).read_text(encoding="utf-8")
+    # dsh-tui drops flag-shaped positional arguments, even after `--`. Its
+    # parser trims the assembled prompt, so a leading space preserves these.
+    if prompt.startswith("-"):
+        prompt = " " + prompt
+    return [executable, "--profile", DSH_PROFILE, prompt]
 
 
 def _discard_launch_files(private_dir: Path) -> None:
@@ -186,11 +204,19 @@ def spawn(
     """
     cwd = Path(cwd).resolve(strict=True)
     prompt = Path(prompt).resolve(strict=True)
-    if agent not in handoff_launcher.AGENT_DEFAULTS:
+    if agent not in AGENT_DEFAULTS:
         raise handoff.HandoffError(
-            f"agent must be one of: {', '.join(handoff_launcher.AGENT_DEFAULTS)}", 2,
+            f"agent must be one of: {', '.join(AGENT_DEFAULTS)}", 2,
         )
-    default_model, default_effort = handoff_launcher.AGENT_DEFAULTS[agent]
+    if agent == "dsh":
+        if model is not None or effort is not None or pmode != "bypassPermissions":
+            raise handoff.HandoffError(
+                "dsh uses the dsh-tui profile's model, effort, and permissions; "
+                "omit --model, --effort, and --pmode", 2,
+            )
+        if shutil.which("dsh", path=env.build_env().get("PATH")) is None:
+            raise handoff_launcher.AdapterError("agent executable not found: dsh")
+    default_model, default_effort = AGENT_DEFAULTS[agent]
     model = default_model if model is None else model
     effort = default_effort if effort is None else effort
     backend = handoff_launcher._select_backend(backend, cmux_binary, herdr_binary)  # noqa: SLF001
@@ -231,6 +257,8 @@ def spawn(
         "backend": backend, "handle": handle, "cwd": str(cwd),
         "prompt_path": str(prompt),
     }
+    if agent == "dsh":
+        result["profile"] = DSH_PROFILE
     if split:
         if backend != "herdr":
             raise handoff.HandoffError(
@@ -409,18 +437,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("cwd", nargs="?", type=Path, help="worker checkout (default: current directory)")
     parser.add_argument(
-        "--agent", choices=tuple(handoff_launcher.AGENT_DEFAULTS), default="claude",
+        "--agent", choices=tuple(AGENT_DEFAULTS), default="claude",
+        help="dsh launches dsh --profile dsh-tui; its profile owns model, effort, and permissions",
     )
     parser.add_argument(
-        "--model", default=None, help=handoff_launcher._agent_default_help("model", 0),  # noqa: SLF001
+        "--model", default=None,
+        help=handoff_launcher._agent_default_help("model", 0) + "; omit for dsh",  # noqa: SLF001
     )
     parser.add_argument(
         "--effort", default=None,
-        help=handoff_launcher._agent_default_help("reasoning effort", 1),  # noqa: SLF001
+        help=handoff_launcher._agent_default_help("reasoning effort", 1) + "; omit for dsh",  # noqa: SLF001
     )
     parser.add_argument(
         "--pmode", default="bypassPermissions",
-        help="agent permission mode, passed through to the agent CLI (default: bypassPermissions)",
+        help="agent permission mode (default: bypassPermissions); dsh keeps profile permissions, omit this flag",
     )
     parser.add_argument(
         "--backend", choices=("herdr", "cmux", "tmux"), default=None,

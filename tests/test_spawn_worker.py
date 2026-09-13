@@ -175,6 +175,66 @@ def test_spawn_rejects_an_unknown_agent(tmp_path, adapter):
     assert "claude" in str(excinfo.value) and "pi" in str(excinfo.value)
 
 
+@pytest.mark.parametrize("backend", ["herdr", "cmux", "tmux"])
+@pytest.mark.parametrize("prompt_text", [
+    "Rename a file.\nKeep literal $(touch SHOULD_NOT_EXIST), `pwd`, and 'quotes'.",
+    "--flag-shaped task text",
+])
+def test_dsh_spawn_executes_profile_with_literal_prompt(
+    tmp_path, adapter, monkeypatch, backend, prompt_text,
+):
+    import shlex
+
+    monkeypatch.setattr(spawn_worker.env, "build_env", lambda: {"PATH": "/bin"})
+    monkeypatch.setattr(spawn_worker.shutil, "which", lambda *args, **kwargs: "/bin/dsh")
+    result = spawn_worker.spawn(
+        label="trivial", prompt=write_prompt(tmp_path, prompt_text), cwd=tmp_path,
+        agent="dsh", backend=backend,
+    )
+    assert result["profile"] == "dsh-tui"
+    assert result["model"] is None and result["effort"] is None
+    assert result["prompt_sent"] is True
+    command = adapter.launched[0][2]
+    assert prompt_text not in command
+    captured = {}
+    monkeypatch.setattr(spawn_worker.os, "chdir", lambda value: captured.update(cwd=value))
+    monkeypatch.setattr(
+        spawn_worker.os, "execvpe",
+        lambda executable, argv, env: captured.update(argv=argv, executable=executable),
+    )
+    spawn_worker.exec_from_config(shlex.split(command)[2])
+    argv = captured["argv"]
+    assert argv[:3] == ["/bin/dsh", "--profile", "dsh-tui"]
+    assert len(argv) == 4 and argv[3].strip() == prompt_text
+    # The installed profile discards argv entries beginning with a dash.
+    assert not argv[3].startswith("-")
+    assert captured["cwd"] == str(tmp_path)
+    assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"model": "some-model"}, {"effort": "high"}, {"pmode": "auto"},
+])
+def test_dsh_rejects_unsupported_overrides_before_launch(tmp_path, adapter, overrides):
+    with pytest.raises(handoff.HandoffError, match="omit --model, --effort, and --pmode"):
+        spawn_worker.spawn(
+            label="bad", prompt=write_prompt(tmp_path), cwd=tmp_path,
+            agent="dsh", backend="tmux", **overrides,
+        )
+    assert adapter.launched == []
+
+
+def test_dsh_missing_executable_fails_before_launch(tmp_path, adapter, monkeypatch):
+    monkeypatch.setattr(spawn_worker.env, "build_env", lambda: {"PATH": "/empty"})
+    monkeypatch.setattr(spawn_worker.shutil, "which", lambda *args, **kwargs: None)
+    with pytest.raises(handoff_launcher.AdapterError, match="agent executable not found: dsh"):
+        spawn_worker.spawn(
+            label="missing", prompt=write_prompt(tmp_path), cwd=tmp_path,
+            agent="dsh", backend="tmux",
+        )
+    assert adapter.launched == []
+
+
 def test_spawn_autoselects_the_backend_when_none_is_given(tmp_path, adapter, monkeypatch):
     monkeypatch.setattr(
         spawn_worker.handoff_launcher.shutil, "which", lambda *args, **kwargs: "/usr/bin/tmux",
