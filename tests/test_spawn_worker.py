@@ -1,8 +1,10 @@
 import base64
 import json
+import shlex
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agents.orchestration import handoff
 from agents.orchestration import handoff_launcher
@@ -176,23 +178,31 @@ def test_spawn_rejects_an_unknown_agent(tmp_path, adapter):
 
 
 @pytest.mark.parametrize("backend", ["herdr", "cmux", "tmux"])
+@pytest.mark.parametrize(("effort", "effective_effort"), [("high", "high"), ("xhigh", "max")])
 @pytest.mark.parametrize("prompt_text", [
     "Rename a file.\nKeep literal $(touch SHOULD_NOT_EXIST), `pwd`, and 'quotes'.",
     "--flag-shaped task text",
 ])
 def test_dsh_spawn_executes_profile_with_literal_prompt(
-    tmp_path, adapter, monkeypatch, backend, prompt_text,
+    tmp_path, adapter, monkeypatch, backend, prompt_text, effort, effective_effort,
 ):
-    import shlex
-
     monkeypatch.setattr(spawn_worker.env, "build_env", lambda: {"PATH": "/bin"})
     monkeypatch.setattr(spawn_worker.shutil, "which", lambda *args, **kwargs: "/bin/dsh")
+    monkeypatch.setattr(spawn_worker.subprocess, "run", lambda *args, **kwargs: Completed(stdout="""
+- id: dsh-tui
+  config:
+    provider: old-provider
+    effort: low
+    fullscreen: false
+    preset: !!js process.env.DSH_TUI_PRESET
+"""))
     result = spawn_worker.spawn(
         label="trivial", prompt=write_prompt(tmp_path, prompt_text), cwd=tmp_path,
-        agent="dsh", backend=backend,
+        agent="dsh", backend=backend, effort=effort,
     )
     assert result["profile"] == "dsh-tui"
-    assert result["model"] is None and result["effort"] is None
+    assert result["model"] == "DeepSeek-V41-Flash"
+    assert result["effort"] == effort and result["effective_effort"] == effective_effort
     assert result["prompt_sent"] is True
     command = adapter.launched[0][2]
     assert prompt_text not in command
@@ -204,22 +214,46 @@ def test_dsh_spawn_executes_profile_with_literal_prompt(
     )
     spawn_worker.exec_from_config(shlex.split(command)[2])
     argv = captured["argv"]
-    assert argv[:3] == ["/bin/dsh", "--profile", "dsh-tui"]
-    assert len(argv) == 4 and argv[3].strip() == prompt_text
+    assert argv[:4] == ["/bin/dsh", "--profile", "dsh-tui", "--patch"]
+    assert len(argv) == 6 and argv[5].strip() == prompt_text
     # The installed profile discards argv entries beginning with a dash.
-    assert not argv[3].startswith("-")
+    assert not argv[5].startswith("-")
+    patch_path = Path(argv[4])
+    assert patch_path.stat().st_mode & 0o777 == 0o600
+    patch_row = dict((k.value, v) for k, v in yaml.compose(patch_path.read_text()).value[0].value)
+    config = dict((k.value, v) for k, v in patch_row["config"].value)
+    assert config["provider"].value == "deepseek-official"
+    assert config["model"].value == "deepseek-flash"
+    assert config["effort"].value == effective_effort
+    assert config["fullscreen"].value == "false"
+    assert config["preset"].tag == "tag:yaml.org,2002:js"
+    assert config["preset"].value == "process.env.DSH_TUI_PRESET"
     assert captured["cwd"] == str(tmp_path)
     assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
 
 
-@pytest.mark.parametrize("overrides", [
-    {"model": "some-model"}, {"effort": "high"}, {"pmode": "auto"},
+@pytest.mark.parametrize(("overrides", "message"), [
+    ({"model": ""}, "dsh model must be"),
+    ({"effort": "invalid"}, "dsh effort must be one of:"),
+    ({"pmode": "auto"}, "omit --pmode"),
 ])
-def test_dsh_rejects_unsupported_overrides_before_launch(tmp_path, adapter, overrides):
-    with pytest.raises(handoff.HandoffError, match="omit --model, --effort, and --pmode"):
+def test_dsh_rejects_unsupported_overrides_before_launch(tmp_path, adapter, overrides, message):
+    with pytest.raises(handoff.HandoffError, match=message):
         spawn_worker.spawn(
             label="bad", prompt=write_prompt(tmp_path), cwd=tmp_path,
             agent="dsh", backend="tmux", **overrides,
+        )
+    assert adapter.launched == []
+
+
+@pytest.mark.parametrize("dump", ["[]", "- id: dsh-tui\n  config: !!js getConfig()"])
+def test_dsh_rejects_unpatchable_profile_before_launch(tmp_path, adapter, monkeypatch, dump):
+    monkeypatch.setattr(spawn_worker.env, "build_env", lambda: {"PATH": "/bin"})
+    monkeypatch.setattr(spawn_worker.shutil, "which", lambda *args, **kwargs: "/bin/dsh")
+    monkeypatch.setattr(spawn_worker.subprocess, "run", lambda *args, **kwargs: Completed(stdout=dump))
+    with pytest.raises(handoff_launcher.AdapterError, match="exactly one dsh-tui entry with a mapping config"):
+        spawn_worker.spawn(
+            label="invalid", prompt=write_prompt(tmp_path), cwd=tmp_path, agent="dsh", backend="tmux",
         )
     assert adapter.launched == []
 

@@ -28,11 +28,14 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from agents import env
 from agents.orchestration import handoff
@@ -40,10 +43,10 @@ from agents.orchestration import handoff_launcher
 
 
 SPAWN_STATE_DIRNAME = ".local/state/agents/spawn"
-# DSH is a lightweight-only worker; its installed profile owns model, effort,
-# and permissions. Keep the durable launcher's supported-agent set unchanged.
-AGENT_DEFAULTS = {**handoff_launcher.AGENT_DEFAULTS, "dsh": (None, None)}
+# DSH is lightweight-only; keep the durable launcher's agent set unchanged.
+AGENT_DEFAULTS = {**handoff_launcher.AGENT_DEFAULTS, "dsh": ("DeepSeek-V41-Flash", "high")}
 DSH_PROFILE = "dsh-tui"
+DSH_EFFORTS = {"off": "off", "low": "low", "high": "high", "max": "max", "xhigh": "max"}
 # Kimi is the one agent with no argv prompt, so it is handed a path to read
 # instead of having the prompt typed into its composer.
 KIMI_BOOTSTRAP_TIMEOUT = 120.0
@@ -135,12 +138,55 @@ def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str
     # parser trims the assembled prompt, so a leading space preserves these.
     if prompt.startswith("-"):
         prompt = " " + prompt
-    return [executable, "--profile", DSH_PROFILE, prompt]
+    return [executable, "--profile", DSH_PROFILE,
+            "--patch", str(Path(config["private_dir"]) / "dsh.patch.yml"), prompt]
+
+
+def _dsh_patch(model: str, effort: str, process_env: dict[str, str]) -> str:
+    """Override only the TUI's route/effort, preserving its tagged YAML config.
+
+    DSH patches replace an entire entry config. Compose the installed profile
+    without booting it, and retain YAML nodes so !!js expressions stay unevaluated.
+    """
+    try:
+        completed = subprocess.run(
+            ["dsh", "--profile", DSH_PROFILE, "--dump-config"],
+            env=process_env, capture_output=True, text=True, timeout=20, check=True,
+        )
+        root = yaml.compose(completed.stdout)
+    except (OSError, subprocess.SubprocessError, yaml.YAMLError) as exc:
+        raise handoff_launcher.AdapterError("could not read dsh-tui profile configuration") from exc
+
+    def entries(node: Any):
+        if not isinstance(node, yaml.SequenceNode):
+            return
+        for row in node.value:
+            if not isinstance(row, yaml.MappingNode):
+                continue
+            fields = {key.value: value for key, value in row.value}
+            if fields.get("id") and fields["id"].value == "dsh-tui":
+                yield fields.get("config")
+            yield from entries(fields.get("config"))
+
+    configs = list(entries(root))
+    if len(configs) != 1 or not isinstance(configs[0], yaml.MappingNode):
+        raise handoff_launcher.AdapterError("dsh-tui profile needs exactly one dsh-tui entry with a mapping config")
+    config = configs[0]
+    route = "deepseek-official/deepseek-flash" if model == "DeepSeek-V41-Flash" else model
+    provider, separator, model_id = route.partition("/")
+    if not separator:
+        provider, model_id = "deepseek-official", route
+    overrides = {"provider": provider, "model": model_id, "effort": DSH_EFFORTS[effort]}
+    patch = yaml.compose(yaml.safe_dump([{"id": "dsh-tui", "config": overrides}]))
+    patch_config = next(value for key, value in patch.value[0].value if key.value == "config")
+    patch_config.value = [(key, value) for key, value in config.value if key.value not in overrides] + patch_config.value
+    return yaml.serialize(patch)
 
 
 def _discard_launch_files(private_dir: Path) -> None:
     """Remove the wrapper and config, keeping any prompt written alongside them.
 
+    DSH's per-worker patch also stays readable for its profile hot-reloads.
     A piped prompt stays readable so a human can see exactly what the worker was
     asked to do; the executable wrapper and its config have no further use once
     argv is built.  When the caller supplied their own prompt file there is
@@ -208,17 +254,23 @@ def spawn(
         raise handoff.HandoffError(
             f"agent must be one of: {', '.join(AGENT_DEFAULTS)}", 2,
         )
-    if agent == "dsh":
-        if model is not None or effort is not None or pmode != "bypassPermissions":
-            raise handoff.HandoffError(
-                "dsh uses the dsh-tui profile's model, effort, and permissions; "
-                "omit --model, --effort, and --pmode", 2,
-            )
-        if shutil.which("dsh", path=env.build_env().get("PATH")) is None:
-            raise handoff_launcher.AdapterError("agent executable not found: dsh")
     default_model, default_effort = AGENT_DEFAULTS[agent]
     model = default_model if model is None else model
     effort = default_effort if effort is None else effort
+    dsh_patch = None
+    if agent == "dsh":
+        if pmode != "bypassPermissions":
+            raise handoff.HandoffError(
+                "dsh keeps the dsh-tui profile's permissions; omit --pmode", 2,
+            )
+        if effort not in DSH_EFFORTS:
+            raise handoff.HandoffError(f"dsh effort must be one of: {', '.join(DSH_EFFORTS)}", 2)
+        if not model or any(not part for part in model.split("/")) or model.count("/") > 1:
+            raise handoff.HandoffError("dsh model must be a model ID, provider/model, or DeepSeek-V41-Flash", 2)
+        dsh_env = env.build_env()
+        if shutil.which("dsh", path=dsh_env.get("PATH")) is None:
+            raise handoff_launcher.AdapterError("agent executable not found: dsh")
+        dsh_patch = _dsh_patch(model, effort, dsh_env)
     backend = handoff_launcher._select_backend(backend, cmux_binary, herdr_binary)  # noqa: SLF001
     if workspace_label:
         if workspace:
@@ -239,6 +291,8 @@ def spawn(
         )
     if private_dir is None:
         private_dir = _private_dir(label)
+    if dsh_patch is not None:
+        handoff._write_new(private_dir / "dsh.patch.yml", dsh_patch.encode(), 0o600)  # noqa: SLF001
 
     config = {
         "agent": agent, "model": model, "effort": effort, "pmode": pmode,
@@ -259,6 +313,7 @@ def spawn(
     }
     if agent == "dsh":
         result["profile"] = DSH_PROFILE
+        result["effective_effort"] = DSH_EFFORTS[effort]
     if split:
         if backend != "herdr":
             raise handoff.HandoffError(
@@ -438,15 +493,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("cwd", nargs="?", type=Path, help="worker checkout (default: current directory)")
     parser.add_argument(
         "--agent", choices=tuple(AGENT_DEFAULTS), default="claude",
-        help="dsh launches dsh --profile dsh-tui; its profile owns model, effort, and permissions",
+        help="dsh launches dsh --profile dsh-tui with a private model/effort overlay; profile permissions stay in effect",
     )
     parser.add_argument(
         "--model", default=None,
-        help=handoff_launcher._agent_default_help("model", 0) + "; omit for dsh",  # noqa: SLF001
+        help=handoff_launcher._agent_default_help("model", 0) + f"; dsh={AGENT_DEFAULTS['dsh'][0]} (or model ID / provider/model)",  # noqa: SLF001
     )
     parser.add_argument(
         "--effort", default=None,
-        help=handoff_launcher._agent_default_help("reasoning effort", 1) + "; omit for dsh",  # noqa: SLF001
+        help=handoff_launcher._agent_default_help("reasoning effort", 1) + f"; dsh={AGENT_DEFAULTS['dsh'][1]}, choices: {', '.join(DSH_EFFORTS)} (xhigh maps to max)",  # noqa: SLF001
     )
     parser.add_argument(
         "--pmode", default="bypassPermissions",
