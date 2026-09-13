@@ -46,7 +46,7 @@ SPAWN_STATE_DIRNAME = ".local/state/agents/spawn"
 # DSH is lightweight-only; keep the durable launcher's agent set unchanged.
 AGENT_DEFAULTS = {**handoff_launcher.AGENT_DEFAULTS, "dsh": ("DeepSeek-V41-Flash", "high")}
 DSH_PROFILE = "dsh-tui"
-DSH_EFFORTS = {"off": "off", "low": "low", "high": "high", "max": "max", "xhigh": "max"}
+DSH_EFFORTS = ("off", "low", "high", "max")
 # Kimi is the one agent with no argv prompt, so it is handed a path to read
 # instead of having the prompt typed into its composer.
 KIMI_BOOTSTRAP_TIMEOUT = 120.0
@@ -176,7 +176,7 @@ def _dsh_patch(model: str, effort: str, process_env: dict[str, str]) -> str:
     provider, separator, model_id = route.partition("/")
     if not separator:
         provider, model_id = "deepseek-official", route
-    overrides = {"provider": provider, "model": model_id, "effort": DSH_EFFORTS[effort]}
+    overrides = {"provider": provider, "model": model_id, "effort": effort}
     patch = yaml.compose(yaml.safe_dump([{"id": "dsh-tui", "config": overrides}]))
     patch_config = next(value for key, value in patch.value[0].value if key.value == "config")
     patch_config.value = [(key, value) for key, value in config.value if key.value not in overrides] + patch_config.value
@@ -313,7 +313,7 @@ def spawn(
     }
     if agent == "dsh":
         result["profile"] = DSH_PROFILE
-        result["effective_effort"] = DSH_EFFORTS[effort]
+        result["effective_effort"] = effort
     if split:
         if backend != "herdr":
             raise handoff.HandoffError(
@@ -501,7 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--effort", default=None,
-        help=handoff_launcher._agent_default_help("reasoning effort", 1) + f"; dsh={AGENT_DEFAULTS['dsh'][1]}, choices: {', '.join(DSH_EFFORTS)} (xhigh maps to max)",  # noqa: SLF001
+        help=handoff_launcher._agent_default_help("reasoning effort", 1) + f"; dsh={AGENT_DEFAULTS['dsh'][1]}, choices: {', '.join(DSH_EFFORTS)}",  # noqa: SLF001
     )
     parser.add_argument(
         "--pmode", default="bypassPermissions",

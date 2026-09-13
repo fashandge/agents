@@ -178,7 +178,7 @@ def test_spawn_rejects_an_unknown_agent(tmp_path, adapter):
 
 
 @pytest.mark.parametrize("backend", ["herdr", "cmux", "tmux"])
-@pytest.mark.parametrize(("effort", "effective_effort"), [("high", "high"), ("xhigh", "max")])
+@pytest.mark.parametrize(("effort", "effective_effort"), [("high", "high"), ("max", "max")])
 @pytest.mark.parametrize("prompt_text", [
     "Rename a file.\nKeep literal $(touch SHOULD_NOT_EXIST), `pwd`, and 'quotes'.",
     "--flag-shaped task text",
@@ -235,6 +235,7 @@ def test_dsh_spawn_executes_profile_with_literal_prompt(
 @pytest.mark.parametrize(("overrides", "message"), [
     ({"model": ""}, "dsh model must be"),
     ({"effort": "invalid"}, "dsh effort must be one of:"),
+    ({"effort": "xhigh"}, "dsh effort must be one of: off, low, high, max"),
     ({"pmode": "auto"}, "omit --pmode"),
 ])
 def test_dsh_rejects_unsupported_overrides_before_launch(tmp_path, adapter, overrides, message):
