@@ -43,10 +43,15 @@ from agents.orchestration import handoff_launcher
 
 
 SPAWN_STATE_DIRNAME = ".local/state/agents/spawn"
-# DSH is lightweight-only; keep the durable launcher's agent set unchanged.
-AGENT_DEFAULTS = {**handoff_launcher.AGENT_DEFAULTS, "dsh": ("DeepSeek-V41-Flash", "high")}
+# DSH and Muse are lightweight-only; keep the durable launcher's agent set unchanged.
+AGENT_DEFAULTS = {
+    **handoff_launcher.AGENT_DEFAULTS,
+    "dsh": ("DeepSeek-V41-Flash", "high"),
+    "muse": ("muse-wonder-full-1.0", "xhigh"),
+}
 DSH_PROFILE = "dsh-tui"
 DSH_EFFORTS = ("off", "low", "high", "max")
+MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 # Kimi is the one agent with no argv prompt, so it is handed a path to read
 # instead of having the prompt typed into its composer.
 KIMI_BOOTSTRAP_TIMEOUT = 120.0
@@ -128,6 +133,8 @@ def exec_from_config(config_path: str | None = None) -> None:
 
 
 def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str]:
+    if config["agent"] == "muse":
+        return _muse_argv(config, process_env)
     if config["agent"] != "dsh":
         return handoff_launcher._agent_argv(config, process_env)  # noqa: SLF001
     executable = shutil.which("dsh", path=process_env.get("PATH"))
@@ -140,6 +147,24 @@ def _agent_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str
         prompt = " " + prompt
     return [executable, "--profile", DSH_PROFILE,
             "--patch", str(Path(config["private_dir"]) / "dsh.patch.yml"), prompt]
+
+
+def _muse_argv(config: dict[str, Any], process_env: dict[str, str]) -> list[str]:
+    executable = shutil.which("muse", path=process_env.get("PATH"))
+    if executable is None:
+        raise handoff_launcher.AdapterError("agent executable not found: muse")
+    prompt = Path(config["kickoff"]).read_text(encoding="utf-8")
+    # Muse acts on flag-shaped words like --help even after `--`, so a leading
+    # space keeps a dash-led prompt positional.
+    if prompt.startswith("-"):
+        prompt = " " + prompt
+    argv = [executable, "--model", config["model"], "--reasoning-effort", config["effort"]]
+    # Muse's TUI blocks on an undecided workspace-trust dialog. --yolo trusts
+    # the workspace for this run; otherwise trust it without dropping approval
+    # or the sandbox. Neither persists a trust decision.
+    argv.append("--yolo" if config["pmode"] == "bypassPermissions" else "--trust-workspace")
+    argv.append(prompt)
+    return argv
 
 
 def _dsh_patch(model: str, effort: str, process_env: dict[str, str]) -> str:
@@ -271,6 +296,13 @@ def spawn(
         if shutil.which("dsh", path=dsh_env.get("PATH")) is None:
             raise handoff_launcher.AdapterError("agent executable not found: dsh")
         dsh_patch = _dsh_patch(model, effort, dsh_env)
+    elif agent == "muse":
+        if effort not in MUSE_EFFORTS:
+            raise handoff.HandoffError(f"muse effort must be one of: {', '.join(MUSE_EFFORTS)}", 2)
+        if not model:
+            raise handoff.HandoffError("muse model must be a catalog model ID", 2)
+        if shutil.which("muse", path=env.build_env().get("PATH")) is None:
+            raise handoff_launcher.AdapterError("agent executable not found: muse")
     backend = handoff_launcher._select_backend(backend, cmux_binary, herdr_binary)  # noqa: SLF001
     if workspace_label:
         if workspace:
@@ -493,15 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("cwd", nargs="?", type=Path, help="worker checkout (default: current directory)")
     parser.add_argument(
         "--agent", choices=tuple(AGENT_DEFAULTS), default="claude",
-        help="dsh launches dsh --profile dsh-tui with a private model/effort overlay; profile permissions stay in effect",
+        help=(
+            "dsh launches dsh --profile dsh-tui with a private model/effort overlay; profile permissions stay in effect. "
+            "muse launches Muse Code's TUI (--yolo under bypassPermissions, else --trust-workspace)"
+        ),
     )
     parser.add_argument(
         "--model", default=None,
-        help=handoff_launcher._agent_default_help("model", 0) + f"; dsh={AGENT_DEFAULTS['dsh'][0]} (or model ID / provider/model)",  # noqa: SLF001
+        help=handoff_launcher._agent_default_help("model", 0) + f"; dsh={AGENT_DEFAULTS['dsh'][0]} (or model ID / provider/model); muse={AGENT_DEFAULTS['muse'][0]}",  # noqa: SLF001
     )
     parser.add_argument(
         "--effort", default=None,
-        help=handoff_launcher._agent_default_help("reasoning effort", 1) + f"; dsh={AGENT_DEFAULTS['dsh'][1]}, choices: {', '.join(DSH_EFFORTS)}",  # noqa: SLF001
+        help=handoff_launcher._agent_default_help("reasoning effort", 1) + f"; dsh={AGENT_DEFAULTS['dsh'][1]}, choices: {', '.join(DSH_EFFORTS)}; muse={AGENT_DEFAULTS['muse'][1]}, choices: {', '.join(MUSE_EFFORTS)}",  # noqa: SLF001
     )
     parser.add_argument(
         "--pmode", default="bypassPermissions",

@@ -270,6 +270,72 @@ def test_dsh_missing_executable_fails_before_launch(tmp_path, adapter, monkeypat
     assert adapter.launched == []
 
 
+@pytest.mark.parametrize(("pmode", "trust_flag"), [
+    ("bypassPermissions", "--yolo"), ("auto", "--trust-workspace"),
+])
+@pytest.mark.parametrize("prompt_text", [
+    "Rename a file.\nKeep literal $(touch SHOULD_NOT_EXIST), `pwd`, and 'quotes'.",
+    "--help",
+])
+def test_muse_spawn_passes_model_effort_and_literal_prompt(
+    tmp_path, adapter, monkeypatch, pmode, trust_flag, prompt_text,
+):
+    monkeypatch.setattr(spawn_worker.env, "build_env", lambda: {"PATH": "/bin"})
+    monkeypatch.setattr(spawn_worker.shutil, "which", lambda *args, **kwargs: "/bin/muse")
+    result = spawn_worker.spawn(
+        label="muse", prompt=write_prompt(tmp_path, prompt_text), cwd=tmp_path,
+        agent="muse", backend="tmux", model="muse-wonder-full-1.0", effort="xhigh", pmode=pmode,
+    )
+    assert result["model"] == "muse-wonder-full-1.0" and result["effort"] == "xhigh"
+    assert result["prompt_sent"] is True
+    command = adapter.launched[0][2]
+    assert prompt_text not in command
+    captured = {}
+    monkeypatch.setattr(spawn_worker.os, "chdir", lambda value: captured.update(cwd=value))
+    monkeypatch.setattr(
+        spawn_worker.os, "execvpe",
+        lambda executable, argv, env: captured.update(argv=argv, executable=executable),
+    )
+    spawn_worker.exec_from_config(shlex.split(command)[2])
+    argv = captured["argv"]
+    assert argv[:-1] == [
+        "/bin/muse", "--model", "muse-wonder-full-1.0", "--reasoning-effort", "xhigh", trust_flag,
+    ]
+    # Muse honours --help even after `--`; the prompt must not start with a dash.
+    assert argv[-1].strip() == prompt_text and not argv[-1].startswith("-")
+    assert captured["cwd"] == str(tmp_path)
+    assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
+
+
+def test_muse_defaults_to_wonder_full_at_xhigh():
+    assert spawn_worker.AGENT_DEFAULTS["muse"] == ("muse-wonder-full-1.0", "xhigh")
+    assert "muse" not in handoff_launcher.AGENT_DEFAULTS
+
+
+@pytest.mark.parametrize(("overrides", "message"), [
+    ({"model": ""}, "muse model must be"),
+    ({"effort": "extreme"}, "muse effort must be one of:"),
+])
+def test_muse_rejects_unsupported_overrides_before_launch(tmp_path, adapter, overrides, message):
+    with pytest.raises(handoff.HandoffError, match=message):
+        spawn_worker.spawn(
+            label="bad", prompt=write_prompt(tmp_path), cwd=tmp_path,
+            agent="muse", backend="tmux", **overrides,
+        )
+    assert adapter.launched == []
+
+
+def test_muse_missing_executable_fails_before_launch(tmp_path, adapter, monkeypatch):
+    monkeypatch.setattr(spawn_worker.env, "build_env", lambda: {"PATH": "/empty"})
+    monkeypatch.setattr(spawn_worker.shutil, "which", lambda *args, **kwargs: None)
+    with pytest.raises(handoff_launcher.AdapterError, match="agent executable not found: muse"):
+        spawn_worker.spawn(
+            label="missing", prompt=write_prompt(tmp_path), cwd=tmp_path,
+            agent="muse", backend="tmux",
+        )
+    assert adapter.launched == []
+
+
 def test_spawn_autoselects_the_backend_when_none_is_given(tmp_path, adapter, monkeypatch):
     monkeypatch.setattr(
         spawn_worker.handoff_launcher.shutil, "which", lambda *args, **kwargs: "/usr/bin/tmux",
