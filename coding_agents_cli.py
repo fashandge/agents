@@ -670,6 +670,28 @@ class _RunResult:
     stderr: str
 
 
+def _codex_needs_node(codex_path: str) -> bool:
+    """Whether the codex entry point must be launched via an explicit ``node``.
+
+    The npm-published codex entry is a Node script (``#!/usr/bin/env node``),
+    run as ``node codex.js``. But ``codex`` may instead resolve to a shell
+    launcher (e.g. the ``codex-herdr`` wrapper symlinked into ``~/.local/bin``)
+    that execs the real codex itself; running ``node <shellscript>`` fails with
+    a Node ``SyntaxError``. Detect a non-node shebang and launch such a wrapper
+    directly. Default to needing node when the shebang can't be read, preserving
+    legacy behavior.
+    """
+    try:
+        with open(codex_path, "rb") as handle:
+            first_line = handle.readline(256)
+    except OSError:
+        return True
+    if first_line.startswith(b"#!"):
+        return b"node" in first_line
+    # No shebang: a real binary, or a .js resolved oddly. Only .js needs node.
+    return codex_path.endswith(".js")
+
+
 def build_codex_command(
     config: AgentConfig,
     *,
@@ -679,7 +701,10 @@ def build_codex_command(
     """Build a Codex CLI command from an AgentConfig."""
     binaries = find_codex_binaries()
     native_review = config.codex_review
-    command = [binaries.node, binaries.codex, "exec"]
+    if _codex_needs_node(binaries.codex):
+        command = [binaries.node, binaries.codex, "exec"]
+    else:
+        command = [binaries.codex, "exec"]
 
     # `--cd` and `--add-dir` are `codex exec` options, so they must precede the
     # `review` subcommand. Keep the legacy generic command ordering unchanged.

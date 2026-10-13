@@ -48,6 +48,53 @@ def test_build_codex_command_uses_native_custom_review(monkeypatch):
     ]
 
 
+def test_build_codex_command_skips_node_for_shell_launcher(tmp_path, monkeypatch):
+    # A codex-herdr-style bash launcher must be invoked directly, not via node.
+    launcher = tmp_path / "codex"
+    launcher.write_text("#!/bin/bash\nexec \"$HOME/.hermes/node/bin/codex\" \"$@\"\n")
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "find_codex_binaries",
+        lambda: coding_agents_cli.CodexBinaries(
+            node="/tmp/node",
+            codex=str(launcher),
+        ),
+    )
+    config = coding_agents_cli.AgentConfig(
+        agent="codex",
+        model="gpt-5.5",
+        codex_reasoning_effort="medium",
+    )
+
+    command = coding_agents_cli.build_codex_command(config)
+
+    assert command[0] == str(launcher)
+    assert "/tmp/node" not in command
+    assert command[1] == "exec"
+
+
+def test_build_codex_command_prefixes_node_for_js_entry(tmp_path, monkeypatch):
+    js_entry = tmp_path / "codex.js"
+    js_entry.write_text("#!/usr/bin/env node\nconsole.log('codex');\n")
+    monkeypatch.setattr(
+        coding_agents_cli,
+        "find_codex_binaries",
+        lambda: coding_agents_cli.CodexBinaries(
+            node="/tmp/node",
+            codex=str(js_entry),
+        ),
+    )
+    config = coding_agents_cli.AgentConfig(
+        agent="codex",
+        model="gpt-5.5",
+        codex_reasoning_effort="medium",
+    )
+
+    command = coding_agents_cli.build_codex_command(config)
+
+    assert command[:3] == ["/tmp/node", str(js_entry), "exec"]
+
+
 def test_build_claude_prompt_uses_unnamespaced_native_commands():
     assert coding_agents_cli.build_claude_prompt(
         "review context",
