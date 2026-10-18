@@ -93,7 +93,63 @@ def test_stream_codex_pty_failure_falls_back_to_pipes(monkeypatch):
     assert events[-1].payload["result"].output == "pipe answer"
 
 
-def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch):
+def test_stream_claude_defaults_to_claude_print_not_pty_wrapper(monkeypatch):
+    calls = []
+
+    def fake_print(prompt, *, model, auto_approve, timeout, cwd, effort, disable_mcp):
+        calls.append(
+            {
+                "prompt": prompt,
+                "model": model,
+                "auto_approve": auto_approve,
+                "timeout": timeout,
+                "cwd": cwd,
+                "effort": effort,
+                "disable_mcp": disable_mcp,
+            }
+        )
+        yield claude_pty_wrapper_streaming.ClaudePtyStreamEvent(
+            kind="done",
+            payload={
+                "result": claude_pty_wrapper_streaming.ClaudePtyStreamResult(
+                    output="print answer",
+                    returncode=0,
+                    stderr="",
+                )
+            },
+        )
+
+    def unexpected_wrapper(*args, **kwargs):
+        raise AssertionError("pty-wrapper must be opt-in")
+
+    monkeypatch.setattr(streaming.claude_print_streaming, "stream_claude_print", fake_print)
+    monkeypatch.setattr(streaming.claude_pty_wrapper_streaming, "stream_claude_pty", unexpected_wrapper)
+    config = _config(
+        "claude",
+        model="opus",
+        codex_working_dir=Path("/tmp/project"),
+        claude_effort="high",
+        claude_disable_mcp=True,
+    )
+
+    events = list(streaming.stream_with_config("long\nprompt", config, timeout=42))
+
+    assert events[0].payload["message"] == "Streaming Claude output via claude -p."
+    assert calls == [
+        {
+            "prompt": "long\nprompt",
+            "model": "opus",
+            "auto_approve": True,
+            "timeout": 42,
+            "cwd": Path("/tmp/project"),
+            "effort": "high",
+            "disable_mcp": True,
+        }
+    ]
+    assert events[-1].payload["result"].output == "print answer"
+
+
+def test_stream_claude_uses_pty_wrapper_when_opted_in_without_prompt_argv(monkeypatch):
     calls = []
 
     def fake_stream(prompt, *, model, auto_approve, timeout, cwd, effort):
@@ -124,6 +180,7 @@ def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch)
         model="claude-opus-4-6[1m]",
         codex_working_dir=Path("/tmp/project"),
         claude_effort="high",
+        claude_use_pty_wrapper=True,
     )
 
     events = list(streaming.stream_with_config("long\nprompt", config, timeout=42))
@@ -138,13 +195,14 @@ def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch)
             "effort": "high",
         }
     ]
+    assert events[0].payload["message"] == "Streaming Claude output via claude-pty-wrapper."
     assert events[-1].payload["result"].output == "claude answer"
 
 
 def test_stream_claude_prefixes_native_review_command(monkeypatch):
     captured = {}
 
-    def fake_stream(prompt, *, model, auto_approve, timeout, cwd, effort):
+    def fake_stream(prompt, *, model, auto_approve, timeout, cwd, effort, disable_mcp):
         captured["prompt"] = prompt
         yield claude_pty_wrapper_streaming.ClaudePtyStreamEvent(
             kind="done",
@@ -158,8 +216,8 @@ def test_stream_claude_prefixes_native_review_command(monkeypatch):
         )
 
     monkeypatch.setattr(
-        streaming.claude_pty_wrapper_streaming,
-        "stream_claude_pty",
+        streaming.claude_print_streaming,
+        "stream_claude_print",
         fake_stream,
     )
     config = _config(

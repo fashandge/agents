@@ -180,6 +180,7 @@ def _stream_command(
     prompt: str,
     timeout: float | None,
     cwd: Path | str | None,
+    process_label: str = "claude-pty-wrapper",
 ) -> Iterator[ClaudePtyStreamEvent]:
     process: subprocess.Popen[str] | None = None
     stdout_chunks: list[str] = []
@@ -270,7 +271,7 @@ def _stream_command(
             yield ClaudePtyStreamEvent(
                 kind="error",
                 payload={
-                    "message": f"claude-pty-wrapper failed with exit code {returncode}",
+                    "message": f"{process_label} failed with exit code {returncode}",
                     "stderr": "".join(stderr_chunks),
                 },
             )
@@ -339,7 +340,7 @@ def _format_stream_json_line(line: str) -> _FormattedStreamLine:
     event_type = event.get("type")
     session_id = _string_value(event.get("session_id"))
 
-    if event_type == "system":
+    if event_type in ("system", "rate_limit_event"):
         return _FormattedStreamLine("", "", session_id=session_id)
 
     if event_type == "assistant":

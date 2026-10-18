@@ -268,3 +268,31 @@ def test_stream_claude_pty_with_mocked_popen(monkeypatch):
     assert result.returncode == 0
     assert result.stderr == "diagnostic\n"
     assert result.session_id == "session-4"
+
+
+def test_format_stream_json_line_ignores_rate_limit_events():
+    formatted = streaming._format_stream_json_line(
+        _line({"type": "rate_limit_event", "session_id": "session-5"})
+    )
+
+    assert formatted.display_text == ""
+    assert formatted.session_id == "session-5"
+
+
+def test_stream_command_failure_names_the_process(monkeypatch):
+    class _FailingPopen(_FakePopen):
+        def __init__(self, command, **kwargs):
+            super().__init__(command, **kwargs)
+            self.returncode = 1
+
+    monkeypatch.setattr(streaming.agents_env, "build_env", lambda: {"HOME": "/tmp"})
+    monkeypatch.setattr(streaming.subprocess, "Popen", _FailingPopen)
+
+    events = list(
+        streaming._stream_command(
+            ["claude", "-p"], prompt="hi", timeout=30, cwd=None, process_label="claude -p"
+        )
+    )
+
+    assert events[-1].kind == "error"
+    assert events[-1].payload["message"] == "claude -p failed with exit code 1"

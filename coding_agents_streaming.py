@@ -16,6 +16,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from agents import claude_print_streaming
 from agents import claude_pty_wrapper_streaming
 from agents import coding_agents_cli
 
@@ -224,9 +225,12 @@ def _stream_claude(
     *,
     timeout: float | None,
 ) -> Iterator[AgentStreamEvent]:
+    # Same default as the blocking runner: direct `claude -p`, with the
+    # pty-wrapper as an opt-in (it can hang on orphaned plugin MCP servers).
+    transport = "claude-pty-wrapper" if config.claude_use_pty_wrapper else "claude -p"
     yield AgentStreamEvent(
         kind="status",
-        payload={"message": "Streaming Claude output via claude-pty-wrapper."},
+        payload={"message": f"Streaming Claude output via {transport}."},
     )
     try:
         effective_prompt = coding_agents_cli.build_claude_prompt(
@@ -234,14 +238,26 @@ def _stream_claude(
             review_command=config.claude_review_command,
             review_target=config.claude_review_target,
         )
-        for event in claude_pty_wrapper_streaming.stream_claude_pty(
-            effective_prompt,
-            model=str(config.model),
-            auto_approve=config.auto_approve,
-            timeout=timeout,
-            cwd=config.codex_working_dir,
-            effort=config.claude_effort,
-        ):
+        if config.claude_use_pty_wrapper:
+            events = claude_pty_wrapper_streaming.stream_claude_pty(
+                effective_prompt,
+                model=str(config.model),
+                auto_approve=config.auto_approve,
+                timeout=timeout,
+                cwd=config.codex_working_dir,
+                effort=config.claude_effort,
+            )
+        else:
+            events = claude_print_streaming.stream_claude_print(
+                effective_prompt,
+                model=str(config.model),
+                auto_approve=config.auto_approve,
+                timeout=timeout,
+                cwd=config.codex_working_dir,
+                effort=config.claude_effort,
+                disable_mcp=config.claude_disable_mcp,
+            )
+        for event in events:
             if event.kind == "done":
                 result = event.payload.get("result")
                 output = getattr(result, "output", "")

@@ -17,8 +17,9 @@ Detailed module behavior for the `agents` library. `CLAUDE.md` has the short rul
    - Gemini calls are dispatched to the `agy` CLI, not the `gemini` CLI. The prompt is passed via stdin using `--print -` (not as an argv value) to avoid `ARG_MAX` limits on long prompts and to keep the invocation free of `shell=True`.
 
 3. **Streaming variants** — same agent set, but yield `AgentStreamEvent`s as the process runs:
-   - `coding_agents_streaming` is the top-level streaming dispatcher. It reuses `coding_agents_cli`'s command/env builders and Claude path is delegated to `claude_pty_wrapper_streaming`.
-   - `claude_pty_wrapper_streaming` shells out to `claude-pty-wrapper -p --output-format stream-json` and converts the wrapper's JSONL into readable progress events plus a clean final assistant string. Do not switch this module to `claude -p` — the wrapper path is intentional.
+   - `coding_agents_streaming` is the top-level streaming dispatcher. It reuses `coding_agents_cli`'s command/env builders. Claude follows the same `claude_use_pty_wrapper` switch as the blocking runner: by default it is delegated to `claude_print_streaming`, and only on opt-in to `claude_pty_wrapper_streaming`.
+   - `claude_print_streaming` (the default) runs `claude -p --output-format stream-json --verbose` (`-p` rejects stream-json without `--verbose`) with the prompt on stdin, builds its effort/permission/MCP flags with `coding_agents_cli.build_claude_flag_args` (shared with the blocking runner), and reuses `claude_pty_wrapper_streaming`'s process loop and JSONL formatter, since both transports emit the same Claude stream-json events. It forwards `claude_disable_mcp`; on this path the MCP servers are reaped on exit anyway.
+   - `claude_pty_wrapper_streaming` (opt-in) shells out to `claude-pty-wrapper -p --output-format stream-json` and converts the wrapper's JSONL into readable progress events plus a clean final assistant string. Do not switch this module to `claude -p` — the wrapper path is intentional.
 
 ## Shell entry point
 

@@ -914,6 +914,39 @@ def find_claude_pty_wrapper_bin() -> str:
 
 
 
+def build_claude_flag_args(
+    *,
+    effort: str | None,
+    auto_approve: bool,
+    disable_mcp: bool,
+) -> list[str]:
+    """Return the effort/permission/MCP flags shared by every Claude command.
+
+    ``claude -p`` and claude-pty-wrapper accept the same flags, so the blocking
+    runner and both streaming runners build them here.
+    """
+    args: list[str] = []
+    # Forward reasoning effort when requested. When omitted, an ambient
+    # CLAUDE_EFFORT env var (if any) still applies via the inherited subprocess
+    # env, so we only inject the flag when explicitly set.
+    if effort is not None:
+        args.extend(["--effort", effort])
+
+    if auto_approve:
+        args.extend(["--permission-mode", "bypassPermissions"])
+
+    if disable_mcp:
+        # No MCP servers: --strict-mcp-config makes Claude ignore all ambient MCP
+        # config (including plugin-provided servers), and an empty --mcp-config
+        # leaves nothing enabled. Both the pty-wrapper and `claude -p` accept and
+        # forward these flags. This prevents the headless-teardown hang where
+        # orphaned npm-exec stdio MCP servers (Playwright / chrome-devtools) hold
+        # the wrapper's PTY slave open so its master read never sees EOF, and it
+        # stops those servers from leaking as long-lived background processes.
+        args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    return args
+
+
 def _run_claude_internal(
     prompt: str,
     *,
@@ -948,25 +981,9 @@ def _run_claude_internal(
             model,
         ]
 
-    # Forward reasoning effort when requested. Both `claude -p` and
-    # claude-pty-wrapper accept --effort and forward it to Claude. When omitted,
-    # an ambient CLAUDE_EFFORT env var (if any) still applies via the inherited
-    # subprocess env, so we only inject the flag when explicitly set.
-    if effort is not None:
-        command.extend(["--effort", effort])
-
-    if auto_approve:
-        command.extend(["--permission-mode", "bypassPermissions"])
-
-    if disable_mcp:
-        # No MCP servers: --strict-mcp-config makes Claude ignore all ambient MCP
-        # config (including plugin-provided servers), and an empty --mcp-config
-        # leaves nothing enabled. Both the pty-wrapper and `claude -p` accept and
-        # forward these flags. This prevents the headless-teardown hang where
-        # orphaned npm-exec stdio MCP servers (Playwright / chrome-devtools) hold
-        # the wrapper's PTY slave open so its master read never sees EOF, and it
-        # stops those servers from leaking as long-lived background processes.
-        command.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    command.extend(
+        build_claude_flag_args(effort=effort, auto_approve=auto_approve, disable_mcp=disable_mcp)
+    )
 
     logger.debug("Running claude command: %s", " ".join(command))
     proc_env = env.build_env()
