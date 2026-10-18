@@ -240,6 +240,7 @@ def _stream_claude(
             auto_approve=config.auto_approve,
             timeout=timeout,
             cwd=config.codex_working_dir,
+            effort=config.claude_effort,
         ):
             if event.kind == "done":
                 result = event.payload.get("result")

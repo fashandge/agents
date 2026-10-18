@@ -96,7 +96,7 @@ def test_stream_codex_pty_failure_falls_back_to_pipes(monkeypatch):
 def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch):
     calls = []
 
-    def fake_stream(prompt, *, model, auto_approve, timeout, cwd):
+    def fake_stream(prompt, *, model, auto_approve, timeout, cwd, effort):
         calls.append(
             {
                 "prompt": prompt,
@@ -104,6 +104,7 @@ def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch)
                 "auto_approve": auto_approve,
                 "timeout": timeout,
                 "cwd": cwd,
+                "effort": effort,
             }
         )
         yield claude_pty_wrapper_streaming.ClaudePtyStreamEvent(
@@ -122,6 +123,7 @@ def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch)
         "claude",
         model="claude-opus-4-6[1m]",
         codex_working_dir=Path("/tmp/project"),
+        claude_effort="high",
     )
 
     events = list(streaming.stream_with_config("long\nprompt", config, timeout=42))
@@ -133,6 +135,7 @@ def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch)
             "auto_approve": True,
             "timeout": 42,
             "cwd": Path("/tmp/project"),
+            "effort": "high",
         }
     ]
     assert events[-1].payload["result"].output == "claude answer"
@@ -141,7 +144,7 @@ def test_stream_claude_delegates_to_pty_wrapper_without_prompt_argv(monkeypatch)
 def test_stream_claude_prefixes_native_review_command(monkeypatch):
     captured = {}
 
-    def fake_stream(prompt, *, model, auto_approve, timeout, cwd):
+    def fake_stream(prompt, *, model, auto_approve, timeout, cwd, effort):
         captured["prompt"] = prompt
         yield claude_pty_wrapper_streaming.ClaudePtyStreamEvent(
             kind="done",

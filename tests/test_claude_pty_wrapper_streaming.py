@@ -152,6 +152,25 @@ def test_build_command_omits_permission_mode_when_not_auto_approve(monkeypatch):
     assert "bypassPermissions" not in command
 
 
+def test_build_command_forwards_effort_only_when_set(monkeypatch):
+    monkeypatch.setattr(
+        streaming.coding_agents_cli,
+        "find_claude_pty_wrapper_bin",
+        lambda: "/opt/homebrew/bin/claude-pty-wrapper",
+    )
+    monkeypatch.setattr(
+        streaming.coding_agents_cli,
+        "find_claude_bin",
+        lambda: "/opt/homebrew/bin/claude",
+    )
+
+    command = streaming.build_claude_pty_wrapper_command("hello", effort="high")
+    default_command = streaming.build_claude_pty_wrapper_command("hello")
+
+    assert command[command.index("--effort") + 1] == "high"
+    assert "--effort" not in default_command
+
+
 class _FakePopen:
     instances = []
 
