@@ -96,12 +96,13 @@ def test_stream_codex_pty_failure_falls_back_to_pipes(monkeypatch):
 def test_stream_claude_defaults_to_claude_print_not_pty_wrapper(monkeypatch):
     calls = []
 
-    def fake_print(prompt, *, model, auto_approve, timeout, cwd, effort, disable_mcp):
+    def fake_print(prompt, *, model, auto_approve, auto_mode, timeout, cwd, effort, disable_mcp):
         calls.append(
             {
                 "prompt": prompt,
                 "model": model,
                 "auto_approve": auto_approve,
+                "auto_mode": auto_mode,
                 "timeout": timeout,
                 "cwd": cwd,
                 "effort": effort,
@@ -140,6 +141,7 @@ def test_stream_claude_defaults_to_claude_print_not_pty_wrapper(monkeypatch):
             "prompt": "long\nprompt",
             "model": "opus",
             "auto_approve": True,
+            "auto_mode": False,
             "timeout": 42,
             "cwd": Path("/tmp/project"),
             "effort": "high",
@@ -152,12 +154,13 @@ def test_stream_claude_defaults_to_claude_print_not_pty_wrapper(monkeypatch):
 def test_stream_claude_uses_pty_wrapper_when_opted_in_without_prompt_argv(monkeypatch):
     calls = []
 
-    def fake_stream(prompt, *, model, auto_approve, timeout, cwd, effort):
+    def fake_stream(prompt, *, model, auto_approve, auto_mode, timeout, cwd, effort):
         calls.append(
             {
                 "prompt": prompt,
                 "model": model,
                 "auto_approve": auto_approve,
+                "auto_mode": auto_mode,
                 "timeout": timeout,
                 "cwd": cwd,
                 "effort": effort,
@@ -190,6 +193,7 @@ def test_stream_claude_uses_pty_wrapper_when_opted_in_without_prompt_argv(monkey
             "prompt": "long\nprompt",
             "model": "claude-opus-4-6[1m]",
             "auto_approve": True,
+            "auto_mode": False,
             "timeout": 42,
             "cwd": Path("/tmp/project"),
             "effort": "high",
@@ -202,7 +206,7 @@ def test_stream_claude_uses_pty_wrapper_when_opted_in_without_prompt_argv(monkey
 def test_stream_claude_prefixes_native_review_command(monkeypatch):
     captured = {}
 
-    def fake_stream(prompt, *, model, auto_approve, timeout, cwd, effort, disable_mcp):
+    def fake_stream(prompt, *, model, auto_approve, auto_mode, timeout, cwd, effort, disable_mcp):
         captured["prompt"] = prompt
         yield claude_pty_wrapper_streaming.ClaudePtyStreamEvent(
             kind="done",
@@ -375,3 +379,33 @@ def test_stream_close_cancels_underlying_generator(monkeypatch):
     stream.close()
 
     assert closed["value"] is True
+
+
+def test_build_codex_command_auto_mode_uses_approve_for_me(monkeypatch):
+    monkeypatch.setattr(
+        streaming.coding_agents_cli,
+        "find_codex_binaries",
+        lambda: streaming.coding_agents_cli.CodexBinaries(
+            node="/opt/homebrew/bin/node",
+            codex="/opt/homebrew/bin/codex",
+        ),
+    )
+
+    command = streaming.build_codex_command(_config("codex", model="gpt-5.5", auto_mode=True))
+
+    assert "--approve-for-me" in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+
+def test_stream_claude_forwards_auto_mode(monkeypatch):
+    seen = {}
+
+    def fake_print(prompt, **kwargs):
+        seen.update(kwargs)
+        yield claude_pty_wrapper_streaming.ClaudePtyStreamEvent(kind="error", payload={"message": "stop"})
+
+    monkeypatch.setattr(streaming.claude_print_streaming, "stream_claude_print", fake_print)
+
+    list(streaming.stream_with_config("hello", _config("claude", auto_mode=True)))
+
+    assert seen["auto_mode"] is True

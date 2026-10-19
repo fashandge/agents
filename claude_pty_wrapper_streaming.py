@@ -63,6 +63,7 @@ def build_claude_pty_wrapper_command(
     timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
     cwd: Path | str | None = None,
     effort: str | None = None,
+    auto_mode: bool = False,
 ) -> list[str]:
     """Build a claude-pty-wrapper command for stream-json output.
 
@@ -89,7 +90,9 @@ def build_claude_pty_wrapper_command(
         command.extend(["--cwd", str(cwd)])
     if effort is not None:
         command.extend(["--effort", effort])
-    if auto_approve:
+    if auto_mode:
+        command.extend(["--permission-mode", "auto"])
+    elif auto_approve:
         command.extend(["--permission-mode", "bypassPermissions"])
     return command
 
@@ -102,6 +105,7 @@ def stream_claude_pty(
     timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
     cwd: Path | str | None = None,
     effort: str | None = None,
+    auto_mode: bool = False,
 ) -> Iterator[ClaudePtyStreamEvent]:
     """Stream readable Claude output from claude-pty-wrapper.
 
@@ -116,6 +120,7 @@ def stream_claude_pty(
             timeout=timeout,
             cwd=cwd,
             effort=effort,
+            auto_mode=auto_mode,
         )
     except Exception as exc:
         yield ClaudePtyStreamEvent(

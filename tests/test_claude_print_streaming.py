@@ -76,3 +76,12 @@ def test_stream_claude_print_reports_missing_binary(monkeypatch):
 
     assert [event.kind for event in events] == ["error"]
     assert "claude unavailable: claude not found" in events[0].payload["message"]
+
+
+def test_build_command_auto_mode_replaces_bypass_permissions(monkeypatch):
+    _fake_claude_bin(monkeypatch)
+
+    command = print_streaming.build_claude_print_command(model="opus", auto_mode=True)
+
+    assert command[command.index("--permission-mode") + 1] == "auto"
+    assert "bypassPermissions" not in command

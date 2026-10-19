@@ -78,6 +78,11 @@ class AgentConfig:
             normalised to AgentType on construction.
         model: Model name. Defaults to the agent-specific default.
         auto_approve: Auto-approve all actions for unattended runs.
+        auto_mode: Use the agent's classifier-reviewed auto mode instead of
+            bypassing permissions: Claude ``--permission-mode auto``, Codex
+            ``--approve-for-me`` (automatic approval review in the
+            workspace-write sandbox). Takes precedence over ``auto_approve``.
+            Ignored by Gemini.
 
     Claude-specific options (prefixed with claude_):
         claude_use_pty_wrapper: Use claude-pty-wrapper instead of ``claude -p``.
@@ -122,6 +127,7 @@ class AgentConfig:
     agent: AgentType | Literal["codex", "claude", "gemini"] = AgentType.CLAUDE
     model: str | None = None
     auto_approve: bool = True
+    auto_mode: bool = False
 
     # Claude-specific
     claude_use_pty_wrapper: bool = False
@@ -238,6 +244,7 @@ def run_with_config(
                 model=effective_model,
                 reasoning_effort=config.codex_reasoning_effort,
                 auto_approve=config.auto_approve,
+                auto_mode=config.auto_mode,
                 skip_git_check=config.codex_skip_git_check,
                 working_dir=config.codex_working_dir,
                 add_dirs=config.codex_add_dirs,
@@ -250,6 +257,7 @@ def run_with_config(
                 prompt,
                 model=effective_model,
                 auto_approve=config.auto_approve,
+                auto_mode=config.auto_mode,
                 use_pty_wrapper=config.claude_use_pty_wrapper,
                 disable_mcp=config.claude_disable_mcp,
                 effort=config.claude_effort,
@@ -725,7 +733,9 @@ def build_codex_command(
         ]
     )
 
-    if config.auto_approve:
+    if config.auto_mode:
+        command.append("--approve-for-me")
+    elif config.auto_approve:
         command.append("--dangerously-bypass-approvals-and-sandbox")
 
     if config.codex_skip_git_check:
@@ -755,6 +765,7 @@ def _run_codex_internal(
     reasoning_effort: str,
     auto_approve: bool,
     skip_git_check: bool,
+    auto_mode: bool = False,
     working_dir: Path | None,
     add_dirs: list[Path] | None,
     output_schema: dict | None,
@@ -783,6 +794,7 @@ def _run_codex_internal(
                 agent=AgentType.CODEX,
                 model=model,
                 auto_approve=auto_approve,
+                auto_mode=auto_mode,
                 codex_reasoning_effort=reasoning_effort,
                 codex_working_dir=working_dir,
                 codex_add_dirs=add_dirs,
@@ -919,6 +931,7 @@ def build_claude_flag_args(
     effort: str | None,
     auto_approve: bool,
     disable_mcp: bool,
+    auto_mode: bool = False,
 ) -> list[str]:
     """Return the effort/permission/MCP flags shared by every Claude command.
 
@@ -932,7 +945,9 @@ def build_claude_flag_args(
     if effort is not None:
         args.extend(["--effort", effort])
 
-    if auto_approve:
+    if auto_mode:
+        args.extend(["--permission-mode", "auto"])
+    elif auto_approve:
         args.extend(["--permission-mode", "bypassPermissions"])
 
     if disable_mcp:
@@ -958,6 +973,7 @@ def _run_claude_internal(
     effort: str | None = None,
     review_command: Literal["code-review", "review"] | None = None,
     review_target: str | None = None,
+    auto_mode: bool = False,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -982,7 +998,9 @@ def _run_claude_internal(
         ]
 
     command.extend(
-        build_claude_flag_args(effort=effort, auto_approve=auto_approve, disable_mcp=disable_mcp)
+        build_claude_flag_args(
+            effort=effort, auto_approve=auto_approve, disable_mcp=disable_mcp, auto_mode=auto_mode
+        )
     )
 
     logger.debug("Running claude command: %s", " ".join(command))

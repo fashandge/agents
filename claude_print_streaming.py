@@ -27,6 +27,7 @@ def build_claude_print_command(
     auto_approve: bool = True,
     effort: str | None = None,
     disable_mcp: bool = False,
+    auto_mode: bool = False,
 ) -> list[str]:
     """Build a ``claude -p`` stream-json command. The prompt goes via stdin."""
     command = [
@@ -40,7 +41,7 @@ def build_claude_print_command(
     ]
     command.extend(
         coding_agents_cli.build_claude_flag_args(
-            effort=effort, auto_approve=auto_approve, disable_mcp=disable_mcp
+            effort=effort, auto_approve=auto_approve, disable_mcp=disable_mcp, auto_mode=auto_mode
         )
     )
     return command
@@ -55,6 +56,7 @@ def stream_claude_print(
     cwd: Path | str | None = None,
     effort: str | None = None,
     disable_mcp: bool = False,
+    auto_mode: bool = False,
 ) -> Iterator[ClaudePtyStreamEvent]:
     """Stream readable Claude output from ``claude -p``.
 
@@ -67,6 +69,7 @@ def stream_claude_print(
             auto_approve=auto_approve,
             effort=effort,
             disable_mcp=disable_mcp,
+            auto_mode=auto_mode,
         )
     except Exception as exc:
         yield ClaudePtyStreamEvent(kind="error", payload={"message": f"claude unavailable: {exc}"})
