@@ -490,3 +490,33 @@ def test_run_with_config_passes_claude_working_dir_as_cwd(monkeypatch, tmp_path)
     config = coding_agents_cli.AgentConfig(agent="claude", claude_working_dir=tmp_path)
     coding_agents_cli.run_with_config("prompt", config, heartbeat_interval=None)
     assert captured["cwd"] == tmp_path
+
+
+def test_run_with_config_forwards_claude_session_id(monkeypatch):
+    monkeypatch.setattr(coding_agents_cli, "find_claude_bin", lambda: "/tmp/claude")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+    session_id = "4f1c2a8e-0000-4000-8000-000000000000"
+    config = coding_agents_cli.AgentConfig(agent="claude", claude_session_id=session_id)
+    coding_agents_cli.run_with_config("prompt", config, heartbeat_interval=None)
+    cmd = captured["command"]
+    assert cmd[cmd.index("--session-id") + 1] == session_id
+
+
+def test_claude_session_id_rejects_pty_wrapper():
+    with pytest.raises(ValueError, match="claude_session_id"):
+        coding_agents_cli.AgentConfig(
+            agent="claude", claude_session_id="4f1c2a8e-0000-4000-8000-000000000000",
+            claude_use_pty_wrapper=True,
+        )

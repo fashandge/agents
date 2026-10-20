@@ -121,6 +121,11 @@ class AgentConfig:
             repo whose ``.claude/skills`` the prompt invokes. Defaults to the
             caller's cwd. (The streaming runners fall back to
             ``codex_working_dir`` when this is unset.)
+        claude_session_id: UUID forwarded as ``--session-id`` so the caller
+            knows the run's session up front — to find its transcript
+            (``~/.claude/projects/*/<id>.jsonl``) while it runs, or to
+            ``claude --resume`` it later. Direct ``claude -p`` path only;
+            rejected with ``claude_use_pty_wrapper``.
 
     Codex-specific options (prefixed with codex_):
         codex_reasoning_effort: Reasoning effort level
@@ -150,6 +155,7 @@ class AgentConfig:
     claude_review_command: Literal["code-review", "review"] | None = None
     claude_review_target: str | None = None
     claude_working_dir: Path | None = None
+    claude_session_id: str | None = None
 
     # Codex-specific
     codex_reasoning_effort: str | None = None
@@ -178,6 +184,8 @@ class AgentConfig:
                 raise ValueError("claude_review_target requires claude_review_command='review'")
             if not self.claude_review_target.strip() or "\n" in self.claude_review_target:
                 raise ValueError("claude_review_target must be a non-empty single line")
+        if self.claude_session_id is not None and self.claude_use_pty_wrapper:
+            raise ValueError("claude_session_id requires the direct claude -p path (claude_use_pty_wrapper=False)")
 
 
 @dataclass(frozen=True)
@@ -277,6 +285,7 @@ def run_with_config(
                 review_command=config.claude_review_command,
                 review_target=config.claude_review_target,
                 working_dir=config.claude_working_dir,
+                session_id=config.claude_session_id,
             )
         elif agent == AgentType.GEMINI:
             result = _run_gemini_internal(
@@ -1127,6 +1136,7 @@ def _run_claude_internal(
     review_target: str | None = None,
     auto_mode: bool = False,
     working_dir: Path | None = None,
+    session_id: str | None = None,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -1155,6 +1165,8 @@ def _run_claude_internal(
             effort=effort, auto_approve=auto_approve, disable_mcp=disable_mcp, auto_mode=auto_mode
         )
     )
+    if session_id is not None:
+        command.extend(["--session-id", session_id])
 
     logger.debug("Running claude command: %s", " ".join(command))
     proc_env = env.build_env()
