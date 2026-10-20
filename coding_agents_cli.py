@@ -674,8 +674,8 @@ def run_agent(
         agent: Which agent to use (codex, claude, gemini).
         model: Model name. Defaults to agent-specific default.
         auto_approve: Auto-approve all actions for unattended runs.
-claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
-            of ``claude -p``. Defaults to True.
+        claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
+            of ``claude -p``. Defaults to False.
         claude_effort: Reasoning effort for Claude runs forwarded via Claude's
             ``--effort`` flag (low, medium, high, xhigh, max). When None (the
             default), no ``--effort`` flag is emitted and any ambient
@@ -737,7 +737,7 @@ def run_agent_or_raise(
 
     Args:
         claude_use_pty_wrapper: Use claude-pty-wrapper for Claude runs instead
-            of ``claude -p``. Defaults to True.
+            of ``claude -p``. Defaults to False.
         claude_effort: Reasoning effort for Claude runs (see :func:`run_agent`).
 
     Returns:
