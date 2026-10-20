@@ -21,7 +21,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, OpenClaw, H
 ## Architecture (details: docs/architecture.md)
 
 - **`env.build_env()`** — sources `~/.zshenv` + `~/.config/secrets.env` into an env dict for `subprocess.run(env=...)`; the single entry point for PATH/API keys under launchd/cron.
-- **`coding_agents_cli`** — unified blocking interface for the three agent CLIs: `AgentConfig` dataclass (all options, including native-review routing, are agent-name-prefixed), `run_with_config()`, `run_with_config_and_fallback()` (Codex → Claude → Gemini).
+- **`coding_agents_cli`** — unified blocking interface for the three agent CLIs: `AgentConfig` dataclass (all options, including native-review routing, are agent-name-prefixed), `run_with_config()`, `run_with_config_and_fallback()` (Codex → Claude → Gemini). `run_background()` + `detached_status()` start a run in a freshly spawned Python process (no fork, so safe from threaded servers) and read its state back from the result files.
 - **`coding_agents_streaming`** / **`claude_print_streaming`** / **`claude_pty_wrapper_streaming`** — same agents, yielding `AgentStreamEvent`s as the process runs.
 - **`openrouter`** / **`deepseek`** — small, self-contained, stdlib-only chat-completion clients (deliberately share no code).
 - **`openclaw`** — messaging wrapper over the `openclaw` CLI (`send_message` / `send_discord`); no network call or token in this repo.

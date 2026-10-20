@@ -470,3 +470,23 @@ def test_fallback_treats_raising_validator_as_failure(monkeypatch):
         "prompt", configs=[gemini, codex], validate=_raising
     )
     assert result.agent == AgentType.CODEX
+
+
+def test_run_with_config_passes_claude_working_dir_as_cwd(monkeypatch, tmp_path):
+    monkeypatch.setattr(coding_agents_cli, "find_claude_bin", lambda: "/tmp/claude")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs)
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+    config = coding_agents_cli.AgentConfig(agent="claude", claude_working_dir=tmp_path)
+    coding_agents_cli.run_with_config("prompt", config, heartbeat_interval=None)
+    assert captured["cwd"] == tmp_path

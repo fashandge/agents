@@ -79,6 +79,12 @@ def main() -> None:
         help="Optional PR number or URL passed to --claude-review-command review.",
     )
     parser.add_argument(
+        "--claude-working-dir",
+        default=None,
+        help="Working directory for the Claude process (e.g. a repo whose "
+             ".claude/skills the prompt invokes). Defaults to the current directory.",
+    )
+    parser.add_argument(
         "--codex-reasoning",
         choices=["low", "medium", "high", "xhigh", "max"],
         default=None,
@@ -141,6 +147,7 @@ def main() -> None:
                 claude_effort=args.claude_effort,
                 claude_review_command=args.claude_review_command,
                 claude_review_target=args.claude_review_target,
+                claude_working_dir=args.claude_working_dir,
                 codex_review=args.codex_review,
             )
             for a in agents
@@ -158,6 +165,7 @@ def main() -> None:
             claude_effort=args.claude_effort,
             claude_review_command=args.claude_review_command,
             claude_review_target=args.claude_review_target,
+            claude_working_dir=args.claude_working_dir,
             codex_reasoning_effort=args.codex_reasoning,
             codex_working_dir=args.codex_working_dir,
             codex_review=args.codex_review,

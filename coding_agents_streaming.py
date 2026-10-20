@@ -245,7 +245,7 @@ def _stream_claude(
                 auto_approve=config.auto_approve,
                 auto_mode=config.auto_mode,
                 timeout=timeout,
-                cwd=config.codex_working_dir,
+                cwd=config.claude_working_dir or config.codex_working_dir,
                 effort=config.claude_effort,
             )
         else:
@@ -255,7 +255,7 @@ def _stream_claude(
                 auto_approve=config.auto_approve,
                 auto_mode=config.auto_mode,
                 timeout=timeout,
-                cwd=config.codex_working_dir,
+                cwd=config.claude_working_dir or config.codex_working_dir,
                 effort=config.claude_effort,
                 disable_mcp=config.claude_disable_mcp,
             )

@@ -8,16 +8,23 @@ while plain shells survived; a detached run of the same command completed). For 
 expected to exceed ~6 minutes in that environment, use ``run_detached`` (CLI:
 ``--detach OUTPUT_BASE``) so the agent runs in its own session, invisible to the
 reaper's process-tree walk. Short runs don't need it.
+
+Background runs from a long-lived, threaded caller (a web server): use
+``run_background``, which spawns a fresh Python process instead of forking the
+caller, and poll ``detached_status``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import threading
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -110,6 +117,10 @@ class AgentConfig:
             command before the supplied prompt: ``code-review`` for the current
             working diff or ``review`` for a GitHub pull request.
         claude_review_target: Optional PR number or URL passed to ``/review``.
+        claude_working_dir: Working directory for the Claude process, e.g. a
+            repo whose ``.claude/skills`` the prompt invokes. Defaults to the
+            caller's cwd. (The streaming runners fall back to
+            ``codex_working_dir`` when this is unset.)
 
     Codex-specific options (prefixed with codex_):
         codex_reasoning_effort: Reasoning effort level
@@ -138,6 +149,7 @@ class AgentConfig:
     claude_effort: str | None = None
     claude_review_command: Literal["code-review", "review"] | None = None
     claude_review_target: str | None = None
+    claude_working_dir: Path | None = None
 
     # Codex-specific
     codex_reasoning_effort: str | None = None
@@ -264,6 +276,7 @@ def run_with_config(
                 timeout=timeout,
                 review_command=config.claude_review_command,
                 review_target=config.claude_review_target,
+                working_dir=config.claude_working_dir,
             )
         elif agent == AgentType.GEMINI:
             result = _run_gemini_internal(
@@ -495,6 +508,145 @@ def run_detached(
             Path(paths["exitcode"]).write_text(str(rc))
         finally:
             os._exit(rc if 0 <= rc < 256 else 1)
+
+
+# Child of run_background: a fresh interpreter that runs the job file at argv[1].
+_BACKGROUND_CHILD_CODE = (
+    "import sys; from agents import coding_agents_cli; "
+    "sys.exit(coding_agents_cli.run_background_job(sys.argv[1]))"
+)
+_ERROR_TAIL_CHARS = 4000
+
+
+def _result_paths(output_base: str | Path) -> dict[str, str]:
+    return {name: f"{output_base}.{name}" for name in ("out", "err", "pid", "exitcode", "job")}
+
+
+def run_background(
+    prompt: str,
+    configs: AgentConfig | Sequence[AgentConfig],
+    output_base: str | Path,
+    *,
+    timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
+) -> dict:
+    """Start an agent run in a fresh background process and return immediately.
+
+    The non-forking sibling of ``run_detached``, safe to call from a threaded,
+    long-lived process such as a web server: it spawns a new Python
+    interpreter (``sys.executable``) in its own session instead of forking the
+    caller, so the run neither inherits the caller's threads and memory nor dies
+    with it. One config runs through ``run_with_config``; several run in order
+    through ``run_with_config_and_fallback``. ``timeout`` applies per agent.
+
+    Results use ``run_detached``'s file contract — ``.out`` (final answer),
+    ``.err`` (log stream plus the agent's stderr), ``.pid``, and ``.exitcode``
+    written last — plus ``.job`` (the prompt and configs the child runs). Poll
+    ``detached_status(output_base)`` for progress.
+
+    Returns:
+        Dict with ``pid`` and the result-file paths (same keys as ``run_detached``).
+    """
+    base = Path(output_base)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    paths = _result_paths(base)
+    configs = [configs] if isinstance(configs, AgentConfig) else list(configs)
+    if not configs:
+        raise ValueError("configs must not be empty")
+    for name in ("out", "exitcode"):
+        Path(paths[name]).unlink(missing_ok=True)
+    Path(paths["job"]).write_text(json.dumps({
+        "prompt": prompt,
+        "configs": [dataclasses.asdict(c) for c in configs],
+        "timeout": timeout,
+    }, default=str))
+
+    # The child imports `agents` by its absolute path, whatever the interpreter's .pth files say.
+    child_env = os.environ.copy()
+    package_root = str(Path(__file__).resolve().parents[1])
+    child_env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, child_env.get("PYTHONPATH")]))
+    with open(paths["err"], "w") as err:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _BACKGROUND_CHILD_CODE, str(base)],
+            stdin=subprocess.DEVNULL, stdout=err, stderr=err,
+            start_new_session=True, env=child_env,
+        )
+    Path(paths["pid"]).write_text(str(proc.pid))
+    # Reap the child when it exits, so a long-lived caller collects no zombies.
+    threading.Thread(target=proc.wait, daemon=True).start()
+    return {
+        "pid": proc.pid,
+        "out": paths["out"],
+        "err": paths["err"],
+        "pid_file": paths["pid"],
+        "exitcode": paths["exitcode"],
+    }
+
+
+def run_background_job(output_base: str | Path) -> int:
+    """Body of ``run_background``'s child process: run ``<output_base>.job`` and
+    record the result files. Returns the exit code (1 if the run raised)."""
+    paths = _result_paths(output_base)
+    rc = 1
+    try:
+        job = json.loads(Path(paths["job"]).read_text())
+        configs = [AgentConfig(**c) for c in job["configs"]]
+        if len(configs) == 1:
+            result = run_with_config(job["prompt"], configs[0], timeout=job["timeout"])
+        else:
+            result = run_with_config_and_fallback(job["prompt"], configs, timeout=job["timeout"])
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        Path(paths["out"]).write_text(result.output)
+        rc = result.returncode
+    except BaseException:
+        traceback.print_exc()
+    finally:
+        sys.stderr.flush()
+        Path(paths["exitcode"]).write_text(str(rc))
+    return rc if 0 <= rc < 256 else 1
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def detached_status(output_base: str | Path) -> dict:
+    """Read a ``run_background`` / ``run_detached`` run's state from its files.
+
+    ``state`` is ``running``, ``done`` (exit code 0), ``failed`` (nonzero), or
+    ``lost`` (the process is gone without writing ``.exitcode``, e.g. killed).
+    Once finished, ``output`` holds ``.out``; for ``failed`` and ``lost``,
+    ``error`` holds the last few thousand characters of ``.err``.
+
+    Raises:
+        FileNotFoundError: No run was started at ``output_base``.
+    """
+    paths = _result_paths(output_base)
+    exitcode, pid_file = Path(paths["exitcode"]), Path(paths["pid"])
+    if not exitcode.exists() and not pid_file.exists():
+        raise FileNotFoundError(f"no detached run at {output_base}")
+    pid = int(pid_file.read_text().strip()) if pid_file.exists() else None
+    returncode = None
+    if exitcode.exists():
+        returncode = int(exitcode.read_text().strip() or 1)
+        state = "done" if returncode == 0 else "failed"
+    elif pid is not None and _pid_alive(pid):
+        state = "running"
+    else:
+        state = "lost"
+    status = {"state": state, "pid": pid, "returncode": returncode, "output": "", "error": ""}
+    if state != "running":
+        out, err = Path(paths["out"]), Path(paths["err"])
+        status["output"] = out.read_text() if out.exists() else ""
+        if state != "done" and err.exists():
+            status["error"] = err.read_text()[-_ERROR_TAIL_CHARS:]
+    return status
 
 
 def run_agent(
@@ -974,6 +1126,7 @@ def _run_claude_internal(
     review_command: Literal["code-review", "review"] | None = None,
     review_target: str | None = None,
     auto_mode: bool = False,
+    working_dir: Path | None = None,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -1022,6 +1175,7 @@ def _run_claude_internal(
             check=False,
             timeout=subprocess_timeout,
             env=proc_env,
+            cwd=working_dir,
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(f"Claude timed out after {timeout} seconds") from e
