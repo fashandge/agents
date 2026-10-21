@@ -126,6 +126,10 @@ class AgentConfig:
             (``~/.claude/projects/*/<id>.jsonl``) while it runs, or to
             ``claude --resume`` it later. Direct ``claude -p`` path only;
             rejected with ``claude_use_pty_wrapper``.
+        claude_add_dirs: Extra directories forwarded as ``--add-dir``, so the
+            session may read and edit files outside ``claude_working_dir``
+            without a permission prompt. Direct ``claude -p`` path only;
+            rejected with ``claude_use_pty_wrapper``.
 
     Codex-specific options (prefixed with codex_):
         codex_reasoning_effort: Reasoning effort level
@@ -156,6 +160,7 @@ class AgentConfig:
     claude_review_target: str | None = None
     claude_working_dir: Path | None = None
     claude_session_id: str | None = None
+    claude_add_dirs: list[Path] | None = None
 
     # Codex-specific
     codex_reasoning_effort: str | None = None
@@ -186,6 +191,8 @@ class AgentConfig:
                 raise ValueError("claude_review_target must be a non-empty single line")
         if self.claude_session_id is not None and self.claude_use_pty_wrapper:
             raise ValueError("claude_session_id requires the direct claude -p path (claude_use_pty_wrapper=False)")
+        if self.claude_add_dirs and self.claude_use_pty_wrapper:
+            raise ValueError("claude_add_dirs requires the direct claude -p path (claude_use_pty_wrapper=False)")
 
 
 @dataclass(frozen=True)
@@ -286,6 +293,7 @@ def run_with_config(
                 review_target=config.claude_review_target,
                 working_dir=config.claude_working_dir,
                 session_id=config.claude_session_id,
+                add_dirs=config.claude_add_dirs,
             )
         elif agent == AgentType.GEMINI:
             result = _run_gemini_internal(
@@ -1137,6 +1145,7 @@ def _run_claude_internal(
     auto_mode: bool = False,
     working_dir: Path | None = None,
     session_id: str | None = None,
+    add_dirs: list[Path] | None = None,
 ) -> _RunResult:
     """Internal Claude runner."""
     claude_bin = find_claude_bin()
@@ -1167,6 +1176,8 @@ def _run_claude_internal(
     )
     if session_id is not None:
         command.extend(["--session-id", session_id])
+    for add_dir in add_dirs or []:
+        command.extend(["--add-dir", str(add_dir)])
 
     logger.debug("Running claude command: %s", " ".join(command))
     proc_env = env.build_env()

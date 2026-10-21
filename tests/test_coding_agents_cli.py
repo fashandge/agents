@@ -520,3 +520,30 @@ def test_claude_session_id_rejects_pty_wrapper():
             agent="claude", claude_session_id="4f1c2a8e-0000-4000-8000-000000000000",
             claude_use_pty_wrapper=True,
         )
+
+
+def test_run_with_config_forwards_claude_add_dirs(monkeypatch, tmp_path):
+    monkeypatch.setattr(coding_agents_cli, "find_claude_bin", lambda: "/tmp/claude")
+    monkeypatch.setattr(coding_agents_cli.env, "build_env", lambda: {"PATH": "/usr/bin"})
+    captured = {}
+
+    class _Completed:
+        stdout = "ok"
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return _Completed()
+
+    monkeypatch.setattr(coding_agents_cli.subprocess, "run", fake_run)
+    first, second = tmp_path / "a", tmp_path / "b"
+    config = coding_agents_cli.AgentConfig(agent="claude", claude_add_dirs=[first, second])
+    coding_agents_cli.run_with_config("prompt", config, heartbeat_interval=None)
+    cmd = captured["command"]
+    assert [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"] == [str(first), str(second)]
+
+
+def test_claude_add_dirs_rejects_pty_wrapper(tmp_path):
+    with pytest.raises(ValueError, match="claude_add_dirs"):
+        coding_agents_cli.AgentConfig(agent="claude", claude_add_dirs=[tmp_path], claude_use_pty_wrapper=True)
