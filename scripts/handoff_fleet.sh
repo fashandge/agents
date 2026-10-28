@@ -48,7 +48,7 @@ Flags:
   --dry-run                     validate + print planned commands, launch nothing
 
 Worked example (manifest.tsv):
-  x-for-you-summary<TAB>kickoffs/x-for-you.md<TAB>/Users/jianfuchen/projects/news<TAB>pi
+  x-for-you-summary<TAB>kickoffs/x-for-you.md<TAB>/Users/me/projects/demo<TAB>pi
   reddit-home<TAB>kickoffs/reddit.md<TAB>/Users/jianfuchen/skills<TAB>pi<TAB>--model deepseek/deepseek-v4-flash
 
 Output: one JSON line per row, then {"summary": {"rows","ok","failed"}}.

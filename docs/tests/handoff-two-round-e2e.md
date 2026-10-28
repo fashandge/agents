@@ -59,7 +59,7 @@ ssh -o ConnectTimeout=8 oci-box 'echo ok; which codex tmux herdr'
 
 On the box, use its env's python (`/home/opc/miniforge3/envs/ml/bin/python3 -m
 agents.orchestration.handoffctl`). If the box is stopped and the request
-authorizes using it: `~/projects/investment/src/scripts/oci_box_ctl.sh up`.
+authorizes using it: `box up` (the `box` command on PATH).
 
 Pick a unique run-name prefix per execution (e.g. `e2e-<MMDD>-a` / `-b`) so a
 previous execution's registry records and scratch dirs can never be mistaken

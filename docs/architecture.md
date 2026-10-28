@@ -34,7 +34,7 @@ Native review flags are `--codex-review`, and `--claude-review-command {code-rev
 
 `AgentConfig.claude_session_id` is forwarded as `--session-id` on the direct `claude -p` path (rejected with the PTY wrapper), so a caller knows the session before it starts: it can locate the transcript (`~/.claude/projects/*/<id>.jsonl`) while the run is going, or `claude --resume` it later. notes-search's web-UI absorb runs use it with `run_background` to report live progress and the files a run changed.
 
-`AgentConfig.claude_add_dirs` is forwarded as repeated `--add-dir` flags on the same direct path (also rejected with the PTY wrapper), letting a session edit files outside its working directory without prompting. notes-search's absorb runs use it to work from `~/projects/stock_picker` while editing the vault.
+`AgentConfig.claude_add_dirs` is forwarded as repeated `--add-dir` flags on the same direct path (also rejected with the PTY wrapper), letting a session edit files outside its working directory without prompting. a caller uses it to run a session in one repo while it edits files elsewhere (notes-search's absorb runs work this way on the vault).
 
 `AgentConfig.claude_working_dir` sets the Claude process's cwd, so a prompt can invoke a repo's `.claude/skills` (CLI: `--claude-working-dir`). The streaming runners use it too, falling back to `codex_working_dir`, which they used as Claude's cwd before this field existed.
 

@@ -76,7 +76,7 @@ ssh oci-box 'herdr status server'               # must report running
 `<spawn>` throughout is `~/projects/agents/scripts/spawn_worker.sh`.
 
 If the box is stopped and the request authorizes using it:
-`~/projects/investment/src/scripts/oci_box_ctl.sh up`. A rebooted box starts
+`box up` (the `box` command on PATH). A rebooted box starts
 its herdr server at boot via `herdr-server.service` (installed by
 `bootstrap_oci_box.sh`), so a missing server is a broken unit, not the normal
 state — check `systemctl status herdr-server` on the box. On a host without

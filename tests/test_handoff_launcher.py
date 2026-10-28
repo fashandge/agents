@@ -1026,13 +1026,13 @@ def test_launch_remote_sends_json_over_stdin_and_returns_remote_uri(tmp_path, mo
     result = handoff_launcher.launch_remote(
         host="oci-box", remote_python="/home/opc/miniforge3/envs/ml/bin/python",
         name="remote-worker", kickoff=kickoff,
-        remote_cwd=Path("/home/opc/projects/investment"), agent="claude",
+        remote_cwd=Path("/home/opc/projects/demo"), agent="claude",
     )
 
     assert captured["host"] == "oci-box"
     assert captured["remote_argv"][-1] == "--receive-remote-request"
     assert handoff_launcher.base64.b64decode(captured["payload"]["kickoff_b64"]) == b"literal $(touch NOPE)"
-    assert captured["payload"]["cwd"] == "/home/opc/projects/investment"
+    assert captured["payload"]["cwd"] == "/home/opc/projects/demo"
     assert result["run_dir"] == "ssh://oci-box/home/opc/.local/state/run-id"
     assert result["remote_run_dir"] == "/home/opc/.local/state/run-id"
     assert result["handle"] == "ssh://oci-box/tmux/remote-worker"
@@ -1953,7 +1953,7 @@ def test_launch_remote_records_the_backend_the_host_actually_used(tmp_path, monk
 
     result = handoff_launcher.launch_remote(
         host="oci-box", remote_python="python3", name="remote-worker",
-        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/investment"),
+        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/demo"),
         agent="pi", backend="herdr",
     )
 
@@ -1981,7 +1981,7 @@ def test_launch_remote_herdr_reports_a_pane_handle_and_herdr_rescue(tmp_path, mo
 
     result = handoff_launcher.launch_remote(
         host="oci-box", remote_python="python3", name="remote-worker",
-        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/investment"),
+        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/demo"),
         agent="pi", backend="herdr",
     )
 
@@ -2012,7 +2012,7 @@ def test_launch_remote_tmux_stays_compatible_with_an_old_receiver(tmp_path, monk
 
     handoff_launcher.launch_remote(
         host="oci-box", remote_python="python3", name="remote-worker",
-        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/investment"),
+        kickoff=kickoff, remote_cwd=Path("/home/opc/projects/demo"),
         agent="pi", backend="tmux",
     )
 
